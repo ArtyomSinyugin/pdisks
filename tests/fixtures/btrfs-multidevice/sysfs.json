@@ -1,0 +1,32 @@
+{
+  "devices": [
+    {
+      "name": "sda",
+      "path": "/dev/sda",
+      "major": 8,
+      "minor": 0,
+      "size_bytes": 1099511627776,
+      "logical_block_size": 512,
+      "physical_block_size": 512,
+      "model": "Samsung SSD 860 EVO 1TB",
+      "serial": "S46ENX0R987654",
+      "rotational": false,
+      "removable": false,
+      "read_only": false
+    },
+    {
+      "name": "sdb",
+      "path": "/dev/sdb",
+      "major": 8,
+      "minor": 16,
+      "size_bytes": 1099511627776,
+      "logical_block_size": 512,
+      "physical_block_size": 512,
+      "model": "Samsung SSD 860 EVO 1TB",
+      "serial": "S46ENX0R987655",
+      "rotational": false,
+      "removable": false,
+      "read_only": false
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "lv",
+        "fields": [
+          { "name": "lv_name" },
+          { "name": "vg_name" },
+          { "name": "lv_path" },
+          { "name": "lv_size" },
+          { "name": "lv_attr" },
+          { "name": "lv_uuid" }
+        ],
+        "rows": []
+      }
+    }
+  ]
+}

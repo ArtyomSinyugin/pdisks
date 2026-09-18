@@ -1,0 +1,59 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": true,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              }
+            ],
+            "model": "Kingston A400 480GB"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": "E5F6-A7B8",
+              "name": "/dev/sda1",
+              "size": 536870912,
+              "status": "efi",
+              "mountpoint": "/boot/efi",
+              "fs": "vfat"
+            },
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 537919488,
+                  "number": 2
+                }
+              },
+              "uuid": "f6a7b8c9-d0e1-4f2a-b3c4-d5e6f7a8b9c0",
+              "name": "/dev/sda2",
+              "size": 536334028800,
+              "status": "not_empty",
+              "mountpoint": "/",
+              "fs": "btrfs"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sda",
+      "size": 536870912000,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    }
+  ]
+}

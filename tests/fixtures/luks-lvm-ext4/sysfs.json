@@ -1,0 +1,18 @@
+{
+  "devices": [
+    {
+      "name": "sda",
+      "path": "/dev/sda",
+      "major": 8,
+      "minor": 0,
+      "size_bytes": 1073741824000,
+      "logical_block_size": 512,
+      "physical_block_size": 512,
+      "model": "Seagate ST1000LM048-1R71",
+      "serial": "Z3HJ123456789",
+      "rotational": true,
+      "removable": false,
+      "read_only": false
+    }
+  ]
+}

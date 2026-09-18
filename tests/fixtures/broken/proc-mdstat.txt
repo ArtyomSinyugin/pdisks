@@ -1,0 +1,6 @@
+Personalities : [raid1] 
+md0 : active raid1 sda2[0] 
+      499865088 blocks super 1.2 [2/1] [_U]
+      resync = P(100.0%) speed=300000K/sec
+
+bitmap: 0/8 pages [0/8 KB], 65536k chunk

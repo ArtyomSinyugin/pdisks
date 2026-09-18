@@ -1,0 +1,16 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "vg",
+        "fields": [
+          { "name": "vg_name" },
+          { "name": "vg_uuid" },
+          { "name": "vg_size" },
+          { "name": "vg_free" }
+        ],
+        "rows": []
+      }
+    }
+  ]
+}

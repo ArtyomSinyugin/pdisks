@@ -1,0 +1,86 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              }
+            ],
+            "model": "Samsung SSD 860 EVO 1TB"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": "a7b8c9d0-e1f2-4a3b-c4d5-e6f7a8b9c0d1",
+              "name": "/dev/sda1",
+              "size": 1099511627776,
+              "status": "not_empty",
+              "mountpoint": null,
+              "fs": "btrfs"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sda",
+      "size": 1099511627776,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    },
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              }
+            ],
+            "model": "Samsung SSD 860 EVO 1TB"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": "a7b8c9d0-e1f2-4a3b-c4d5-e6f7a8b9c0d1",
+              "name": "/dev/sdb1",
+              "size": 1099511627776,
+              "status": "not_empty",
+              "mountpoint": null,
+              "fs": "btrfs"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sdb",
+      "size": 1099511627776,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    }
+  ]
+}

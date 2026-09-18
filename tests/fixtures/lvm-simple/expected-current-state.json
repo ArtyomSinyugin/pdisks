@@ -1,0 +1,59 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": true,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              }
+            ],
+            "model": "Samsung SSD 870 EVO 500GB"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": "C3D4-E5F6",
+              "name": "/dev/sda1",
+              "size": 536870912,
+              "status": "efi",
+              "mountpoint": "/boot/efi",
+              "fs": "vfat"
+            },
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 537919488,
+                  "number": 2
+                }
+              },
+              "uuid": null,
+              "name": "/dev/sda2",
+              "size": 536334028800,
+              "status": "lvm_pv:def456-ghi789-jkl012-mno345-pqr678",
+              "mountpoint": null,
+              "fs": "LVM2_member"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sda",
+      "size": 536870912000,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    }
+  ]
+}

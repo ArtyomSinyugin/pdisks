@@ -1,0 +1,18 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "pv",
+        "fields": [
+          { "name": "pv_name" },
+          { "name": "vg_name" },
+          { "name": "pv_fmt" },
+          { "name": "pv_size" },
+          { "name": "pv_free" },
+          { "name": "pv_uuid" }
+        ],
+        "rows": []
+      }
+    }
+  ]
+}

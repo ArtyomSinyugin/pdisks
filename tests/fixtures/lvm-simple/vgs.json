@@ -1,0 +1,25 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "vg",
+        "fields": [
+          { "name": "vg_name" },
+          { "name": "vg_uuid" },
+          { "name": "vg_size" },
+          { "name": "vg_free" }
+        ],
+        "rows": [
+          {
+            "values": [
+              "vg0",
+              "def456-ghi789-jkl012-mno345-pqr678",
+              "536.334GB",
+              "10.00MB"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "pv",
+        "fields": [
+          { "name": "pv_name" },
+          { "name": "vg_name" },
+          { "name": "pv_fmt" },
+          { "name": "pv_size" },
+          { "name": "pv_free" },
+          { "name": "pv_uuid" }
+        ],
+        "rows": [
+          {
+            "values": [
+              "/dev/mapper/luks0",
+              "vg0",
+              "lvm2",
+              "1.073TB",
+              "10.00MB",
+              "i5j6k7l8-m9n0-4o1p-q2r3-s4t5u6v7w8x9"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "lv",
+        "fields": [
+          { "name": "lv_name" },
+          { "name": "vg_name" },
+          { "name": "lv_path" },
+          { "name": "lv_size" },
+          { "name": "lv_attr" },
+          { "name": "lv_uuid" }
+        ],
+        "rows": [
+          {
+            "values": [
+              "root",
+              "vg0",
+              "/dev/vg0/root",
+              "536.324GB",
+              "-wi-ao----",
+              "ghi789-jkl012-mno345-pqr678-stu901"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

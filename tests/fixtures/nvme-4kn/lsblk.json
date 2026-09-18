@@ -1,0 +1,26 @@
+{
+ "blockdevices": [
+  {
+   "name": "nvme0n1",
+   "maj:min": "259:0",
+   "size": "2199023255552",
+   "ro": "0",
+   "type": "disk",
+   "mountpoint": "-",
+   "label": "",
+   "uuid": "",
+   "partuuid": "",
+   "parttype": "",
+   "partlabel": "",
+   "fstype": "",
+   "fsversion": "",
+   "fsavail": "",
+   "fssize": "",
+   "fsused%": "",
+   "state": "",
+   "log-sectorsize": "4096",
+   "phys-sectorsize": "4096",
+   "wwn": ""
+  }
+ ]
+}

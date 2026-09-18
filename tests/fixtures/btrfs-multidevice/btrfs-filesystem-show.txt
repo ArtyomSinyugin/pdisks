@@ -1,0 +1,7 @@
+Label: 'btrfs0'  uuid: a7b8c9d0-e1f2-4a3b-c4d5-e6f7a8b9c0d1
+	Total devices 2
+	FSTYPE	btrfs
+	FS Label	btrfs0
+	Mon Path	SIZE  Used   Device 
+	/dev/sda1	1.00TiB	500.00GiB	sda1
+	/dev/sdb1	1.00TiB	500.00GiB	sdb1

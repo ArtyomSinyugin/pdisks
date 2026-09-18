@@ -1,0 +1,27 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "NVMe",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              { "start": 0, "size": 2199023255552 }
+            ],
+            "model": "Samsung SSD 980 Pro 2TB"
+          },
+          "table": "unknown",
+          "children": []
+        }
+      },
+      "uuid": null,
+      "name": "/dev/nvme0n1",
+      "size": 2199023255552,
+      "status": "empty",
+      "mountpoint": null,
+      "fs": "none"
+    }
+  ]
+}

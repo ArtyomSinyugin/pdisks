@@ -1,0 +1,59 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "NVMe",
+            "has_esp_part": true,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              }
+            ],
+            "model": "Samsung SSD 970 EVO Plus 1TB"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": "A1B2-C3D4",
+              "name": "/dev/nvme0n1p1",
+              "size": 536870912,
+              "status": "efi",
+              "mountpoint": "/boot/efi",
+              "fs": "vfat"
+            },
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 537919488,
+                  "number": 2
+                }
+              },
+              "uuid": "e4f3a2b1-1c2d-4e5f-9a8b-7c6d5e4f3a2b",
+              "name": "/dev/nvme0n1p2",
+              "size": 999667458560,
+              "status": "not_empty",
+              "mountpoint": "/",
+              "fs": "ext4"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/nvme0n1",
+      "size": 1000204886016,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    }
+  ]
+}

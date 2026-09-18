@@ -1,0 +1,18 @@
+{
+  "devices": [
+    {
+      "name": "sda",
+      "path": "/dev/sda",
+      "major": 8,
+      "minor": 0,
+      "size_bytes": 107374182400,
+      "logical_block_size": 512,
+      "physical_block_size": 512,
+      "model": "SAMSUNG MZ7KM960",
+      "serial": "S5EWNJ0R123456",
+      "rotational": true,
+      "removable": false,
+      "read_only": false
+    }
+  ]
+}

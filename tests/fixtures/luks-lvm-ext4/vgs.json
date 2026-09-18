@@ -1,0 +1,25 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "vg",
+        "fields": [
+          { "name": "vg_name" },
+          { "name": "vg_uuid" },
+          { "name": "vg_size" },
+          { "name": "vg_free" }
+        ],
+        "rows": [
+          {
+            "values": [
+              "vg0",
+              "j6k7l8m9-n0o1-4p2q-r3s4-t5u6v7w8x9y0",
+              "1.073TB",
+              "10.00MB"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

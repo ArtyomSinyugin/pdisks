@@ -1,0 +1,18 @@
+{
+   "filesystems": [
+      {
+         "target": "/boot/efi",
+         "source": "/dev/sda1",
+         "fstype": "vfat",
+         "options": "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=mixed,errors=remount-ro",
+         "uuid": "F6A7-B8C9"
+      },
+      {
+         "target": "/",
+         "source": "/dev/sda2",
+         "fstype": "ext4",
+         "options": "rw,relatime",
+         "uuid": "d0e1f2a3-b4c5-4d6e-f7a8-b9c0d1e2f3a4"
+      }
+   ]
+}

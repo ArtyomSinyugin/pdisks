@@ -1,0 +1,18 @@
+{
+  "devices": [
+    {
+      "name": "nvme0n1",
+      "path": "/dev/nvme0n1",
+      "major": 259,
+      "minor": 0,
+      "size_bytes": 2199023255552,
+      "logical_block_size": 4096,
+      "physical_block_size": 4096,
+      "model": "Samsung SSD 980 Pro 2TB",
+      "serial": "S7E1NX0R13579",
+      "rotational": false,
+      "removable": false,
+      "read_only": false
+    }
+  ]
+}

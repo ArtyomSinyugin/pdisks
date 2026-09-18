@@ -1,0 +1,29 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "lv",
+        "fields": [
+          { "name": "lv_name" },
+          { "name": "vg_name" },
+          { "name": "lv_path" },
+          { "name": "lv_size" },
+          { "name": "lv_attr" },
+          { "name": "lv_uuid" }
+        ],
+        "rows": [
+          {
+            "values": [
+              "root",
+              "vg0",
+              "/dev/vg0/root",
+              "1.073TB",
+              "-wi-ao----",
+              "k7l8m9n0-o1p2-4q3r-s4t5-u6v7w8x9y0z1"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+   "filesystems": [
+      {
+         "target": "/boot/efi",
+         "source": "/dev/sda1",
+         "fstype": "vfat",
+         "options": "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=mixed,errors=remount-ro",
+         "uuid": "A7B8-C9D0"
+      },
+      {
+         "target": "/",
+         "source": "/dev/sda2",
+         "fstype": "btrfs",
+         "options": "rw,relatime,ssd,space_cache=v2,subvolid=256,subvol=@",
+         "uuid": "e1f2a3b4-c5d6-4e7f-a8b9-c0d1e2f3a4b5"
+      },
+      {
+         "target": "/home",
+         "source": "/dev/sda2",
+         "fstype": "btrfs",
+         "options": "rw,relatime,ssd,space_cache=v2,subvolid=257,subvol=@home",
+         "uuid": "e1f2a3b4-c5d6-4e7f-a8b9-c0d1e2f3a4b5"
+      }
+   ]
+}

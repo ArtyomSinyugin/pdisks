@@ -1,0 +1,112 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              }
+            ],
+            "model": "WDC WD10EZEX-00BN"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": null,
+              "name": "/dev/sda1",
+              "size": 214747316224,
+              "status": "raid_device:/dev/md0",
+              "mountpoint": null,
+              "fs": "linux_raid_member"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sda",
+      "size": 214748364800,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    },
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              }
+            ],
+            "model": "WDC WD10EZEX-00BN"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": null,
+              "name": "/dev/sdb1",
+              "size": 214747316224,
+              "status": "raid_device:/dev/md0",
+              "mountpoint": null,
+              "fs": "linux_raid_member"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sdb",
+      "size": 214748364800,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    },
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "RAID:1",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 214746762240
+              }
+            ],
+            "model": null
+          },
+          "table": "unknown",
+          "children": []
+        }
+      },
+      "uuid": "f5a6b7c8-9d0e-4f1a-b2c3-d4e5f6a7b8c9",
+      "name": "/dev/md0",
+      "size": 214746762240,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "ext4"
+    }
+  ]
+}

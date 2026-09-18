@@ -1,0 +1,278 @@
+{
+  "manifest_version": 1,
+  "providers": [
+    {
+      "id": "udev-block",
+      "library": {
+        "path": "/usr/lib64/libudev.so",
+        "required_symbols": [
+          "udev_device_get_devnode",
+          "udev_device_get_devtype",
+          "udev_device_get_property_value",
+          "udev_device_get_sysattr_value",
+          "udev_device_get_sysname",
+          "udev_device_new_from_syspath",
+          "udev_device_unref",
+          "udev_enumerate_add_match_subsystem",
+          "udev_enumerate_get_list_entry",
+          "udev_enumerate_new",
+          "udev_enumerate_scan_devices",
+          "udev_enumerate_unref",
+          "udev_list_entry_get_name",
+          "udev_list_entry_get_next",
+          "udev_new",
+          "udev_unref"
+        ]
+      },
+      "capabilities": ["probe"]
+    },
+    {
+      "id": "blkid-signatures",
+      "library": {
+        "path": "/usr/lib64/libblkid.so",
+        "required_symbols": [
+          "blkid_dev_devname",
+          "blkid_dev_iterate_begin",
+          "blkid_dev_iterate_end",
+          "blkid_dev_next",
+          "blkid_get_cache",
+          "blkid_probe_all",
+          "blkid_put_cache",
+          "blkid_tag_iterate_begin",
+          "blkid_tag_iterate_end",
+          "blkid_tag_next"
+        ]
+      },
+      "capabilities": ["probe"]
+    },
+    {
+      "id": "fdisk-partitions",
+      "library": {
+        "path": "/usr/lib64/libfdisk.so",
+        "required_symbols": [
+          "fdisk_assign_device",
+          "fdisk_deassign_device",
+          "fdisk_get_label",
+          "fdisk_get_partitions",
+          "fdisk_get_sector_size",
+          "fdisk_label_get_name",
+          "fdisk_new_context",
+          "fdisk_partition_get_name",
+          "fdisk_partition_get_partno",
+          "fdisk_partition_get_size",
+          "fdisk_partition_get_start",
+          "fdisk_partition_get_type",
+          "fdisk_partition_get_uuid",
+          "fdisk_partition_is_bootable",
+          "fdisk_parttype_get_string",
+          "fdisk_table_get_nents",
+          "fdisk_table_get_partition",
+          "fdisk_unref_context",
+          "fdisk_unref_table"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "libmount-mounts",
+      "library": {
+        "path": "/usr/lib64/libmount.so",
+        "required_symbols": [
+          "mnt_free_iter",
+          "mnt_free_table",
+          "mnt_fs_get_fstype",
+          "mnt_fs_get_options",
+          "mnt_fs_get_source",
+          "mnt_fs_get_target",
+          "mnt_new_iter",
+          "mnt_new_table_from_file",
+          "mnt_table_next_fs"
+        ]
+      },
+      "capabilities": ["probe"]
+    },
+    {
+      "id": "devmapper-topology",
+      "library": {
+        "path": "/usr/lib64/libdevmapper.so",
+        "required_symbols": [
+          "dm_get_next_target",
+          "dm_task_create",
+          "dm_task_destroy",
+          "dm_task_get_deps",
+          "dm_task_get_info",
+          "dm_task_get_names",
+          "dm_task_get_uuid",
+          "dm_task_run",
+          "dm_task_set_name"
+        ]
+      },
+      "capabilities": ["probe", "execute"]
+    },
+    {
+      "id": "cryptsetup-luks",
+      "library": {
+        "path": "/usr/lib64/libcryptsetup.so",
+        "required_symbols": [
+          "crypt_free",
+          "crypt_get_type",
+          "crypt_get_uuid",
+          "crypt_init",
+          "crypt_load"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "lvm",
+      "library": {
+        "path": "/usr/lib64/libbd_lvm.so",
+        "required_symbols": [
+          "bd_lvm_close",
+          "bd_lvm_init",
+          "bd_lvm_lvdata_free",
+          "bd_lvm_lvs",
+          "bd_lvm_pvdata_free",
+          "bd_lvm_pvs",
+          "bd_lvm_vgdata_free",
+          "bd_lvm_vgs",
+          "g_free"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "btrfs",
+      "library": {
+        "path": "/usr/lib64/libbtrfsutil.so.1",
+        "required_symbols": [
+          "btrfs_util_create_subvolume_iterator",
+          "btrfs_util_destroy_subvolume_iterator",
+          "btrfs_util_get_default_subvolume",
+          "btrfs_util_get_subvolume_read_only",
+          "btrfs_util_subvolume_iterator_next",
+          "free"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "zfs",
+      "library": {
+        "path": "/usr/lib64/libzfs.so",
+        "required_symbols": [
+          "libzfs_fini",
+          "libzfs_init",
+          "zfs_close",
+          "zfs_get_name",
+          "zfs_get_type",
+          "zfs_iter_children",
+          "zfs_iter_root",
+          "zpool_close",
+          "zpool_get_name",
+          "zpool_iter"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "nvme",
+      "library": {
+        "path": "/usr/lib64/libnvme.so",
+        "required_symbols": [
+          "nvme_free_tree",
+          "nvme_first_host",
+          "nvme_first_subsystem",
+          "nvme_next_host",
+          "nvme_next_subsystem",
+          "nvme_ctrl_get_name",
+          "nvme_ctrl_get_transport",
+          "nvme_ns_get_eui64",
+          "nvme_ns_get_lba_size",
+          "nvme_ns_get_meta_size",
+          "nvme_ns_get_name",
+          "nvme_ns_get_nguid",
+          "nvme_ns_get_nsid",
+          "nvme_ns_get_uuid",
+          "nvme_scan",
+          "nvme_subsystem_first_ctrl",
+          "nvme_subsystem_first_ns",
+          "nvme_subsystem_get_name",
+          "nvme_subsystem_get_nqn",
+          "nvme_subsystem_next_ctrl",
+          "nvme_subsystem_next_ns"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "libblockdev",
+      "library": {
+        "path": "/usr/lib64/libblockdev.so",
+        "required_symbols": [
+          "bd_get_available_plugin_names",
+          "bd_init",
+          "bd_is_plugin_available"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "mdraid",
+      "library": {
+        "path": "/usr/lib64/libbd_mdraid.so",
+        "required_symbols": [
+          "bd_md_close",
+          "bd_md_detail",
+          "bd_md_detail_data_free",
+          "bd_md_examine",
+          "bd_md_examine_data_free",
+          "bd_md_init",
+          "bd_md_get_status"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "multipath",
+      "library": {
+        "path": "/usr/lib64/libbd_mpath.so",
+        "required_symbols": [
+          "bd_mpath_close",
+          "bd_mpath_get_mpath_members",
+          "bd_mpath_init",
+          "bd_mpath_is_mpath_member",
+          "g_strfreev"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "loop",
+      "library": {
+        "path": "/usr/lib64/libbd_loop.so",
+        "required_symbols": [
+          "bd_loop_close",
+          "bd_loop_info",
+          "bd_loop_info_free",
+          "bd_loop_init",
+          "bd_loop_is_tech_avail"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    },
+    {
+      "id": "swap",
+      "library": {
+        "path": "/usr/lib64/libbd_swap.so",
+        "required_symbols": [
+          "bd_swap_close",
+          "bd_swap_init",
+          "bd_swap_is_tech_avail",
+          "bd_swap_swapstatus"
+        ]
+      },
+      "capabilities": ["probe", "validate", "plan", "execute"]
+    }
+  ]
+}

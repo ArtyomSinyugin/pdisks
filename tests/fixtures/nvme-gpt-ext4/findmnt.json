@@ -1,0 +1,18 @@
+{
+   "filesystems": [
+      {
+         "target": "/boot/efi",
+         "source": "/dev/nvme0n1p1",
+         "fstype": "vfat",
+         "options": "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=mixed,errors=remount-ro",
+         "uuid": "A1B2-C3D4"
+      },
+      {
+         "target": "/",
+         "source": "/dev/nvme0n1p2",
+         "fstype": "ext4",
+         "options": "rw,relatime",
+         "uuid": "e4f3a2b1-1c2d-4e5f-9a8b-7c6d5e4f3a2b"
+      }
+   ]
+}

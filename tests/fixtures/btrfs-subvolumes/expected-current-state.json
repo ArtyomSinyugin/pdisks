@@ -1,0 +1,63 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": true,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              },
+              {
+                "start": 1000205378048,
+                "size": 99306249728
+              }
+            ],
+            "model": "Samsung SSD 870 QVO 1TB"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": "A7B8-C9D0",
+              "name": "/dev/sda1",
+              "size": 536870912,
+              "status": "efi",
+              "mountpoint": "/boot/efi",
+              "fs": "vfat"
+            },
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 537919488,
+                  "number": 2
+                }
+              },
+              "uuid": "e1f2a3b4-c5d6-4e7f-a8b9-c0d1e2f3a4b5",
+              "name": "/dev/sda2",
+              "size": 999667458560,
+              "status": "not_empty",
+              "mountpoint": "/",
+              "fs": "btrfs"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sda",
+      "size": 1099511627776,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    }
+  ]
+}

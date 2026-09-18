@@ -1,0 +1,5 @@
+Personalities : [raid1] 
+md0 : active raid1 sdb1[1] sda1[0]
+      214746752 blocks super 1.2 [2/2] [UU]
+      
+bitmap: 0/8 pages [0/8 KB], 65536k chunk

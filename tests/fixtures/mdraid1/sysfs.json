@@ -1,0 +1,32 @@
+{
+  "devices": [
+    {
+      "name": "sda",
+      "path": "/dev/sda",
+      "major": 8,
+      "minor": 0,
+      "size_bytes": 214748364800,
+      "logical_block_size": 512,
+      "physical_block_size": 512,
+      "model": "WDC WD10EZEX-00BN",
+      "serial": "WD-CC2E60ABCD1234",
+      "rotational": true,
+      "removable": false,
+      "read_only": false
+    },
+    {
+      "name": "sdb",
+      "path": "/dev/sdb",
+      "major": 8,
+      "minor": 16,
+      "size_bytes": 214748364800,
+      "logical_block_size": 512,
+      "physical_block_size": 512,
+      "model": "WDC WD10EZEX-00BN",
+      "serial": "WD-CC2E60ABCD5678",
+      "rotational": true,
+      "removable": false,
+      "read_only": false
+    }
+  ]
+}

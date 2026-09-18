@@ -1,0 +1,89 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 1048576
+              },
+              {
+                "start": 1073742872576,
+                "size": 25768755200
+              }
+            ],
+            "model": "Seagate ST4000DM004-2U91"
+          },
+          "table": "GPT",
+          "children": [
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 1048576,
+                  "number": 1
+                }
+              },
+              "uuid": null,
+              "name": "/dev/sda1",
+              "size": 536870912000,
+              "status": "not_empty",
+              "mountpoint": null,
+              "fs": "ext4"
+            },
+            {
+              "kind": {
+                "partition": {
+                  "start_byte": 536871960576,
+                  "number": 2
+                }
+              },
+              "uuid": null,
+              "name": "/dev/sda2",
+              "size": 536870912000,
+              "status": "raid_device:/dev/md0",
+              "mountpoint": null,
+              "fs": "linux_raid_member"
+            }
+          ]
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sda",
+      "size": 1099511627776,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "none"
+    },
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "RAID:1",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              {
+                "start": 0,
+                "size": 536870912000
+              }
+            ],
+            "model": null
+          },
+          "table": "unknown",
+          "children": []
+        }
+      },
+      "uuid": "c9d0e1f2-a3b4-4c5d-e6f7-a8b9c0d1e2f3",
+      "name": "/dev/md0",
+      "size": 536870912000,
+      "status": "not_empty",
+      "mountpoint": null,
+      "fs": "ext4"
+    }
+  ]
+}

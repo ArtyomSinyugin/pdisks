@@ -1,0 +1,18 @@
+{
+  "devices": [
+    {
+      "name": "nvme0n1",
+      "path": "/dev/nvme0n1",
+      "major": 259,
+      "minor": 0,
+      "size_bytes": 1000204886016,
+      "logical_block_size": 512,
+      "physical_block_size": 512,
+      "model": "Samsung SSD 970 EVO Plus 1TB",
+      "serial": "S6EVNF0R901234",
+      "rotational": false,
+      "removable": false,
+      "read_only": false
+    }
+  ]
+}

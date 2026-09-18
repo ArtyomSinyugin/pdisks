@@ -1,0 +1,29 @@
+{
+  "block_device": [
+    {
+      "report": {
+        "label": "pv",
+        "fields": [
+          { "name": "pv_name" },
+          { "name": "vg_name" },
+          { "name": "pv_fmt" },
+          { "name": "pv_size" },
+          { "name": "pv_free" },
+          { "name": "pv_uuid" }
+        ],
+        "rows": [
+          {
+            "values": [
+              "/dev/sda2",
+              "vg0",
+              "lvm2",
+              "536.334GB",
+              "10.00MB",
+              "abc123-def45-ghi67-jkl89-mno01"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "devices": [
+    {
+      "kind": {
+        "disk": {
+          "meta": {
+            "disk_type": "SATA/SCSI",
+            "has_esp_part": false,
+            "has_bios_boot_part": false,
+            "free_regions": [
+              { "start": 0, "size": 107374182400 }
+            ],
+            "model": "SAMSUNG MZ7KM960"
+          },
+          "table": "unknown",
+          "children": []
+        }
+      },
+      "uuid": null,
+      "name": "/dev/sda",
+      "size": 107374182400,
+      "status": "empty",
+      "mountpoint": null,
+      "fs": "none"
+    }
+  ]
+}
