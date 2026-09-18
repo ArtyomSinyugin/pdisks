@@ -1,0 +1,16 @@
+{
+  "Devices": [
+    {
+      "NameSpace": 1,
+      "DevicePath": "/dev/nvme0n1",
+      "GenericPath": "/dev/ng0n1",
+      "Firmware": "1.0",
+      "ModelNumber": "FIXTURE NVME",
+      "SerialNumber": "SERIAL0001",
+      "UsedBytes": 512110190592,
+      "MaximumLBA": 1000215216,
+      "PhysicalSize": 512110190592,
+      "SectorSize": 512
+    }
+  ]
+}

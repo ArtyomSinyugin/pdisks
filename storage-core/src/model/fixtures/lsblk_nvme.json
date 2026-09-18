@@ -1,0 +1,59 @@
+{
+  "blockdevices": [
+    {
+      "path": "/dev/nvme0n1",
+      "maj:min": "259:0",
+      "size": 512110190592,
+      "type": "disk",
+      "model": "FIXTURE NVME",
+      "serial": "SERIAL0001",
+      "log-sec": 512,
+      "phy-sec": 512,
+      "pttype": "gpt",
+      "ro": false,
+      "rota": false,
+      "rm": false,
+      "tran": "nvme",
+      "wwn": "eui.0001020304050607",
+      "zoned": "none",
+      "children": [
+        {
+          "path": "/dev/nvme0n1p1",
+          "maj:min": "259:1",
+          "size": 535822336,
+          "type": "part",
+          "partn": 1,
+          "partuuid": "10000000-0000-0000-0000-000000000001",
+          "start": 2048,
+          "fstype": "vfat",
+          "uuid": "AAAA-BBBB",
+          "mountpoints": ["/boot/efi"]
+        },
+        {
+          "path": "/dev/nvme0n1p2",
+          "maj:min": "259:2",
+          "size": 15530459136,
+          "type": "part",
+          "partn": 2,
+          "partuuid": "10000000-0000-0000-0000-000000000002",
+          "start": 1048576,
+          "fstype": "swap",
+          "uuid": "20000000-0000-0000-0000-000000000002",
+          "mountpoints": ["[SWAP]"]
+        },
+        {
+          "path": "/dev/nvme0n1p3",
+          "maj:min": "259:3",
+          "size": 496042508288,
+          "type": "part",
+          "partn": 3,
+          "partuuid": "10000000-0000-0000-0000-000000000003",
+          "start": 31381504,
+          "fstype": "ext4",
+          "uuid": "20000000-0000-0000-0000-000000000003",
+          "mountpoints": ["/home", "/"]
+        }
+      ]
+    }
+  ]
+}
