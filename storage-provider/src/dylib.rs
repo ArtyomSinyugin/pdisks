@@ -3,7 +3,7 @@
 
 //! Isolated dynamic-library loading boundary.
 
-use std::{ffi::c_void, path::PathBuf};
+use std::{ffi::c_void, mem::ManuallyDrop, path::PathBuf};
 
 use libloading::{Library, Symbol};
 
@@ -30,7 +30,9 @@ mod zfs;
 
 /// Loaded native library retained for a provider-specific typed FFI adapter.
 pub(super) struct LoadedLibrary {
-    handle: Library,
+    /// Process-lifetime handle for a library whose initializers may register
+    /// global state that cannot be undone safely by `dlclose`.
+    handle: ManuallyDrop<Library>,
 }
 
 impl std::fmt::Debug for LoadedLibrary {
@@ -48,6 +50,9 @@ impl LoadedLibrary {
         let Ok(library) = (unsafe { Library::new(&requirement.path) }) else {
             return None;
         };
+        let loaded = Self {
+            handle: ManuallyDrop::new(library),
+        };
 
         for symbol in &requirement.required_symbols {
             let mut name = Vec::with_capacity(symbol.len() + 1);
@@ -56,12 +61,12 @@ impl LoadedLibrary {
             // SAFETY: validation rejects interior NUL bytes, the appended NUL
             // terminates the name, and the raw address is not called here.
             let resolved: Result<Symbol<'_, *const c_void>, _> =
-                unsafe { library.get(name.as_slice()) };
+                unsafe { loaded.handle.get(name.as_slice()) };
             if resolved.is_err() {
                 return None;
             }
         }
-        Some(Self { handle: library })
+        Some(loaded)
     }
 
     /// Reads `/proc/self/mountinfo` through libmount.
@@ -170,4 +175,15 @@ unsafe fn load_symbol<'library, T>(
 fn symbol_name(name: &'static [u8]) -> &'static str {
     let name = name.strip_suffix(&[0]).unwrap_or(name);
     std::str::from_utf8(name).unwrap_or("invalid symbol name")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoadedLibrary;
+
+    #[test]
+    /// Guards the process-lifetime handle required by libraries with global registries.
+    fn loaded_library_handle_is_not_dropped() {
+        assert!(!std::mem::needs_drop::<LoadedLibrary>());
+    }
 }
