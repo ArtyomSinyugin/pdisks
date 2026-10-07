@@ -93,12 +93,6 @@ const EXPECTED_PROVIDERS: &[ExpectedProvider] = &[
         live_state_adapter: true,
     },
     ExpectedProvider {
-        id: "libblockdev",
-        responsibility: "storage.operations",
-        model_contract: "provider validation/planning/execution capabilities",
-        live_state_adapter: false,
-    },
-    ExpectedProvider {
         id: "mdraid",
         responsibility: "mdraid.topology",
         model_contract: "MdArray/MdMember + MemberOf",
