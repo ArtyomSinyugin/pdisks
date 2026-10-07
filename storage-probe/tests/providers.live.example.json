@@ -46,6 +46,29 @@
       "capabilities": ["probe"]
     },
     {
+      "id": "filesystems",
+      "library": {
+        "path": "/usr/lib64/libbd_fs.so",
+        "required_symbols": [
+          "bd_fs_can_check",
+          "bd_fs_can_mkfs",
+          "bd_fs_can_repair",
+          "bd_fs_can_resize",
+          "bd_fs_can_get_free_space",
+          "bd_fs_can_get_min_size",
+          "bd_fs_can_get_size",
+          "bd_fs_can_set_label",
+          "bd_fs_can_set_uuid",
+          "bd_fs_close",
+          "bd_fs_features",
+          "bd_fs_init",
+          "bd_fs_supported_filesystems",
+          "g_free"
+        ]
+      },
+      "capabilities": ["probe", "validate"]
+    },
+    {
       "id": "fdisk-partitions",
       "library": {
         "path": "/usr/lib64/libfdisk.so",

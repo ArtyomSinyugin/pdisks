@@ -33,6 +33,12 @@ const EXPECTED_PROVIDERS: &[ExpectedProvider] = &[
         live_state_adapter: true,
     },
     ExpectedProvider {
+        id: "filesystems",
+        responsibility: "storage.operations",
+        model_contract: "filesystem features + host operation availability",
+        live_state_adapter: false,
+    },
+    ExpectedProvider {
         id: "fdisk-partitions",
         responsibility: "partition.topology",
         model_contract: "PartitionTable/Partition + Contains",
@@ -217,6 +223,59 @@ fn native_current_state_adapter_matrix_is_complete() {
         "native providers without a live CurrentState adapter: {}",
         missing.join(", ")
     );
+}
+
+#[test]
+#[ignore = "requires PDISKS_PROVIDER_MANIFEST and installed libblockdev-fs"]
+/// Reports ordinary filesystem capabilities and their runtime utility dependencies.
+fn native_filesystem_capability_matrix_is_available() {
+    let registry = registry();
+    let descriptor = provider(&registry, "filesystems");
+    let capabilities = descriptor
+        .probe_filesystem_capabilities()
+        .unwrap_or_else(|error| panic!("probe libblockdev-fs capabilities: {error}"));
+
+    println!("\nlibblockdev-fs capability matrix");
+    println!(
+        "{:<10} {:<12} {:<12} {:<12} {:<12} {}",
+        "filesystem", "create", "check", "repair", "set-label", "resize"
+    );
+    println!("{}", "-".repeat(88));
+    for fs in &capabilities {
+        println!(
+            "{:<10} {:<12} {:<12} {:<12} {:<12} off(-/+)={}/{} on(-/+)={}/{}",
+            fs.filesystem,
+            availability_summary(&fs.create),
+            availability_summary(&fs.check),
+            availability_summary(&fs.repair),
+            availability_summary(&fs.set_label),
+            fs.resize.offline_shrink,
+            fs.resize.offline_grow,
+            fs.resize.online_shrink,
+            fs.resize.online_grow,
+        );
+    }
+
+    assert!(!capabilities.is_empty());
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability.filesystem == "ext4")
+    );
+}
+
+/// Formats host availability for the live capability report.
+fn availability_summary(
+    availability: &storage_provider::FilesystemOperationAvailability,
+) -> String {
+    if availability.available {
+        "yes".to_owned()
+    } else {
+        availability
+            .required_utility
+            .as_deref()
+            .map_or_else(|| "no".to_owned(), |utility| format!("need:{utility}"))
+    }
 }
 
 #[test]

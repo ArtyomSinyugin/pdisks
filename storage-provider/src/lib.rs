@@ -272,6 +272,96 @@ impl RegisteredProvider {
             LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
         }
     }
+
+    /// Reports ordinary-filesystem operations exposed by libblockdev-fs.
+    ///
+    /// The result distinguishes support compiled into libblockdev from host
+    /// availability, because many libblockdev filesystem operations delegate
+    /// to a filesystem-specific utility installed on the host.
+    pub fn probe_filesystem_capabilities(
+        &self,
+    ) -> Result<Vec<FilesystemCapabilities>, NativeProbeError> {
+        match &self.backend {
+            LoadedBackend::Library { library } => library.probe_filesystem_capabilities(),
+            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        }
+    }
+}
+
+/// Host availability of one filesystem operation exposed by libblockdev-fs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemOperationAvailability {
+    /// Whether the operation can be performed on this host.
+    pub available: bool,
+    /// External utility required by libblockdev when the operation is unavailable.
+    pub required_utility: Option<String>,
+}
+
+/// Resize directions supported by one filesystem implementation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilesystemResizeCapabilities {
+    /// Shrinking while unmounted is supported by the implementation.
+    pub offline_shrink: bool,
+    /// Growing while unmounted is supported by the implementation.
+    pub offline_grow: bool,
+    /// Shrinking while mounted is supported by the implementation.
+    pub online_shrink: bool,
+    /// Growing while mounted is supported by the implementation.
+    pub online_grow: bool,
+}
+
+/// Creation options accepted by one filesystem implementation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilesystemCreateOptions {
+    /// A label can be assigned during creation.
+    pub label: bool,
+    /// A UUID can be assigned during creation.
+    pub uuid: bool,
+    /// The implementation provides a dry-run mode.
+    pub dry_run: bool,
+    /// Discard can be disabled during creation.
+    pub no_discard: bool,
+    /// A force flag is accepted.
+    pub force: bool,
+    /// Partition-table probing can be disabled.
+    pub no_partition_table: bool,
+}
+
+/// Static and host-specific capabilities of one ordinary filesystem backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemCapabilities {
+    /// Filesystem name accepted by libblockdev-fs.
+    pub filesystem: String,
+    /// Resize modes implemented for this filesystem.
+    pub resize: FilesystemResizeCapabilities,
+    /// Options accepted by the generic mkfs entrypoint.
+    pub create_options: FilesystemCreateOptions,
+    /// Minimum filesystem size reported by libblockdev.
+    pub minimum_size: u64,
+    /// Maximum filesystem size reported by libblockdev, or zero if unspecified.
+    pub maximum_size: u64,
+    /// Native partition identifier suggested for MBR.
+    pub partition_id: Option<String>,
+    /// Native partition type suggested for GPT.
+    pub partition_type: Option<String>,
+    /// Filesystem creation availability on this host.
+    pub create: FilesystemOperationAvailability,
+    /// Filesystem resize availability on this host.
+    pub resize_operation: FilesystemOperationAvailability,
+    /// Filesystem consistency-check availability on this host.
+    pub check: FilesystemOperationAvailability,
+    /// Filesystem repair availability on this host.
+    pub repair: FilesystemOperationAvailability,
+    /// Label modification availability on this host.
+    pub set_label: FilesystemOperationAvailability,
+    /// UUID modification availability on this host.
+    pub set_uuid: FilesystemOperationAvailability,
+    /// Filesystem size query availability on this host.
+    pub get_size: FilesystemOperationAvailability,
+    /// Free-space query availability on this host.
+    pub get_free_space: FilesystemOperationAvailability,
+    /// Minimum-size query availability on this host.
+    pub get_minimum_size: FilesystemOperationAvailability,
 }
 
 /// One Linux block endpoint returned by libudev.

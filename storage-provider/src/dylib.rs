@@ -8,9 +8,9 @@ use std::{ffi::c_void, mem::ManuallyDrop, path::PathBuf};
 use libloading::{Library, Symbol};
 
 use crate::{
-    BlkidEntry, BtrfsEntry, CryptsetupEntry, DevmapperEntry, FdiskTable, LibmountEntry, LoopEntry,
-    LvmEntry, MdraidEntry, MultipathEntry, NativeProbeError, NvmeEntry, ProviderLibrary, SwapEntry,
-    UdevBlockEntry, ZfsEntry,
+    BlkidEntry, BtrfsEntry, CryptsetupEntry, DevmapperEntry, FdiskTable, FilesystemCapabilities,
+    LibmountEntry, LoopEntry, LvmEntry, MdraidEntry, MultipathEntry, NativeProbeError, NvmeEntry,
+    ProviderLibrary, SwapEntry, UdevBlockEntry, ZfsEntry,
 };
 
 mod blkid;
@@ -18,6 +18,7 @@ mod btrfs;
 mod cryptsetup;
 mod devmapper;
 mod fdisk;
+mod filesystem;
 mod libmount;
 mod loopdev;
 mod lvm;
@@ -156,6 +157,13 @@ impl LoadedLibrary {
     /// Reads the live NVMe subsystem topology.
     pub(super) fn probe_nvme(&self) -> Result<NvmeEntry, NativeProbeError> {
         nvme::probe(&self.handle)
+    }
+
+    /// Reports ordinary-filesystem features and host tool availability.
+    pub(super) fn probe_filesystem_capabilities(
+        &self,
+    ) -> Result<Vec<FilesystemCapabilities>, NativeProbeError> {
+        filesystem::probe_capabilities(&self.handle)
     }
 }
 
