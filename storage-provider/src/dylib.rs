@@ -36,6 +36,8 @@ pub(super) struct LoadedLibrary {
     /// Process-lifetime handle for a library whose initializers may register
     /// global state that cannot be undone safely by `dlclose`.
     handle: ManuallyDrop<Library>,
+    /// Explicit dependency handles retained for multi-library adapters.
+    auxiliary: ManuallyDrop<Vec<Library>>,
 }
 
 impl std::fmt::Debug for LoadedLibrary {
@@ -53,23 +55,25 @@ impl LoadedLibrary {
         let Ok(library) = (unsafe { Library::new(&requirement.path) }) else {
             return None;
         };
-        let loaded = Self {
-            handle: ManuallyDrop::new(library),
-        };
-
-        for symbol in &requirement.required_symbols {
-            let mut name = Vec::with_capacity(symbol.len() + 1);
-            name.extend_from_slice(symbol.as_bytes());
-            name.push(0);
-            // SAFETY: validation rejects interior NUL bytes, the appended NUL
-            // terminates the name, and the raw address is not called here.
-            let resolved: Result<Symbol<'_, *const c_void>, _> =
-                unsafe { loaded.handle.get(name.as_slice()) };
-            if resolved.is_err() {
+        if !has_symbols(&library, &requirement.required_symbols) {
+            return None;
+        }
+        let mut auxiliary = Vec::with_capacity(requirement.auxiliary.len());
+        for dependency in &requirement.auxiliary {
+            // SAFETY: auxiliary paths are absolute and package-owned; handles
+            // are retained for the process lifetime after successful loading.
+            let Ok(handle) = (unsafe { Library::new(&dependency.path) }) else {
+                return None;
+            };
+            if !has_symbols(&handle, &dependency.required_symbols) {
                 return None;
             }
+            auxiliary.push(handle);
         }
-        Some(loaded)
+        Some(Self {
+            handle: ManuallyDrop::new(library),
+            auxiliary: ManuallyDrop::new(auxiliary),
+        })
     }
 
     /// Reads `/proc/self/mountinfo` through libmount.
@@ -166,7 +170,7 @@ impl LoadedLibrary {
 
     /// Reads imported ZFS pools and datasets.
     pub(super) fn probe_zfs(&self) -> Result<ZfsEntry, NativeProbeError> {
-        zfs::probe(&self.handle)
+        zfs::probe(self)
     }
 
     /// Reads the live NVMe subsystem topology.
@@ -180,6 +184,41 @@ impl LoadedLibrary {
     ) -> Result<Vec<FilesystemCapabilities>, NativeProbeError> {
         filesystem::probe_capabilities(&self.handle)
     }
+}
+
+/// Resolves all declared symbols from one freshly loaded library.
+fn has_symbols(library: &Library, symbols: &std::collections::BTreeSet<String>) -> bool {
+    symbols.iter().all(|symbol| {
+        let mut name = Vec::with_capacity(symbol.len() + 1);
+        name.extend_from_slice(symbol.as_bytes());
+        name.push(0);
+        // SAFETY: manifest validation rejects interior NUL bytes; this only
+        // verifies presence and never calls the untyped address.
+        unsafe { library.get::<*const c_void>(name.as_slice()) }.is_ok()
+    })
+}
+
+/// Loads a typed symbol from the main library or an explicit auxiliary.
+unsafe fn load_symbol_from_set<'library, T>(
+    libraries: &'library LoadedLibrary,
+    name: &'static [u8],
+) -> Result<Symbol<'library, T>, NativeProbeError> {
+    // Prefer explicit auxiliaries so a symbol is borrowed from the library
+    // whose ABI declaration the manifest validated.
+    for library in libraries.auxiliary.iter() {
+        // SAFETY: the caller supplies the exact signature and `Symbol` remains
+        // borrowed from a retained library handle.
+        if let Ok(symbol) = unsafe { library.get::<T>(name) } {
+            return Ok(symbol);
+        }
+    }
+    // SAFETY: same signature and lifetime invariant as auxiliary handles.
+    if let Ok(symbol) = unsafe { libraries.handle.get::<T>(name) } {
+        return Ok(symbol);
+    }
+    Err(NativeProbeError::MissingSymbol {
+        symbol: symbol_name(name),
+    })
 }
 
 /// Loads one typed symbol while preserving its borrow from the library.

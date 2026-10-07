@@ -69,6 +69,20 @@ pub struct ProviderLibrary {
     /// Symbols required by the compiled pdisks adapter.
     #[serde(default)]
     pub required_symbols: BTreeSet<String>,
+    /// Additional libraries consumed by the same typed adapter.
+    #[serde(default)]
+    pub auxiliary: Vec<AuxiliaryLibrary>,
+}
+
+/// Additional dynamic library retained by a multi-library provider adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuxiliaryLibrary {
+    /// Absolute path supplied by the target package build.
+    pub path: PathBuf,
+    /// Symbols resolved from this auxiliary library.
+    #[serde(default)]
+    pub required_symbols: BTreeSet<String>,
 }
 
 /// Versioned project-owned collection of provider integrations.
@@ -701,9 +715,84 @@ pub struct BtrfsCapabilities {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZfsEntry {
     /// Imported storage pools.
-    pub pools: Vec<String>,
+    pub pools: Vec<ZfsPoolEntry>,
     /// Filesystems and volumes visible below imported pools.
     pub datasets: Vec<ZfsDatasetEntry>,
+}
+
+/// One imported ZFS pool and its virtual-device tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZfsPoolEntry {
+    /// Canonical pool name.
+    pub name: String,
+    /// Stable pool GUID.
+    pub guid: Option<u64>,
+    /// Native pool state value returned by libzfs.
+    pub state: i32,
+    /// Flattened virtual-device tree with parent identities.
+    pub vdevs: Vec<ZfsVdevEntry>,
+}
+
+/// One ZFS virtual device copied from the pool configuration nvlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZfsVdevEntry {
+    /// Stable vdev GUID when present in the pool configuration.
+    pub guid: Option<u64>,
+    /// Parent vdev GUID, or `None` for a top-level allocation vdev.
+    pub parent_guid: Option<u64>,
+    /// Allocation class used when this is a top-level vdev.
+    pub class: Option<ZfsVdevClass>,
+    /// Vdev layout.
+    pub kind: ZfsVdevKind,
+    /// Backing path for leaf devices.
+    pub path: Option<PathBuf>,
+    /// Allocated size reported by the pool configuration.
+    pub size: Option<u64>,
+    /// Whether the vdev is currently marked missing.
+    pub missing: bool,
+    /// Whether the vdev is currently marked faulted.
+    pub faulted: bool,
+    /// Whether the vdev is currently marked degraded.
+    pub degraded: bool,
+}
+
+/// ZFS virtual-device layouts represented by the canonical storage model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZfsVdevKind {
+    /// One disk or file leaf.
+    Leaf,
+    /// Mirrored children.
+    Mirror,
+    /// RAIDZ with the supplied parity width.
+    RaidZ { parity: u8 },
+    /// Distributed RAID layout.
+    DRaid {
+        /// Parity width.
+        parity: u8,
+        /// Data-device width.
+        data_width: u32,
+        /// Distributed spare count.
+        distributed_spares: u16,
+    },
+    /// Provider layout not represented by a dedicated variant.
+    Other(String),
+}
+
+/// Allocation class of a top-level ZFS vdev.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZfsVdevClass {
+    /// Ordinary data allocation.
+    Data,
+    /// ZFS intent log.
+    Log,
+    /// Special allocation class.
+    Special,
+    /// Deduplication-table allocation class.
+    Dedup,
+    /// Level-two ARC cache.
+    Cache,
+    /// Hot spare.
+    Spare,
 }
 
 /// One ZFS filesystem or volume.
@@ -713,6 +802,16 @@ pub struct ZfsDatasetEntry {
     pub name: String,
     /// Dataset object type.
     pub kind: ZfsDatasetKind,
+    /// Effective mountpoint property when returned by libzfs_core.
+    pub mountpoint: Option<String>,
+    /// Effective compression property when returned by libzfs_core.
+    pub compression: Option<String>,
+    /// Effective quota in bytes, with zero representing no quota.
+    pub quota: Option<u64>,
+    /// Zvol size in bytes.
+    pub volume_size: Option<u64>,
+    /// Snapshot origin of a clone.
+    pub origin: Option<String>,
 }
 
 /// ZFS object kinds represented by the canonical model.
@@ -942,21 +1041,9 @@ fn validate_manifest(path: &Path, manifest: &ProviderManifest) -> Result<(), Pro
         });
     }
     if let Some(library) = &manifest.library {
-        if !library.path.is_absolute() {
-            return Err(ProviderError::RelativeLibrary {
-                path: path.to_path_buf(),
-                library: library.path.clone(),
-            });
-        }
-        if let Some(symbol) = library
-            .required_symbols
-            .iter()
-            .find(|symbol| symbol.as_bytes().contains(&0))
-        {
-            return Err(ProviderError::InvalidLibrarySymbol {
-                path: path.to_path_buf(),
-                symbol: symbol.clone(),
-            });
+        validate_library_fields(path, &library.path, &library.required_symbols)?;
+        for auxiliary in &library.auxiliary {
+            validate_library_fields(path, &auxiliary.path, &auxiliary.required_symbols)?;
         }
     }
     if let Some(executable) = &manifest.executable
@@ -965,6 +1052,27 @@ fn validate_manifest(path: &Path, manifest: &ProviderManifest) -> Result<(), Pro
         return Err(ProviderError::RelativeExecutable {
             path: path.to_path_buf(),
             executable: executable.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates one main or auxiliary dynamic-library declaration.
+fn validate_library_fields(
+    manifest_path: &Path,
+    library_path: &Path,
+    symbols: &BTreeSet<String>,
+) -> Result<(), ProviderError> {
+    if !library_path.is_absolute() {
+        return Err(ProviderError::RelativeLibrary {
+            path: manifest_path.to_path_buf(),
+            library: library_path.to_path_buf(),
+        });
+    }
+    if let Some(symbol) = symbols.iter().find(|symbol| symbol.as_bytes().contains(&0)) {
+        return Err(ProviderError::InvalidLibrarySymbol {
+            path: manifest_path.to_path_buf(),
+            symbol: symbol.clone(),
         });
     }
     Ok(())
@@ -1164,11 +1272,28 @@ mod tests {
         relative.library = Some(ProviderLibrary {
             path: PathBuf::from("/usr/lib64/libblock.so"),
             required_symbols: BTreeSet::from([String::from("bad\0symbol")]),
+            auxiliary: Vec::new(),
         });
         write_manifests(&directory, manifests(vec![relative]));
         assert!(matches!(
             ProviderRegistry::load_from(path),
             Err(ProviderError::InvalidLibrarySymbol { .. })
+        ));
+
+        let mut relative_auxiliary = manifest("block", "/bin/true");
+        relative_auxiliary.executable = None;
+        relative_auxiliary.library = Some(ProviderLibrary {
+            path: PathBuf::from("/usr/lib64/libblock.so"),
+            required_symbols: BTreeSet::new(),
+            auxiliary: vec![AuxiliaryLibrary {
+                path: PathBuf::from("libhelper.so"),
+                required_symbols: BTreeSet::new(),
+            }],
+        });
+        let path = write_manifests(&directory, manifests(vec![relative_auxiliary]));
+        assert!(matches!(
+            ProviderRegistry::load_from(path),
+            Err(ProviderError::RelativeLibrary { .. })
         ));
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
     }

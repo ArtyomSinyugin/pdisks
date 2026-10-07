@@ -7,13 +7,14 @@ use std::{
 };
 
 use storage_core::model::{
-    BlockFacts, BlockGeometry, BlockSize, BtrfsAllocation, Bytes, Dependency, DependencyKind,
-    DeviceInfo, DeviceNumber, Diagnostic, DiagnosticSeverity, DiagnosticSubject, ExternalId,
-    FilesystemKind, LuksVersion, LvmLv, LvmLvKind, MdArray, MdExternalMetadata, MdMember,
-    MdMemberRole, MdMetadata, MdNativeMetadata, MdPersonality, MdRaid, MdRaid0Layout, MemberRole,
-    MountContext, MountSource, NetworkMountSource, Node, NodeFacts, NodeGraph, NodeId, NodeKind,
-    NodeSpec, NvmeLbaFormat, NvmeNamespace, NvmeNamespaceId, ObservedMount, PartitionAttributes,
-    PartitionTable, Presence, Relation, RelationKind, Transport,
+    BlockFacts, BlockGeometry, BlockSize, BtrfsAllocation, Bytes, DataStripeCount, Dependency,
+    DependencyKind, DeviceInfo, DeviceNumber, Diagnostic, DiagnosticSeverity, DiagnosticSubject,
+    ExternalId, FilesystemKind, LuksVersion, LvmLv, LvmLvKind, MdArray, MdExternalMetadata,
+    MdMember, MdMemberRole, MdMetadata, MdNativeMetadata, MdPersonality, MdRaid, MdRaid0Layout,
+    MemberRole, MountContext, MountSource, NetworkMountSource, Node, NodeFacts, NodeGraph, NodeId,
+    NodeKind, NodeSpec, NvmeLbaFormat, NvmeNamespace, NvmeNamespaceId, ObservedMount,
+    PartitionAttributes, PartitionTable, Presence, Relation, RelationKind, Transport, ZfsMember,
+    ZfsParity, ZfsVdevClass, ZfsVdevKind,
 };
 use storage_provider::{ProviderBackend, RegisteredProvider, UdevBlockEntry};
 use uuid::Uuid;
@@ -431,7 +432,7 @@ impl StateProvider for NativeSystemProvider<'_> {
         };
         enrich_btrfs_filesystems(&mut state.graph, &btrfs_filesystems);
         enrich_btrfs(&mut state.graph, &state.mounts, &btrfs);
-        enrich_zfs(&mut state.graph, &zfs);
+        state.diagnostics.extend(enrich_zfs(&mut state.graph, &zfs));
         enrich_nvme(&mut state.graph, &nvme);
         Ok(state)
     }
@@ -1209,13 +1210,22 @@ fn enrich_btrfs(
 }
 
 /// Adds imported ZFS pools, filesystems, and volumes.
-fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) {
+fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
     let pools = topology
         .pools
         .iter()
-        .map(|name| (name.as_str(), stable_node_id("zfs-pool", name)))
+        .map(|pool| {
+            let identity = pool
+                .guid
+                .map_or_else(|| pool.name.clone(), |guid| guid.to_string());
+            (
+                pool.name.as_str(),
+                (stable_node_id("zfs-pool", &identity), pool),
+            )
+        })
         .collect::<HashMap<_, _>>();
-    for (name, id) in &pools {
+    for (name, (id, pool)) in &pools {
         graph.insert_node(
             *id,
             Node {
@@ -1227,10 +1237,118 @@ fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) {
                 },
                 size: NodeFacts {
                     presence: Presence::Present,
+                    identities: pool
+                        .guid
+                        .map_or_else(Vec::new, |guid| vec![ExternalId::ZfsGuid(guid)]),
                     ..NodeFacts::default()
                 },
             },
         );
+
+        let vdev_ids = pool
+            .vdevs
+            .iter()
+            .filter_map(|vdev| {
+                vdev.guid
+                    .map(|guid| (guid, stable_node_id("zfs-vdev", &guid.to_string())))
+            })
+            .collect::<HashMap<_, _>>();
+        for (index, vdev) in pool.vdevs.iter().enumerate() {
+            let vdev_id = vdev.guid.map_or_else(
+                || {
+                    stable_node_id(
+                        "zfs-vdev",
+                        &format!(
+                            "{}:{index}:{}",
+                            pool.name,
+                            vdev.path
+                                .as_deref()
+                                .unwrap_or_else(|| Path::new("unknown"))
+                                .display()
+                        ),
+                    )
+                },
+                |guid| stable_node_id("zfs-vdev", &guid.to_string()),
+            );
+            graph.insert_node(
+                vdev_id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::ZfsVdev(zfs_vdev_kind(&vdev.kind)),
+                        size: vdev.size.map(Bytes::new),
+                    },
+                    size: NodeFacts {
+                        presence: if vdev.missing {
+                            Presence::Missing
+                        } else {
+                            Presence::Present
+                        },
+                        identities: vdev
+                            .guid
+                            .map_or_else(Vec::new, |guid| vec![ExternalId::ZfsGuid(guid)]),
+                        ..NodeFacts::default()
+                    },
+                },
+            );
+            if vdev.faulted || vdev.degraded {
+                diagnostics.push(Diagnostic {
+                    code: if vdev.faulted {
+                        "zfs.vdev_faulted".to_owned()
+                    } else {
+                        "zfs.vdev_degraded".to_owned()
+                    },
+                    severity: DiagnosticSeverity::Warning,
+                    subjects: vec![DiagnosticSubject::Node(vdev_id)],
+                    message: format!(
+                        "ZFS vdev {} is {}",
+                        vdev.guid.map_or_else(
+                            || vdev.path.as_deref().map_or_else(
+                                || "<unknown>".to_owned(),
+                                |path| path.display().to_string()
+                            ),
+                            |guid| guid.to_string()
+                        ),
+                        if vdev.faulted { "faulted" } else { "degraded" }
+                    ),
+                    evidence: vdev.path.as_ref().map(|path| path.display().to_string()),
+                    suggested_remedy: Some(
+                        "inspect pool status and replace or restore the affected vdev".to_owned(),
+                    ),
+                });
+            }
+            if let Some(parent_id) = vdev
+                .parent_guid
+                .and_then(|guid| vdev_ids.get(&guid).copied())
+            {
+                graph.insert_dependency(Dependency {
+                    from: vdev_id,
+                    to: parent_id,
+                    kind: DependencyKind::MemberOf(MemberRole::Zfs(ZfsMember::Child)),
+                });
+            } else if let Some(class) = vdev.class.map(zfs_vdev_class) {
+                graph.insert_dependency(Dependency {
+                    from: vdev_id,
+                    to: *id,
+                    kind: DependencyKind::MemberOf(MemberRole::Zfs(ZfsMember::TopLevel(class))),
+                });
+            }
+            let device_id = vdev.path.as_ref().and_then(|path| {
+                graph.nodes().find_map(|(node_id, node)| {
+                    node.size
+                        .block
+                        .as_ref()
+                        .is_some_and(|block| block.paths.contains(path))
+                        .then_some(*node_id)
+                })
+            });
+            if let Some(device_id) = device_id {
+                graph.insert_dependency(Dependency {
+                    from: device_id,
+                    to: vdev_id,
+                    kind: DependencyKind::MemberOf(MemberRole::Zfs(ZfsMember::Child)),
+                });
+            }
+        }
     }
     for dataset in &topology.datasets {
         let id = stable_node_id("zfs-dataset", &dataset.name);
@@ -1245,7 +1363,10 @@ fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) {
         graph.insert_node(
             id,
             Node {
-                kind: NodeSpec { kind, size: None },
+                kind: NodeSpec {
+                    kind,
+                    size: dataset.volume_size.map(Bytes::new),
+                },
                 size: NodeFacts {
                     presence: Presence::Present,
                     ..NodeFacts::default()
@@ -1253,7 +1374,7 @@ fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) {
             },
         );
         if let Some(pool_name) = dataset.name.split('/').next()
-            && let Some(pool_id) = pools.get(pool_name)
+            && let Some((pool_id, _)) = pools.get(pool_name)
         {
             graph.insert_dependency(Dependency {
                 from: *pool_id,
@@ -1261,6 +1382,63 @@ fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) {
                 kind: DependencyKind::Provides,
             });
         }
+    }
+    diagnostics
+}
+
+/// Converts a provider ZFS layout into the canonical model.
+fn zfs_vdev_kind(kind: &storage_provider::ZfsVdevKind) -> ZfsVdevKind {
+    match kind {
+        storage_provider::ZfsVdevKind::Leaf => ZfsVdevKind::Leaf,
+        storage_provider::ZfsVdevKind::Mirror => ZfsVdevKind::Mirror,
+        storage_provider::ZfsVdevKind::RaidZ { parity } => match parity {
+            1 => ZfsVdevKind::RaidZ {
+                parity: ZfsParity::One,
+            },
+            2 => ZfsVdevKind::RaidZ {
+                parity: ZfsParity::Two,
+            },
+            3 => ZfsVdevKind::RaidZ {
+                parity: ZfsParity::Three,
+            },
+            other => ZfsVdevKind::Other(format!("raidz{other}")),
+        },
+        storage_provider::ZfsVdevKind::DRaid {
+            parity,
+            data_width,
+            distributed_spares,
+        } => {
+            let parity = match parity {
+                1 => Some(ZfsParity::One),
+                2 => Some(ZfsParity::Two),
+                3 => Some(ZfsParity::Three),
+                _ => None,
+            };
+            let data_width = u16::try_from(*data_width)
+                .ok()
+                .and_then(DataStripeCount::new);
+            match (parity, data_width) {
+                (Some(parity), Some(data_width)) => ZfsVdevKind::DRaid {
+                    parity,
+                    data_width,
+                    distributed_spares: *distributed_spares,
+                },
+                _ => ZfsVdevKind::Other("draid".to_owned()),
+            }
+        }
+        storage_provider::ZfsVdevKind::Other(value) => ZfsVdevKind::Other(value.clone()),
+    }
+}
+
+/// Converts a provider ZFS allocation class into the canonical model.
+const fn zfs_vdev_class(class: storage_provider::ZfsVdevClass) -> ZfsVdevClass {
+    match class {
+        storage_provider::ZfsVdevClass::Data => ZfsVdevClass::Data,
+        storage_provider::ZfsVdevClass::Log => ZfsVdevClass::Log,
+        storage_provider::ZfsVdevClass::Special => ZfsVdevClass::Special,
+        storage_provider::ZfsVdevClass::Dedup => ZfsVdevClass::Dedup,
+        storage_provider::ZfsVdevClass::Cache => ZfsVdevClass::Cache,
+        storage_provider::ZfsVdevClass::Spare => ZfsVdevClass::Spare,
     }
 }
 
@@ -2068,7 +2246,8 @@ mod tests {
         BlkidEntry, BtrfsDeviceEntry, BtrfsEntry, BtrfsFilesystemEntry, BtrfsSubvolumeEntry,
         DevmapperEntry, FdiskPartition, FdiskTable, LvmEntry, LvmLvEntry, LvmPvEntry, LvmVgEntry,
         MdraidArrayEntry, NativeDeviceNumber, NvmeControllerEntry, NvmeEntry, NvmeNamespaceEntry,
-        NvmeSubsystemEntry, ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry,
+        NvmeSubsystemEntry, ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry, ZfsPoolEntry,
+        ZfsVdevClass as ProviderZfsVdevClass, ZfsVdevEntry, ZfsVdevKind as ProviderZfsVdevKind,
     };
 
     /// Ensures native partial observations become one connected canonical graph.
@@ -2326,16 +2505,37 @@ mod tests {
                 }],
             }],
         );
-        enrich_zfs(
+        let zfs_diagnostics = enrich_zfs(
             &mut graph,
             &ZfsEntry {
-                pools: vec!["tank".to_owned()],
+                pools: vec![ZfsPoolEntry {
+                    name: "tank".to_owned(),
+                    guid: Some(100),
+                    state: 0,
+                    vdevs: vec![ZfsVdevEntry {
+                        guid: Some(101),
+                        parent_guid: None,
+                        class: Some(ProviderZfsVdevClass::Data),
+                        kind: ProviderZfsVdevKind::Mirror,
+                        path: None,
+                        size: Some(1_024),
+                        missing: false,
+                        faulted: false,
+                        degraded: false,
+                    }],
+                }],
                 datasets: vec![ZfsDatasetEntry {
                     name: "tank/data".to_owned(),
                     kind: ZfsDatasetKind::Filesystem,
+                    mountpoint: Some("/tank/data".to_owned()),
+                    compression: Some("zstd".to_owned()),
+                    quota: Some(0),
+                    volume_size: None,
+                    origin: None,
                 }],
             },
         );
+        assert!(zfs_diagnostics.is_empty());
         enrich_nvme(
             &mut graph,
             &NvmeEntry {

@@ -83,7 +83,7 @@ const EXPECTED_PROVIDERS: &[ExpectedProvider] = &[
     ExpectedProvider {
         id: "zfs",
         responsibility: "zfs.topology",
-        model_contract: "ZfsPool/ZfsDataset/ZfsVolume",
+        model_contract: "ZfsPool/vdev tree/classes + dataset properties",
         live_state_adapter: true,
     },
     ExpectedProvider {
@@ -175,10 +175,18 @@ fn installed_native_provider_abi_matrix_matches_manifest() {
             expected.id,
             "library",
             expected.responsibility,
-            library.required_symbols.len(),
+            library.required_symbols.len()
+                + library
+                    .auxiliary
+                    .iter()
+                    .map(|library| library.required_symbols.len())
+                    .sum::<usize>(),
             expected.model_contract,
         );
         println!("  library: {}", library.path.display());
+        for auxiliary in &library.auxiliary {
+            println!("  auxiliary: {}", auxiliary.path.display());
+        }
     }
     println!("\nresolved native providers: {}", EXPECTED_PROVIDERS.len());
 }

@@ -209,11 +209,31 @@
           "zfs_iter_children",
           "zfs_iter_root",
           "zpool_close",
+          "zpool_get_config",
           "zpool_get_name",
+          "zpool_get_state",
           "zpool_iter"
+        ],
+        "auxiliary": [
+          {
+            "path": "/usr/lib64/libzfs_core.so",
+            "required_symbols": [
+              "lzc_get_props"
+            ]
+          },
+          {
+            "path": "/usr/lib64/libnvpair.so",
+            "required_symbols": [
+              "nvlist_free",
+              "nvlist_lookup_nvlist",
+              "nvlist_lookup_nvlist_array",
+              "nvlist_lookup_string",
+              "nvlist_lookup_uint64"
+            ]
+          }
         ]
       },
-      "capabilities": ["probe", "validate", "plan", "execute"]
+      "capabilities": ["probe"]
     },
     {
       "id": "nvme",
