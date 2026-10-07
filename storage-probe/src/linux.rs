@@ -1483,6 +1483,27 @@ fn enrich_nvme(graph: &mut NodeGraph, topology: &storage_provider::NvmeEntry) {
                     },
                     size: NodeFacts {
                         presence: Presence::Present,
+                        identities: controller.serial.as_ref().map_or_else(Vec::new, |serial| {
+                            vec![ExternalId::Serial {
+                                vendor: None,
+                                value: serial.clone(),
+                            }]
+                        }),
+                        device: Some(DeviceInfo {
+                            model: controller.model.clone(),
+                            vendor: None,
+                            transport: controller.transport.as_deref().map(|transport| {
+                                if transport == "pcie" {
+                                    Transport::Nvme
+                                } else {
+                                    Transport::NvmeOf
+                                }
+                            }),
+                            network_backing: None,
+                            rotational: Some(false),
+                            removable: None,
+                            zoned: None,
+                        }),
                         ..NodeFacts::default()
                     },
                 },
@@ -1519,6 +1540,11 @@ fn enrich_nvme(graph: &mut NodeGraph, topology: &storage_provider::NvmeEntry) {
                     metadata_size: namespace.metadata_size,
                 },
             });
+            node.kind.size = Some(Bytes::new(
+                namespace
+                    .lba_count
+                    .saturating_mul(u64::from(namespace.lba_size)),
+            ));
             if let Some(device) = &mut node.size.device {
                 device.transport = transport;
             }
@@ -2585,12 +2611,21 @@ mod tests {
                     controllers: vec![NvmeControllerEntry {
                         name: "nvme0".to_owned(),
                         transport: Some("pcie".to_owned()),
+                        address: Some("0000:01:00.0".to_owned()),
+                        transport_address: None,
+                        transport_service_id: None,
+                        model: Some("fixture".to_owned()),
+                        serial: Some("serial".to_owned()),
+                        firmware: Some("1.0".to_owned()),
+                        state: Some("live".to_owned()),
                     }],
                     namespaces: vec![NvmeNamespaceEntry {
                         name: "nvme0n1".to_owned(),
                         nsid: 1,
                         lba_size: 512,
                         metadata_size: 0,
+                        lba_count: 2_000,
+                        lba_utilization: 1_000,
                         nguid: Some([1; 16]),
                         eui64: None,
                         uuid: None,

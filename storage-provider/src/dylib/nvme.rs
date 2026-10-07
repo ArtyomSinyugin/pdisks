@@ -36,6 +36,7 @@ type NextNamespace =
     unsafe extern "C" fn(*mut SubsystemRaw, *mut NamespaceRaw) -> *mut NamespaceRaw;
 type GetText<T> = unsafe extern "C" fn(*mut T) -> *const c_char;
 type GetInt = unsafe extern "C" fn(*mut NamespaceRaw) -> c_int;
+type GetU64 = unsafe extern "C" fn(*mut NamespaceRaw) -> u64;
 type GetBytes = unsafe extern "C" fn(*mut NamespaceRaw) -> *const u8;
 type GetUuid = unsafe extern "C" fn(*mut NamespaceRaw, *mut u8);
 
@@ -53,12 +54,21 @@ struct Api<'library> {
     subsystem_nqn: Symbol<'library, GetText<SubsystemRaw>>,
     controller_name: Symbol<'library, GetText<ControllerRaw>>,
     controller_transport: Symbol<'library, GetText<ControllerRaw>>,
+    controller_address: Symbol<'library, GetText<ControllerRaw>>,
+    controller_transport_address: Symbol<'library, GetText<ControllerRaw>>,
+    controller_transport_service_id: Symbol<'library, GetText<ControllerRaw>>,
+    controller_model: Symbol<'library, GetText<ControllerRaw>>,
+    controller_serial: Symbol<'library, GetText<ControllerRaw>>,
+    controller_firmware: Symbol<'library, GetText<ControllerRaw>>,
+    controller_state: Symbol<'library, GetText<ControllerRaw>>,
     first_namespace: Symbol<'library, FirstNamespace>,
     next_namespace: Symbol<'library, NextNamespace>,
     namespace_name: Symbol<'library, GetText<NamespaceRaw>>,
     namespace_nsid: Symbol<'library, GetInt>,
     namespace_lba_size: Symbol<'library, GetInt>,
     namespace_meta_size: Symbol<'library, GetInt>,
+    namespace_lba_count: Symbol<'library, GetU64>,
+    namespace_lba_utilization: Symbol<'library, GetU64>,
     namespace_nguid: Symbol<'library, GetBytes>,
     namespace_eui64: Symbol<'library, GetBytes>,
     namespace_uuid: Symbol<'library, GetUuid>,
@@ -83,12 +93,21 @@ impl<'library> Api<'library> {
                 subsystem_nqn: load_symbol(library, b"nvme_subsystem_get_nqn\0")?,
                 controller_name: load_symbol(library, b"nvme_ctrl_get_name\0")?,
                 controller_transport: load_symbol(library, b"nvme_ctrl_get_transport\0")?,
+                controller_address: load_symbol(library, b"nvme_ctrl_get_address\0")?,
+                controller_transport_address: load_symbol(library, b"nvme_ctrl_get_traddr\0")?,
+                controller_transport_service_id: load_symbol(library, b"nvme_ctrl_get_trsvcid\0")?,
+                controller_model: load_symbol(library, b"nvme_ctrl_get_model\0")?,
+                controller_serial: load_symbol(library, b"nvme_ctrl_get_serial\0")?,
+                controller_firmware: load_symbol(library, b"nvme_ctrl_get_firmware\0")?,
+                controller_state: load_symbol(library, b"nvme_ctrl_get_state\0")?,
                 first_namespace: load_symbol(library, b"nvme_subsystem_first_ns\0")?,
                 next_namespace: load_symbol(library, b"nvme_subsystem_next_ns\0")?,
                 namespace_name: load_symbol(library, b"nvme_ns_get_name\0")?,
                 namespace_nsid: load_symbol(library, b"nvme_ns_get_nsid\0")?,
                 namespace_lba_size: load_symbol(library, b"nvme_ns_get_lba_size\0")?,
                 namespace_meta_size: load_symbol(library, b"nvme_ns_get_meta_size\0")?,
+                namespace_lba_count: load_symbol(library, b"nvme_ns_get_lba_count\0")?,
+                namespace_lba_utilization: load_symbol(library, b"nvme_ns_get_lba_util\0")?,
                 namespace_nguid: load_symbol(library, b"nvme_ns_get_nguid\0")?,
                 namespace_eui64: load_symbol(library, b"nvme_ns_get_eui64\0")?,
                 namespace_uuid: load_symbol(library, b"nvme_ns_get_uuid\0")?,
@@ -152,7 +171,25 @@ fn inspect_subsystem(
         if let Some(name) = controller_name {
             // SAFETY: transport is an optional borrowed controller string.
             let transport = unsafe { copied_string((api.controller_transport)(controller)) };
-            controllers.push(NvmeControllerEntry { name, transport });
+            // SAFETY: all optional fields are borrowed controller strings and
+            // are copied before the tree is released.
+            controllers.push(unsafe {
+                NvmeControllerEntry {
+                    name,
+                    transport,
+                    address: copied_string((api.controller_address)(controller)),
+                    transport_address: copied_string((api.controller_transport_address)(
+                        controller,
+                    )),
+                    transport_service_id: copied_string((api.controller_transport_service_id)(
+                        controller,
+                    )),
+                    model: copied_string((api.controller_model)(controller)),
+                    serial: copied_string((api.controller_serial)(controller)),
+                    firmware: copied_string((api.controller_firmware)(controller)),
+                    state: copied_string((api.controller_state)(controller)),
+                }
+            });
         }
         if controllers.len() == MAX_NATIVE_ENTRIES {
             return Err(invalid("nvme controller traversal"));
@@ -201,6 +238,13 @@ fn inspect_namespace(
             (api.namespace_meta_size)(namespace),
         )
     };
+    // SAFETY: scalar getters only inspect the live namespace.
+    let (lba_count, lba_utilization) = unsafe {
+        (
+            (api.namespace_lba_count)(namespace),
+            (api.namespace_lba_utilization)(namespace),
+        )
+    };
     if nsid <= 0 || lba_size <= 0 || !(0..=u16::MAX as c_int).contains(&metadata_size) {
         return Ok(None);
     }
@@ -217,6 +261,8 @@ fn inspect_namespace(
         nsid: nsid as u32,
         lba_size: lba_size as u32,
         metadata_size: metadata_size as u16,
+        lba_count,
+        lba_utilization,
         nguid,
         eui64,
         uuid: (uuid != [0; 16]).then_some(uuid),

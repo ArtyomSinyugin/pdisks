@@ -864,6 +864,20 @@ pub struct NvmeControllerEntry {
     pub name: String,
     /// libnvme transport string such as `pcie` or `tcp`.
     pub transport: Option<String>,
+    /// Kernel controller address string.
+    pub address: Option<String>,
+    /// NVMe-oF transport address.
+    pub transport_address: Option<String>,
+    /// NVMe-oF transport service identifier.
+    pub transport_service_id: Option<String>,
+    /// Controller model.
+    pub model: Option<String>,
+    /// Controller serial number.
+    pub serial: Option<String>,
+    /// Controller firmware revision.
+    pub firmware: Option<String>,
+    /// Kernel controller state.
+    pub state: Option<String>,
 }
 
 /// One NVMe namespace and its active block format.
@@ -877,6 +891,10 @@ pub struct NvmeNamespaceEntry {
     pub lba_size: u32,
     /// Metadata bytes stored with each logical block.
     pub metadata_size: u16,
+    /// Number of logical blocks provided by the namespace.
+    pub lba_count: u64,
+    /// Number of logical blocks currently allocated or used.
+    pub lba_utilization: u64,
     /// Namespace globally unique identifier, when non-zero.
     pub nguid: Option<[u8; 16]>,
     /// Namespace EUI-64 identifier, when non-zero.

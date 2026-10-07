@@ -112,7 +112,7 @@ that exist in the public Rust API today.
 | `libbd_btrfs` | Filesystem UUID/label/usage, member paths/sizes/usage/devid and operation-group availability | Allocation profiles and balance state; typed mkfs/member/subvolume/snapshot/resize/check/scrub actions |
 | `libbtrfsutil` | Mounted subvolume ID/path, default and read-only flags | Subvolume UUID/parent/snapshot identity and operation progress where available |
 | OpenZFS libraries | Imported pools, GUIDs, full vdev tree, mirror/RAIDZ/dRAID layouts, allocation classes, leaf paths, missing/faulted/degraded state, dataset mountpoint/compression/quota/zvol size/origin | Importable pools, snapshots/clones and typed pool/vdev/dataset/zvol/import/export/scrub actions |
-| `libnvme` | Subsystem/controller/namespace topology, transport, NSID, LBA format and native identifiers | Controller address/model/serial/state, namespace capacity/ANA, zoned facts and typed connect/disconnect/format/sanitize actions |
+| `libnvme` | Subsystem/controller/namespace topology, transport/address/service, controller model/serial/firmware/state, NSID, LBA format/count/utilization and native identifiers | ANA/path state, zoned namespace facts and typed connect/disconnect/format/sanitize actions |
 
 The table is deliberately stricter than ABI availability. Resolving a symbol
 does not count as implementing the corresponding backend operation.
