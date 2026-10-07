@@ -165,7 +165,7 @@
       "capabilities": ["probe", "validate", "plan", "execute"]
     },
     {
-      "id": "btrfs",
+      "id": "btrfs-subvolumes",
       "library": {
         "path": "/usr/lib64/libbtrfsutil.so.1",
         "required_symbols": [
@@ -177,7 +177,24 @@
           "free"
         ]
       },
-      "capabilities": ["probe", "validate", "plan", "execute"]
+      "capabilities": ["probe"]
+    },
+    {
+      "id": "btrfs",
+      "library": {
+        "path": "/usr/lib64/libbd_btrfs.so",
+        "required_symbols": [
+          "bd_btrfs_close",
+          "bd_btrfs_device_info_free",
+          "bd_btrfs_filesystem_info",
+          "bd_btrfs_filesystem_info_free",
+          "bd_btrfs_init",
+          "bd_btrfs_is_tech_avail",
+          "bd_btrfs_list_devices",
+          "g_free"
+        ]
+      },
+      "capabilities": ["probe", "validate"]
     },
     {
       "id": "zfs",

@@ -69,9 +69,15 @@ const EXPECTED_PROVIDERS: &[ExpectedProvider] = &[
         live_state_adapter: true,
     },
     ExpectedProvider {
+        id: "btrfs-subvolumes",
+        responsibility: "btrfs.subvolumes",
+        model_contract: "BtrfsSubvolume + filesystem Provides edges",
+        live_state_adapter: true,
+    },
+    ExpectedProvider {
         id: "btrfs",
         responsibility: "btrfs.topology",
-        model_contract: "BtrfsSubvolume + filesystem Provides edges",
+        model_contract: "Btrfs filesystem identity + member devices",
         live_state_adapter: true,
     },
     ExpectedProvider {
@@ -261,6 +267,30 @@ fn native_filesystem_capability_matrix_is_available() {
         capabilities
             .iter()
             .any(|capability| capability.filesystem == "ext4")
+    );
+}
+
+#[test]
+#[ignore = "requires PDISKS_PROVIDER_MANIFEST and installed libblockdev-btrfs"]
+/// Reports Btrfs operation groups exposed by the native backend.
+fn native_btrfs_capabilities_are_available() {
+    let registry = registry();
+    let capabilities = provider(&registry, "btrfs")
+        .probe_btrfs_capabilities()
+        .unwrap_or_else(|error| panic!("probe libblockdev-btrfs capabilities: {error}"));
+
+    println!("\nlibblockdev-btrfs capability matrix");
+    println!("filesystem:   {}", capabilities.filesystem);
+    println!("multi-device: {}", capabilities.multi_device);
+    println!("subvolume:    {}", capabilities.subvolume);
+    println!("snapshot:     {}", capabilities.snapshot);
+
+    assert!(
+        capabilities.filesystem
+            || capabilities.multi_device
+            || capabilities.subvolume
+            || capabilities.snapshot,
+        "libblockdev-btrfs exposes no usable operation group"
     );
 }
 
@@ -608,6 +638,7 @@ fn native_system_storage_stack_populates_current_state() {
     let system = NativeSystemProvider::new(
         local,
         provider(&registry, "libmount-mounts"),
+        provider(&registry, "btrfs-subvolumes"),
         provider(&registry, "btrfs"),
         provider(&registry, "zfs"),
         provider(&registry, "nvme"),

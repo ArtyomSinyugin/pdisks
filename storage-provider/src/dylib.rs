@@ -8,13 +8,15 @@ use std::{ffi::c_void, mem::ManuallyDrop, path::PathBuf};
 use libloading::{Library, Symbol};
 
 use crate::{
-    BlkidEntry, BtrfsEntry, CryptsetupEntry, DevmapperEntry, FdiskTable, FilesystemCapabilities,
-    LibmountEntry, LoopEntry, LvmEntry, MdraidEntry, MultipathEntry, NativeProbeError, NvmeEntry,
-    ProviderLibrary, SwapEntry, UdevBlockEntry, ZfsEntry,
+    BlkidEntry, BtrfsCapabilities, BtrfsEntry, BtrfsFilesystemEntry, CryptsetupEntry,
+    DevmapperEntry, FdiskTable, FilesystemCapabilities, LibmountEntry, LoopEntry, LvmEntry,
+    MdraidEntry, MultipathEntry, NativeProbeError, NvmeEntry, ProviderLibrary, SwapEntry,
+    UdevBlockEntry, ZfsEntry,
 };
 
 mod blkid;
 mod btrfs;
+mod btrfs_blockdev;
 mod cryptsetup;
 mod devmapper;
 mod fdisk;
@@ -147,6 +149,19 @@ impl LoadedLibrary {
         mountpoints: &[PathBuf],
     ) -> Result<Vec<BtrfsEntry>, NativeProbeError> {
         btrfs::probe(&self.handle, mountpoints)
+    }
+
+    /// Reads Btrfs filesystem and member topology through libblockdev.
+    pub(super) fn probe_btrfs_filesystems(
+        &self,
+        devices: &[PathBuf],
+    ) -> Result<Vec<BtrfsFilesystemEntry>, NativeProbeError> {
+        btrfs_blockdev::probe(&self.handle, devices)
+    }
+
+    /// Reports operation groups exposed by libblockdev-btrfs.
+    pub(super) fn probe_btrfs_capabilities(&self) -> Result<BtrfsCapabilities, NativeProbeError> {
+        btrfs_blockdev::probe_capabilities(&self.handle)
     }
 
     /// Reads imported ZFS pools and datasets.

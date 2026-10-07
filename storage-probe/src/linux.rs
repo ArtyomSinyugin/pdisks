@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
 };
 
@@ -69,6 +69,7 @@ pub struct NativeLocalProvider<'a> {
 pub struct NativeSystemProvider<'a> {
     local: NativeLocalProvider<'a>,
     libmount: &'a RegisteredProvider,
+    btrfs_subvolumes: &'a RegisteredProvider,
     btrfs: &'a RegisteredProvider,
     zfs: &'a RegisteredProvider,
     nvme: &'a RegisteredProvider,
@@ -79,6 +80,7 @@ impl<'a> NativeSystemProvider<'a> {
     pub const fn new(
         local: NativeLocalProvider<'a>,
         libmount: &'a RegisteredProvider,
+        btrfs_subvolumes: &'a RegisteredProvider,
         btrfs: &'a RegisteredProvider,
         zfs: &'a RegisteredProvider,
         nvme: &'a RegisteredProvider,
@@ -86,6 +88,7 @@ impl<'a> NativeSystemProvider<'a> {
         Self {
             local,
             libmount,
+            btrfs_subvolumes,
             btrfs,
             zfs,
             nvme,
@@ -381,6 +384,14 @@ impl StateProvider for NativeSystemProvider<'_> {
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
         let mut state = self.local.probe()?;
+        let btrfs_devices = btrfs_backing_devices(&state.graph);
+        let btrfs_filesystems = match self.btrfs.probe_btrfs_filesystems(&btrfs_devices) {
+            Ok(entries) => entries,
+            Err(error) => {
+                push_native_failure(&mut state, "btrfs-topology", error.to_string());
+                Vec::new()
+            }
+        };
         let mount_entries = match self.libmount.probe_libmount() {
             Ok(entries) => entries,
             Err(error) => {
@@ -397,7 +408,7 @@ impl StateProvider for NativeSystemProvider<'_> {
             .collect::<Vec<_>>();
         state.mounts = mount_entries.into_iter().map(observed_mount).collect();
 
-        let btrfs = match self.btrfs.probe_btrfs(&btrfs_mountpoints) {
+        let btrfs = match self.btrfs_subvolumes.probe_btrfs(&btrfs_mountpoints) {
             Ok(entries) => entries,
             Err(error) => {
                 push_native_failure(&mut state, "btrfs", error.to_string());
@@ -418,6 +429,7 @@ impl StateProvider for NativeSystemProvider<'_> {
                 storage_provider::NvmeEntry::default()
             }
         };
+        enrich_btrfs_filesystems(&mut state.graph, &btrfs_filesystems);
         enrich_btrfs(&mut state.graph, &state.mounts, &btrfs);
         enrich_zfs(&mut state.graph, &zfs);
         enrich_nvme(&mut state.graph, &nvme);
@@ -1049,6 +1061,103 @@ fn normalized_native_uuid(value: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// Collects backing paths for Btrfs filesystems already identified by blkid.
+fn btrfs_backing_devices(graph: &NodeGraph) -> Vec<PathBuf> {
+    let filesystems = graph
+        .nodes()
+        .filter_map(|(id, node)| {
+            matches!(
+                node.kind.kind,
+                NodeKind::Filesystem {
+                    kind: FilesystemKind::Btrfs(_),
+                    ..
+                }
+            )
+            .then_some(*id)
+        })
+        .collect::<HashSet<_>>();
+    graph
+        .dependencies()
+        .filter(|dependency| {
+            filesystems.contains(&dependency.to) && matches!(dependency.kind, DependencyKind::Backs)
+        })
+        .filter_map(|dependency| graph.node(&dependency.from))
+        .filter_map(|node| node.size.block.as_ref())
+        .flat_map(|block| block.paths.iter().cloned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Adds Btrfs filesystem identity and multi-device membership.
+fn enrich_btrfs_filesystems(
+    graph: &mut NodeGraph,
+    filesystems: &[storage_provider::BtrfsFilesystemEntry],
+) {
+    for filesystem in filesystems {
+        let member_paths = filesystem
+            .devices
+            .iter()
+            .map(|device| &device.path)
+            .collect::<HashSet<_>>();
+        let filesystem_id = graph
+            .dependencies()
+            .find_map(|dependency| {
+                if !matches!(dependency.kind, DependencyKind::Backs) {
+                    return None;
+                }
+                let backing = graph.node(&dependency.from)?;
+                let is_member = backing.size.block.as_ref().is_some_and(|block| {
+                    block.paths.iter().any(|path| member_paths.contains(path))
+                });
+                let content = graph.node(&dependency.to)?;
+                (is_member
+                    && matches!(
+                        content.kind.kind,
+                        NodeKind::Filesystem {
+                            kind: FilesystemKind::Btrfs(_),
+                            ..
+                        }
+                    ))
+                .then_some(dependency.to)
+            })
+            .unwrap_or_else(|| content_node_id(&filesystem.seed_device.to_string_lossy()));
+
+        if let Some(mut node) = graph.node(&filesystem_id).cloned() {
+            if let NodeKind::Filesystem { label, .. } = &mut node.kind.kind {
+                *label = filesystem.label.clone();
+            }
+            if let Ok(uuid) = Uuid::parse_str(&filesystem.uuid)
+                && !node.size.identities.contains(&ExternalId::BtrfsFsid(uuid))
+            {
+                node.size.identities.push(ExternalId::BtrfsFsid(uuid));
+            }
+            graph.insert_node(filesystem_id, node);
+        }
+
+        for member in &filesystem.devices {
+            let member_id = graph.nodes().find_map(|(id, node)| {
+                node.size
+                    .block
+                    .as_ref()
+                    .is_some_and(|block| block.paths.contains(&member.path))
+                    .then_some(*id)
+            });
+            if let Some(member_id) = member_id {
+                graph.insert_dependency(Dependency {
+                    from: member_id,
+                    to: filesystem_id,
+                    kind: DependencyKind::MemberOf(MemberRole::Btrfs(
+                        storage_core::model::BtrfsMember {
+                            devid: NonZeroU64::new(member.id),
+                        },
+                    )),
+                });
+            }
+        }
+    }
 }
 
 /// Adds Btrfs subvolumes below their mounted filesystem nodes.
@@ -1956,10 +2065,10 @@ fn transport(name: &str) -> Option<Transport> {
 mod tests {
     use super::*;
     use storage_provider::{
-        BlkidEntry, BtrfsEntry, BtrfsSubvolumeEntry, DevmapperEntry, FdiskPartition, FdiskTable,
-        LvmEntry, LvmLvEntry, LvmPvEntry, LvmVgEntry, MdraidArrayEntry, NativeDeviceNumber,
-        NvmeControllerEntry, NvmeEntry, NvmeNamespaceEntry, NvmeSubsystemEntry, ZfsDatasetEntry,
-        ZfsDatasetKind, ZfsEntry,
+        BlkidEntry, BtrfsDeviceEntry, BtrfsEntry, BtrfsFilesystemEntry, BtrfsSubvolumeEntry,
+        DevmapperEntry, FdiskPartition, FdiskTable, LvmEntry, LvmLvEntry, LvmPvEntry, LvmVgEntry,
+        MdraidArrayEntry, NativeDeviceNumber, NvmeControllerEntry, NvmeEntry, NvmeNamespaceEntry,
+        NvmeSubsystemEntry, ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry,
     };
 
     /// Ensures native partial observations become one connected canonical graph.
@@ -2138,7 +2247,29 @@ mod tests {
     #[test]
     fn extended_native_topologies_enrich_the_graph() {
         let mut graph = NodeGraph::new();
+        let backing_id = block_node_id(Path::new("/dev/vda1"));
         let filesystem_id = content_node_id("/dev/vda1");
+        graph.insert_node(
+            backing_id,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Partition {
+                        number: NonZeroU32::new(1).unwrap_or_else(|| unreachable!()),
+                        offset: Bytes::new(1_048_576),
+                        role: None,
+                        attributes: PartitionAttributes::default(),
+                    },
+                    size: Some(Bytes::new(1_073_741_824)),
+                },
+                size: NodeFacts {
+                    block: Some(BlockFacts {
+                        paths: vec![PathBuf::from("/dev/vda1")],
+                        ..BlockFacts::default()
+                    }),
+                    ..NodeFacts::default()
+                },
+            },
+        );
         graph.insert_node(
             filesystem_id,
             Node {
@@ -2155,6 +2286,27 @@ mod tests {
                 },
                 size: NodeFacts::default(),
             },
+        );
+        graph.insert_dependency(Dependency {
+            from: backing_id,
+            to: filesystem_id,
+            kind: DependencyKind::Backs,
+        });
+        enrich_btrfs_filesystems(
+            &mut graph,
+            &[BtrfsFilesystemEntry {
+                seed_device: PathBuf::from("/dev/vda1"),
+                uuid: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+                label: Some("data".to_owned()),
+                device_count: 1,
+                used: 512,
+                devices: vec![BtrfsDeviceEntry {
+                    id: 1,
+                    path: PathBuf::from("/dev/vda1"),
+                    size: 1_073_741_824,
+                    used: 512,
+                }],
+            }],
         );
         enrich_btrfs(
             &mut graph,
@@ -2212,6 +2364,20 @@ mod tests {
                 .nodes()
                 .any(|(_, node)| matches!(node.kind.kind, NodeKind::BtrfsSubvolume { .. }))
         );
+        assert!(graph.dependencies().any(|dependency| {
+            dependency.from == backing_id
+                && dependency.to == filesystem_id
+                && matches!(
+                    dependency.kind,
+                    DependencyKind::MemberOf(MemberRole::Btrfs(_))
+                )
+        }));
+        assert!(graph.node(&filesystem_id).is_some_and(|node| {
+            node.size
+                .identities
+                .iter()
+                .any(|identity| matches!(identity, ExternalId::BtrfsFsid(_)))
+        }));
         assert!(
             graph
                 .nodes()

@@ -257,6 +257,25 @@ impl RegisteredProvider {
         }
     }
 
+    /// Reads Btrfs filesystem and member-device topology through libblockdev.
+    pub fn probe_btrfs_filesystems(
+        &self,
+        devices: &[PathBuf],
+    ) -> Result<Vec<BtrfsFilesystemEntry>, NativeProbeError> {
+        match &self.backend {
+            LoadedBackend::Library { library } => library.probe_btrfs_filesystems(devices),
+            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        }
+    }
+
+    /// Reports operation groups available through libblockdev-btrfs.
+    pub fn probe_btrfs_capabilities(&self) -> Result<BtrfsCapabilities, NativeProbeError> {
+        match &self.backend {
+            LoadedBackend::Library { library } => library.probe_btrfs_capabilities(),
+            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        }
+    }
+
     /// Reads imported ZFS pools and datasets through libzfs.
     pub fn probe_zfs(&self) -> Result<ZfsEntry, NativeProbeError> {
         match &self.backend {
@@ -633,6 +652,49 @@ pub struct BtrfsSubvolumeEntry {
     pub read_only: bool,
     /// Whether this is the filesystem's default subvolume.
     pub is_default: bool,
+}
+
+/// Btrfs filesystem metadata returned by libblockdev-btrfs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtrfsFilesystemEntry {
+    /// Device used to address the filesystem during discovery.
+    pub seed_device: PathBuf,
+    /// Filesystem UUID reported by Btrfs.
+    pub uuid: String,
+    /// Optional filesystem label.
+    pub label: Option<String>,
+    /// Number of devices recorded by the filesystem.
+    pub device_count: u64,
+    /// Bytes allocated by the filesystem.
+    pub used: u64,
+    /// Member devices visible to the provider.
+    pub devices: Vec<BtrfsDeviceEntry>,
+}
+
+/// One device participating in a Btrfs filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtrfsDeviceEntry {
+    /// Btrfs-local device identifier.
+    pub id: u64,
+    /// Current block-device path.
+    pub path: PathBuf,
+    /// Device capacity in bytes.
+    pub size: u64,
+    /// Bytes allocated on this member.
+    pub used: u64,
+}
+
+/// Operation groups currently available through libblockdev-btrfs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BtrfsCapabilities {
+    /// Basic filesystem queries and modifications are available.
+    pub filesystem: bool,
+    /// Multi-device creation and member changes are available.
+    pub multi_device: bool,
+    /// Subvolume creation, deletion, and default selection are available.
+    pub subvolume: bool,
+    /// Snapshot creation and deletion are available.
+    pub snapshot: bool,
 }
 
 /// Imported ZFS topology returned by libzfs.
