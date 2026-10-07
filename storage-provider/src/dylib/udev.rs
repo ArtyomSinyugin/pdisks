@@ -157,6 +157,9 @@ fn entry(
     };
     UdevBlockEntry {
         devnode: PathBuf::from(OsString::from_vec(devnode)),
+        aliases: property(c"DEVLINKS")
+            .map(|links| links.split_ascii_whitespace().map(PathBuf::from).collect())
+            .unwrap_or_default(),
         sysname,
         // SAFETY: device remains live and the returned string is copied.
         devtype: unsafe { copied_string((api.get_devtype)(device.pointer)) },
@@ -171,12 +174,18 @@ fn entry(
             .and_then(|value| value.parse().ok()),
         physical_block_size: sysattr(c"queue/physical_block_size")
             .and_then(|value| value.parse().ok()),
+        alignment_offset: sysattr(c"alignment_offset").and_then(|value| value.parse().ok()),
+        minimum_io_size: sysattr(c"queue/minimum_io_size").and_then(|value| value.parse().ok()),
+        optimal_io_size: sysattr(c"queue/optimal_io_size").and_then(|value| value.parse().ok()),
         model: property(c"ID_MODEL").map(|value| value.trim().to_owned()),
+        vendor: property(c"ID_VENDOR").map(|value| value.trim().to_owned()),
+        transport: property(c"ID_BUS"),
         serial: property(c"ID_SERIAL_SHORT"),
         wwn: property(c"ID_WWN"),
         read_only: sysattr(c"ro").and_then(parse_bool),
         rotational: sysattr(c"queue/rotational").and_then(parse_bool),
         removable: sysattr(c"removable").and_then(parse_bool),
+        zoned: sysattr(c"queue/zoned"),
     }
 }
 

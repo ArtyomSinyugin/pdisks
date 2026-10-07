@@ -1601,7 +1601,7 @@ fn native_block_facts(endpoint: &UdevBlockEntry) -> NodeFacts {
     }
     if let Some(serial) = endpoint.serial.clone() {
         identities.push(ExternalId::Serial {
-            vendor: None,
+            vendor: endpoint.vendor.clone(),
             value: serial,
         });
     }
@@ -1609,7 +1609,9 @@ fn native_block_facts(endpoint: &UdevBlockEntry) -> NodeFacts {
         presence: Presence::Present,
         identities,
         block: Some(BlockFacts {
-            paths: vec![endpoint.devnode.clone()],
+            paths: std::iter::once(endpoint.devnode.clone())
+                .chain(endpoint.aliases.iter().cloned())
+                .collect(),
             devno: DeviceNumber {
                 major: endpoint.major,
                 minor: endpoint.minor,
@@ -1618,23 +1620,47 @@ fn native_block_facts(endpoint: &UdevBlockEntry) -> NodeFacts {
                 |logical_block_size| BlockGeometry {
                     logical_block_size,
                     physical_block_size: endpoint.physical_block_size.and_then(BlockSize::new),
-                    alignment_offset: None,
-                    minimum_io_size: None,
-                    optimal_io_size: None,
+                    alignment_offset: endpoint.alignment_offset.map(Bytes::new),
+                    minimum_io_size: endpoint.minimum_io_size.map(Bytes::new),
+                    optimal_io_size: endpoint.optimal_io_size.map(Bytes::new),
                 },
             ),
             read_only: endpoint.read_only,
         }),
         device: (endpoint.devtype.as_deref() == Some("disk")).then(|| DeviceInfo {
             model: endpoint.model.clone(),
-            vendor: None,
-            transport: transport(&endpoint.sysname),
+            vendor: endpoint.vendor.clone(),
+            transport: endpoint
+                .transport
+                .as_deref()
+                .and_then(udev_transport)
+                .or_else(|| transport(&endpoint.sysname)),
             network_backing: None,
             rotational: endpoint.rotational,
             removable: endpoint.removable,
-            zoned: None,
+            zoned: endpoint.zoned.as_deref().and_then(|zoned| match zoned {
+                "host-aware" => Some(storage_core::model::ZonedModel::HostAware),
+                "host-managed" => Some(storage_core::model::ZonedModel::HostManaged),
+                "none" => Some(storage_core::model::ZonedModel::None),
+                _ => None,
+            }),
         }),
         ..NodeFacts::default()
+    }
+}
+
+/// Maps udev's bus names into canonical transport values.
+fn udev_transport(value: &str) -> Option<Transport> {
+    match value {
+        "ata" => Some(Transport::Sata),
+        "scsi" => Some(Transport::Scsi),
+        "usb" => Some(Transport::Usb),
+        "nvme" => Some(Transport::Nvme),
+        "virtio" => Some(Transport::Virtio),
+        "mmc" => Some(Transport::Mmc),
+        "fc" => Some(Transport::FibreChannel),
+        "iscsi" => Some(Transport::Iscsi),
+        _ => None,
     }
 }
 
@@ -2255,6 +2281,7 @@ mod tests {
     fn native_block_observations_form_connected_graph() {
         let disk = UdevBlockEntry {
             devnode: PathBuf::from("/dev/vda"),
+            aliases: vec![PathBuf::from("/dev/disk/by-id/fixture")],
             sysname: "vda".to_owned(),
             devtype: Some("disk".to_owned()),
             major: 252,
@@ -2262,12 +2289,18 @@ mod tests {
             size_sectors: Some(2_000),
             logical_block_size: Some(512),
             physical_block_size: Some(512),
+            alignment_offset: Some(0),
+            minimum_io_size: Some(512),
+            optimal_io_size: Some(4096),
             model: Some("fixture".to_owned()),
+            vendor: Some("test".to_owned()),
+            transport: Some("virtio".to_owned()),
             serial: None,
             wwn: None,
             read_only: Some(false),
             rotational: Some(false),
             removable: Some(false),
+            zoned: Some("none".to_owned()),
         };
         let mut partition = disk.clone();
         partition.devnode = PathBuf::from("/dev/vda1");
@@ -2316,6 +2349,7 @@ mod tests {
     fn lvm_observations_enrich_existing_block_graph() {
         let mapper_endpoint = UdevBlockEntry {
             devnode: PathBuf::from("/dev/dm-0"),
+            aliases: Vec::new(),
             sysname: "dm-0".to_owned(),
             devtype: Some("disk".to_owned()),
             major: 253,
@@ -2323,12 +2357,18 @@ mod tests {
             size_sectors: Some(1_000),
             logical_block_size: Some(512),
             physical_block_size: Some(512),
+            alignment_offset: None,
+            minimum_io_size: None,
+            optimal_io_size: None,
             model: None,
+            vendor: None,
+            transport: None,
             serial: None,
             wwn: None,
             read_only: Some(false),
             rotational: None,
             removable: None,
+            zoned: None,
         };
         let mut graph = NodeGraph::new();
         insert_native_endpoint(

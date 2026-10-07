@@ -402,6 +402,8 @@ pub struct FilesystemCapabilities {
 pub struct UdevBlockEntry {
     /// Kernel device node.
     pub devnode: PathBuf,
+    /// Stable and descriptive device links exported by udev.
+    pub aliases: Vec<PathBuf>,
     /// Kernel device name.
     pub sysname: String,
     /// Udev device type, normally `disk` or `partition`.
@@ -416,8 +418,18 @@ pub struct UdevBlockEntry {
     pub logical_block_size: Option<u32>,
     /// Physical block size in bytes.
     pub physical_block_size: Option<u32>,
+    /// Required alignment offset in bytes.
+    pub alignment_offset: Option<u64>,
+    /// Minimum efficient I/O size in bytes.
+    pub minimum_io_size: Option<u64>,
+    /// Optimal I/O size in bytes.
+    pub optimal_io_size: Option<u64>,
     /// Hardware model reported by udev.
     pub model: Option<String>,
+    /// Hardware vendor reported by udev.
+    pub vendor: Option<String>,
+    /// Udev transport/bus identifier.
+    pub transport: Option<String>,
     /// Hardware serial reported by udev.
     pub serial: Option<String>,
     /// World-wide name reported by udev.
@@ -428,6 +440,8 @@ pub struct UdevBlockEntry {
     pub rotational: Option<bool>,
     /// Kernel removable-media flag.
     pub removable: Option<bool>,
+    /// Kernel zoned block-device model.
+    pub zoned: Option<String>,
 }
 
 /// One partition table returned by libfdisk.
