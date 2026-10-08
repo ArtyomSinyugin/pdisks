@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::Bytes;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockFacts {
     pub paths: Vec<PathBuf>,
     pub devno: DeviceNumber,
@@ -15,7 +15,7 @@ pub struct BlockFacts {
     pub read_only: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceNumber {
     pub major: u32,
     pub minor: u32,

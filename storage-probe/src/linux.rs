@@ -2695,7 +2695,12 @@ mod tests {
                 size: NodeFacts {
                     block: Some(BlockFacts {
                         paths: vec![PathBuf::from("/dev/vda1")],
-                        ..BlockFacts::default()
+                        ..BlockFacts {
+                            devno: DeviceNumber { major: 0, minor: 0 },
+                            paths: Default::default(),
+                            geometry: Default::default(),
+                            read_only: Default::default(),
+                        }
                     }),
                     ..NodeFacts::default()
                 },
