@@ -669,6 +669,11 @@ fn enrich_luks(graph: &mut NodeGraph, entries: &[storage_provider::CryptsetupEnt
             _ => continue,
         };
         node.kind.kind = NodeKind::LuksContainer { version };
+        let header_size = entry.data_offset_sectors.saturating_mul(512);
+        node.kind.size = node
+            .kind
+            .size
+            .map(|size| Bytes::new(size.as_u64().saturating_sub(header_size)));
         node.size.identities.retain(|identity| {
             !matches!(identity, ExternalId::Filesystem { fs_type, .. } if fs_type == "crypto_LUKS")
         });
@@ -2372,9 +2377,10 @@ mod tests {
     use super::*;
     use storage_provider::{
         BlkidEntry, BtrfsDeviceEntry, BtrfsEntry, BtrfsFilesystemEntry, BtrfsSubvolumeEntry,
-        DevmapperEntry, FdiskPartition, FdiskTable, LvmEntry, LvmLvEntry, LvmPvEntry, LvmVgEntry,
-        MdraidArrayEntry, NativeDeviceNumber, NvmeControllerEntry, NvmeEntry, NvmeNamespaceEntry,
-        NvmeSubsystemEntry, ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry, ZfsPoolEntry,
+        CryptsetupEntry, CryptsetupKeyslotEntry, CryptsetupKeyslotState, DevmapperEntry,
+        FdiskPartition, FdiskTable, LvmEntry, LvmLvEntry, LvmPvEntry, LvmVgEntry, MdraidArrayEntry,
+        NativeDeviceNumber, NvmeControllerEntry, NvmeEntry, NvmeNamespaceEntry, NvmeSubsystemEntry,
+        ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry, ZfsPoolEntry,
         ZfsVdevClass as ProviderZfsVdevClass, ZfsVdevEntry, ZfsVdevKind as ProviderZfsVdevKind,
     };
 
@@ -2444,6 +2450,82 @@ mod tests {
                 .map(|node| &node.kind.kind),
             Some(NodeKind::Filesystem { .. })
         ));
+    }
+
+    /// Ensures cryptsetup metadata classifies LUKS and exposes usable payload capacity.
+    #[test]
+    fn cryptsetup_metadata_enriches_luks_content() {
+        let endpoint = UdevBlockEntry {
+            devnode: PathBuf::from("/dev/vda1"),
+            aliases: Vec::new(),
+            sysname: "vda1".to_owned(),
+            devtype: Some("partition".to_owned()),
+            major: 252,
+            minor: 1,
+            size_sectors: Some(10_000),
+            logical_block_size: Some(512),
+            physical_block_size: Some(512),
+            alignment_offset: None,
+            minimum_io_size: None,
+            optimal_io_size: None,
+            model: None,
+            vendor: None,
+            transport: None,
+            serial: None,
+            wwn: None,
+            read_only: Some(false),
+            rotational: None,
+            removable: None,
+            zoned: None,
+        };
+        let mut graph = assemble_native_block_state(
+            &[endpoint],
+            &[],
+            &[BlkidEntry {
+                device: PathBuf::from("/dev/vda1"),
+                signature_type: Some("crypto_LUKS".to_owned()),
+                uuid: Some("08f959f7-30d8-44c9-a49e-91638f131eb7".to_owned()),
+                label: None,
+                partition_uuid: None,
+            }],
+        )
+        .graph;
+
+        enrich_luks(
+            &mut graph,
+            &[CryptsetupEntry {
+                device: PathBuf::from("/dev/vda1"),
+                luks_type: "LUKS2".to_owned(),
+                uuid: Some("08f959f7-30d8-44c9-a49e-91638f131eb7".to_owned()),
+                cipher: Some("aes".to_owned()),
+                cipher_mode: Some("xts-plain64".to_owned()),
+                data_offset_sectors: 32,
+                sector_size: Some(4_096),
+                volume_key_size: Some(64),
+                metadata_size: Some(16_384),
+                keyslots_size: Some(16_744_448),
+                keyslots: vec![CryptsetupKeyslotEntry {
+                    index: 0,
+                    state: CryptsetupKeyslotState::ActiveLast,
+                }],
+            }],
+        );
+
+        let node = graph
+            .node(&content_node_id("/dev/vda1"))
+            .unwrap_or_else(|| panic!("LUKS content node is missing"));
+        assert_eq!(
+            node.kind.kind,
+            NodeKind::LuksContainer {
+                version: LuksVersion::Luks2
+            }
+        );
+        assert_eq!(node.kind.size, Some(Bytes::new((10_000 - 32) * 512)));
+        assert!(node.size.identities.iter().any(|identity| matches!(
+            identity,
+            ExternalId::LuksUuid(uuid)
+                if uuid.to_string() == "08f959f7-30d8-44c9-a49e-91638f131eb7"
+        )));
     }
 
     /// Ensures LVM identities join PV, VG, and active mapper-backed LV nodes.

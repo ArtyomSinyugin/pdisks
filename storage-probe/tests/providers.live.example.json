@@ -138,9 +138,17 @@
         "path": "/usr/lib64/libcryptsetup.so",
         "required_symbols": [
           "crypt_free",
+          "crypt_get_cipher",
+          "crypt_get_cipher_mode",
+          "crypt_get_data_offset",
+          "crypt_get_metadata_size",
+          "crypt_get_sector_size",
           "crypt_get_type",
           "crypt_get_uuid",
+          "crypt_get_volume_key_size",
           "crypt_init",
+          "crypt_keyslot_max",
+          "crypt_keyslot_status",
           "crypt_load"
         ]
       },

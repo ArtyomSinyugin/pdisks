@@ -526,6 +526,44 @@ pub struct CryptsetupEntry {
     pub luks_type: String,
     /// Header UUID without interpretation.
     pub uuid: Option<String>,
+    /// Encryption cipher name.
+    pub cipher: Option<String>,
+    /// Encryption cipher mode.
+    pub cipher_mode: Option<String>,
+    /// Data offset in 512-byte sectors as defined by libcryptsetup.
+    pub data_offset_sectors: u64,
+    /// Encryption sector size in bytes.
+    pub sector_size: Option<u32>,
+    /// Volume-key size in bytes.
+    pub volume_key_size: Option<u32>,
+    /// Metadata area size in bytes.
+    pub metadata_size: Option<u64>,
+    /// Keyslot area size in bytes.
+    pub keyslots_size: Option<u64>,
+    /// Non-inactive keyslots without any key material.
+    pub keyslots: Vec<CryptsetupKeyslotEntry>,
+}
+
+/// Public state of one LUKS keyslot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CryptsetupKeyslotEntry {
+    /// Zero-based keyslot index.
+    pub index: u32,
+    /// State reported by libcryptsetup.
+    pub state: CryptsetupKeyslotState,
+}
+
+/// Non-inactive keyslot states exposed without reading secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptsetupKeyslotState {
+    /// Keyslot contains a usable key.
+    Active,
+    /// Keyslot is the last active slot protecting the volume.
+    ActiveLast,
+    /// LUKS2 keyslot is not bound to a data-segment digest.
+    Unbound,
+    /// Provider state not recognized by this build.
+    Other(i32),
 }
 
 /// Loop-device metadata returned by the libblockdev loop plugin.
