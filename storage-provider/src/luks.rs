@@ -41,6 +41,8 @@ pub enum LuksAction {
     Format {
         /// Existing block node to format.
         target: NodeId,
+        /// Stable identity reserved for the planned LUKS container node.
+        planned_node_id: NodeId,
         /// On-disk LUKS format version.
         version: LuksVersion,
         /// Credential reference resolved only at execution time.
@@ -50,6 +52,8 @@ pub enum LuksAction {
     Open {
         /// Existing LUKS container node.
         container: NodeId,
+        /// Stable identity reserved for the planned dm-crypt mapping node.
+        planned_node_id: NodeId,
         /// Requested device-mapper name.
         mapping_name: String,
         /// Credential reference resolved only at execution time.
@@ -387,6 +391,7 @@ mod tests {
     fn luks_action_round_trips_without_secret_material() {
         let action = LuksAction::Open {
             container: NodeId::new(),
+            planned_node_id: NodeId::new(),
             mapping_name: "crypt-root".to_owned(),
             credential: CredentialRef::new("secret-service://root")
                 .unwrap_or_else(|| unreachable!()),
@@ -413,6 +418,7 @@ mod tests {
         let diagnostics = provider.validate_action(
             &LuksAction::Open {
                 container: disk,
+                planned_node_id: NodeId::new(),
                 mapping_name: "crypt-root".to_owned(),
                 credential: CredentialRef::new("agent://root").unwrap_or_else(|| unreachable!()),
                 read_only: false,

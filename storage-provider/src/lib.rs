@@ -16,6 +16,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod action;
 mod dylib;
 mod logical;
 mod luks;
@@ -1456,3 +1457,6 @@ mod tests {
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
     }
 }
+pub use action::{
+    BtrfsAction, FilesystemAction, LvmAction, MountAction, PartitionAction, ProviderAction,
+};
