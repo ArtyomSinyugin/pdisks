@@ -17,6 +17,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod dylib;
+mod logical;
+mod luks;
+
+pub use logical::{LogicalProvider, ProviderId};
+pub use luks::{
+    CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProvider,
+    LuksValidationError,
+};
 
 /// Manifest JSON schema version supported by this release.
 pub const BACKEND_MANIFEST_VERSION: u16 = 1;

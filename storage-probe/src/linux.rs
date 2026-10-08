@@ -9,12 +9,12 @@ use std::{
 use storage_core::model::{
     BlockFacts, BlockGeometry, BlockSize, BtrfsAllocation, Bytes, DataStripeCount, Dependency,
     DependencyKind, DeviceInfo, DeviceNumber, Diagnostic, DiagnosticSeverity, DiagnosticSubject,
-    ExternalId, FilesystemKind, LuksVersion, LvmLv, LvmLvKind, MdArray, MdExternalMetadata,
-    MdMember, MdMemberRole, MdMetadata, MdNativeMetadata, MdPersonality, MdRaid, MdRaid0Layout,
-    MemberRole, MountContext, MountSource, NetworkMountSource, Node, NodeFacts, NodeGraph, NodeId,
-    NodeKind, NodeSpec, NvmeLbaFormat, NvmeNamespace, NvmeNamespaceId, ObservedMount,
-    PartitionAttributes, PartitionTable, Presence, Relation, RelationKind, Transport, ZfsMember,
-    ZfsParity, ZfsVdevClass, ZfsVdevKind,
+    ExternalId, FilesystemKind, LvmLv, LvmLvKind, MdArray, MdExternalMetadata, MdMember,
+    MdMemberRole, MdMetadata, MdNativeMetadata, MdPersonality, MdRaid, MdRaid0Layout, MemberRole,
+    MountContext, MountSource, NetworkMountSource, Node, NodeFacts, NodeGraph, NodeId, NodeKind,
+    NodeSpec, NvmeLbaFormat, NvmeNamespace, NvmeNamespaceId, ObservedMount, PartitionAttributes,
+    PartitionTable, Presence, Relation, RelationKind, Transport, ZfsMember, ZfsParity,
+    ZfsVdevClass, ZfsVdevKind,
 };
 use storage_provider::{BackendAccess, RegisteredBackend, UdevBlockEntry};
 use uuid::Uuid;
@@ -234,7 +234,8 @@ impl NativeMapperProvider<'_> {
             .filter(|entry| entry.signature_type.as_deref() == Some("crypto_LUKS"))
             .map(|entry| entry.device.clone())
             .collect::<Vec<_>>();
-        let luks = match self.cryptsetup.probe_cryptsetup(&luks_devices) {
+        let luks_provider = storage_provider::LuksProvider::new(self.cryptsetup);
+        let luks = match luks_provider.probe(&luks_devices) {
             Ok(entries) => entries,
             Err(error) => {
                 push_native_failure(&mut state, "cryptsetup", error.to_string());
@@ -657,32 +658,24 @@ fn push_native_failure(state: &mut ProviderState, provider: &str, evidence: Stri
 }
 
 /// Replaces blkid's generic LUKS signature nodes with cryptsetup metadata.
-fn enrich_luks(graph: &mut NodeGraph, entries: &[storage_provider::CryptsetupEntry]) {
+fn enrich_luks(graph: &mut NodeGraph, entries: &[storage_provider::LuksObservation]) {
     for entry in entries {
         let id = content_node_id(&entry.device.to_string_lossy());
         let Some(mut node) = graph.node(&id).cloned() else {
             continue;
         };
-        let version = match entry.luks_type.as_str() {
-            "LUKS1" => LuksVersion::Luks1,
-            "LUKS2" => LuksVersion::Luks2,
-            _ => continue,
+        node.kind.kind = NodeKind::LuksContainer {
+            version: entry.version,
         };
-        node.kind.kind = NodeKind::LuksContainer { version };
-        let header_size = entry.data_offset_sectors.saturating_mul(512);
         node.kind.size = node
             .kind
             .size
-            .map(|size| Bytes::new(size.as_u64().saturating_sub(header_size)));
+            .map(|size| Bytes::new(size.as_u64().saturating_sub(entry.payload_offset.as_u64())));
         node.size.identities.retain(|identity| {
             !matches!(identity, ExternalId::Filesystem { fs_type, .. } if fs_type == "crypto_LUKS")
         });
-        if let Some(uuid) = entry
-            .uuid
-            .as_deref()
-            .and_then(|value| Uuid::parse_str(value).ok())
-        {
-            node.size.identities.push(ExternalId::LuksUuid(uuid));
+        if let Some(identity) = &entry.identity {
+            node.size.identities.push(identity.clone());
         }
         graph.insert_node(id, node);
     }
@@ -2375,12 +2368,13 @@ fn transport(name: &str) -> Option<Transport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage_core::model::LuksVersion;
     use storage_provider::{
         BlkidEntry, BtrfsDeviceEntry, BtrfsEntry, BtrfsFilesystemEntry, BtrfsSubvolumeEntry,
         CryptsetupEntry, CryptsetupKeyslotEntry, CryptsetupKeyslotState, DevmapperEntry,
-        FdiskPartition, FdiskTable, LvmEntry, LvmLvEntry, LvmPvEntry, LvmVgEntry, MdraidArrayEntry,
-        NativeDeviceNumber, NvmeControllerEntry, NvmeEntry, NvmeNamespaceEntry, NvmeSubsystemEntry,
-        ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry, ZfsPoolEntry,
+        FdiskPartition, FdiskTable, LuksObservation, LvmEntry, LvmLvEntry, LvmPvEntry, LvmVgEntry,
+        MdraidArrayEntry, NativeDeviceNumber, NvmeControllerEntry, NvmeEntry, NvmeNamespaceEntry,
+        NvmeSubsystemEntry, ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry, ZfsPoolEntry,
         ZfsVdevClass as ProviderZfsVdevClass, ZfsVdevEntry, ZfsVdevKind as ProviderZfsVdevKind,
     };
 
@@ -2493,21 +2487,30 @@ mod tests {
 
         enrich_luks(
             &mut graph,
-            &[CryptsetupEntry {
+            &[LuksObservation {
                 device: PathBuf::from("/dev/vda1"),
-                luks_type: "LUKS2".to_owned(),
-                uuid: Some("08f959f7-30d8-44c9-a49e-91638f131eb7".to_owned()),
-                cipher: Some("aes".to_owned()),
-                cipher_mode: Some("xts-plain64".to_owned()),
-                data_offset_sectors: 32,
-                sector_size: Some(4_096),
-                volume_key_size: Some(64),
-                metadata_size: Some(16_384),
-                keyslots_size: Some(16_744_448),
-                keyslots: vec![CryptsetupKeyslotEntry {
-                    index: 0,
-                    state: CryptsetupKeyslotState::ActiveLast,
-                }],
+                version: LuksVersion::Luks2,
+                identity: Some(ExternalId::LuksUuid(
+                    Uuid::parse_str("08f959f7-30d8-44c9-a49e-91638f131eb7")
+                        .unwrap_or_else(|error| panic!("parse test UUID: {error}")),
+                )),
+                payload_offset: Bytes::new(32 * 512),
+                header: CryptsetupEntry {
+                    device: PathBuf::from("/dev/vda1"),
+                    luks_type: "LUKS2".to_owned(),
+                    uuid: Some("08f959f7-30d8-44c9-a49e-91638f131eb7".to_owned()),
+                    cipher: Some("aes".to_owned()),
+                    cipher_mode: Some("xts-plain64".to_owned()),
+                    data_offset_sectors: 32,
+                    sector_size: Some(4_096),
+                    volume_key_size: Some(64),
+                    metadata_size: Some(16_384),
+                    keyslots_size: Some(16_744_448),
+                    keyslots: vec![CryptsetupKeyslotEntry {
+                        index: 0,
+                        state: CryptsetupKeyslotState::ActiveLast,
+                    }],
+                },
             }],
         );
 

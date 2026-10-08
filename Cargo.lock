@@ -577,7 +577,9 @@ dependencies = [
  "libloading",
  "serde",
  "serde_json",
+ "storage-core",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

@@ -20,4 +20,6 @@ expect_used = "deny"
 libloading.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+storage-core.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
