@@ -19,11 +19,17 @@ use thiserror::Error;
 mod dylib;
 mod logical;
 mod luks;
+mod transport;
 
 pub use logical::{LogicalProvider, ProviderId};
 pub use luks::{
     CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProvider,
     LuksValidationError,
+};
+pub use transport::{
+    PROVIDER_PROTOCOL_VERSION, ProviderBinding, ProviderConnection, ProviderConnectionKind,
+    ProviderRemoteError, ProviderRequest, ProviderResponse, ProviderResponsePayload,
+    ProviderTransport, ProviderTransportError,
 };
 
 /// Manifest JSON schema version supported by this release.

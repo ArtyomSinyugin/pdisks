@@ -16,7 +16,7 @@ use storage_core::model::{
     PartitionTable, Presence, Relation, RelationKind, Transport, ZfsMember, ZfsParity,
     ZfsVdevClass, ZfsVdevKind,
 };
-use storage_provider::{BackendAccess, RegisteredBackend, UdevBlockEntry};
+use storage_provider::{ProviderConnectionKind, RegisteredBackend, UdevBlockEntry};
 use uuid::Uuid;
 
 use crate::{
@@ -188,8 +188,8 @@ impl StateProvider for NativeBlockProvider<'_> {
         "block.current-state"
     }
 
-    fn backend_access(&self) -> BackendAccess {
-        BackendAccess::Library
+    fn connection_kind(&self) -> ProviderConnectionKind {
+        ProviderConnectionKind::BuiltIn
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -206,8 +206,8 @@ impl StateProvider for NativeMapperProvider<'_> {
         "block.current-state"
     }
 
-    fn backend_access(&self) -> BackendAccess {
-        BackendAccess::Library
+    fn connection_kind(&self) -> ProviderConnectionKind {
+        ProviderConnectionKind::BuiltIn
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -264,8 +264,8 @@ impl StateProvider for NativeRuntimeProvider<'_> {
         "block.current-state"
     }
 
-    fn backend_access(&self) -> BackendAccess {
-        BackendAccess::Library
+    fn connection_kind(&self) -> ProviderConnectionKind {
+        ProviderConnectionKind::BuiltIn
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -334,8 +334,8 @@ impl StateProvider for NativeLocalProvider<'_> {
         "block.current-state"
     }
 
-    fn backend_access(&self) -> BackendAccess {
-        BackendAccess::Library
+    fn connection_kind(&self) -> ProviderConnectionKind {
+        ProviderConnectionKind::BuiltIn
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -384,8 +384,8 @@ impl StateProvider for NativeSystemProvider<'_> {
         "storage.current-state"
     }
 
-    fn backend_access(&self) -> BackendAccess {
-        BackendAccess::Library
+    fn connection_kind(&self) -> ProviderConnectionKind {
+        ProviderConnectionKind::BuiltIn
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -493,8 +493,8 @@ impl StateProvider for LibmountProvider<'_> {
         "mounts.runtime"
     }
 
-    fn backend_access(&self) -> BackendAccess {
-        self.provider.access()
+    fn connection_kind(&self) -> ProviderConnectionKind {
+        ProviderConnectionKind::BuiltIn
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -1900,8 +1900,8 @@ impl StateProvider for FixtureCliProvider {
         "fixture.linux-state"
     }
 
-    fn backend_access(&self) -> BackendAccess {
-        BackendAccess::Executable
+    fn connection_kind(&self) -> ProviderConnectionKind {
+        ProviderConnectionKind::BuiltIn
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {

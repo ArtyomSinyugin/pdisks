@@ -6,7 +6,7 @@ use storage_core::model::{
     CurrentState, Diagnostic, DiagnosticSeverity, DiagnosticSubject, Environment, MountState,
     NodeGraph, NodeId, ObservedMount, SystemEnvironment,
 };
-use storage_provider::BackendAccess;
+use storage_provider::ProviderConnectionKind;
 use thiserror::Error;
 
 /// Successful read-only contribution from one provider.
@@ -44,8 +44,9 @@ impl ProviderProbeError {
 
 /// Provider-specific adapter capable of a read-only probe.
 ///
-/// Library and CLI adapters must have distinct responsibilities. The assembler
-/// never substitutes one adapter for another.
+/// The connection describes how PDisks reaches this logical provider. Concrete
+/// C libraries and executables used behind it remain backend implementation
+/// details. The assembler never substitutes one provider for another.
 pub trait StateProvider {
     /// Stable provider integration ID.
     fn id(&self) -> &str;
@@ -53,8 +54,8 @@ pub trait StateProvider {
     /// Exclusive area of current state owned by this adapter.
     fn responsibility(&self) -> &str;
 
-    /// Backend used by this adapter.
-    fn backend_access(&self) -> BackendAccess;
+    /// PDisks attachment mechanism used by this provider.
+    fn connection_kind(&self) -> ProviderConnectionKind;
 
     /// Reads current state without performing storage mutations.
     fn probe(&self) -> Result<ProviderState, ProviderProbeError>;
@@ -88,7 +89,7 @@ pub fn probe(providers: &[&dyn StateProvider]) -> CurrentState {
             }
             Err(error) => state.diagnostics.push(provider_failure(
                 adapter.id(),
-                adapter.backend_access(),
+                adapter.connection_kind(),
                 format!("{}: {}", error.code, error.message),
             )),
         }
@@ -165,13 +166,17 @@ fn merge_provider_state(
 }
 
 /// Converts total provider failure into a current-state diagnostic.
-fn provider_failure(provider_id: &str, backend: BackendAccess, evidence: String) -> Diagnostic {
+fn provider_failure(
+    provider_id: &str,
+    connection: ProviderConnectionKind,
+    evidence: String,
+) -> Diagnostic {
     Diagnostic {
         code: "provider.probe_failed".into(),
         severity: DiagnosticSeverity::MissingInformation,
         subjects: vec![],
         message: format!(
-            "provider {provider_id} ({backend:?}) could not inspect its storage responsibility"
+            "provider {provider_id} ({connection:?}) could not inspect its storage responsibility"
         ),
         evidence: Some(evidence),
         suggested_remedy: Some("install or repair the provider backend and repeat probing".into()),
@@ -188,7 +193,7 @@ fn responsibility_conflict(responsibility: &str, providers: &[&dyn StateProvider
         evidence: Some(
             providers
                 .iter()
-                .map(|provider| format!("{} ({:?})", provider.id(), provider.backend_access()))
+                .map(|provider| format!("{} ({:?})", provider.id(), provider.connection_kind()))
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
@@ -212,7 +217,7 @@ mod tests {
     struct FakeProvider {
         id: &'static str,
         responsibility: &'static str,
-        backend: BackendAccess,
+        connection: ProviderConnectionKind,
         calls: Rc<Cell<u32>>,
         result: Result<ProviderState, ProviderProbeError>,
     }
@@ -226,8 +231,8 @@ mod tests {
             self.responsibility
         }
 
-        fn backend_access(&self) -> BackendAccess {
-            self.backend
+        fn connection_kind(&self) -> ProviderConnectionKind {
+            self.connection
         }
 
         fn probe(&self) -> Result<ProviderState, ProviderProbeError> {
@@ -261,54 +266,54 @@ mod tests {
     #[test]
     fn providers_with_distinct_responsibilities_are_called_independently() {
         let id = NodeId::from_uuid(Uuid::from_u128(1));
-        let native_calls = Rc::new(Cell::new(0));
-        let cli_calls = Rc::new(Cell::new(0));
-        let native = FakeProvider {
+        let built_in_calls = Rc::new(Cell::new(0));
+        let process_calls = Rc::new(Cell::new(0));
+        let built_in = FakeProvider {
             id: "block",
             responsibility: "block.topology",
-            backend: BackendAccess::Library,
-            calls: Rc::clone(&native_calls),
+            connection: ProviderConnectionKind::BuiltIn,
+            calls: Rc::clone(&built_in_calls),
             result: Ok(disk_state(id)),
         };
-        let cli = FakeProvider {
+        let process = FakeProvider {
             id: "mounts",
             responsibility: "mounts.runtime",
-            backend: BackendAccess::Executable,
-            calls: Rc::clone(&cli_calls),
+            connection: ProviderConnectionKind::Process,
+            calls: Rc::clone(&process_calls),
             result: Ok(ProviderState::default()),
         };
 
-        let current = probe(&[&cli, &native]);
+        let current = probe(&[&process, &built_in]);
 
-        assert_eq!(native_calls.get(), 1);
-        assert_eq!(cli_calls.get(), 1);
+        assert_eq!(built_in_calls.get(), 1);
+        assert_eq!(process_calls.get(), 1);
         assert!(current.graph.node(&id).is_some());
         assert!(current.diagnostics.is_empty());
     }
 
     #[test]
     fn duplicate_responsibility_is_rejected_without_substitution() {
-        let native_calls = Rc::new(Cell::new(0));
-        let cli_calls = Rc::new(Cell::new(0));
-        let native = FakeProvider {
+        let built_in_calls = Rc::new(Cell::new(0));
+        let process_calls = Rc::new(Cell::new(0));
+        let built_in = FakeProvider {
             id: "libmount",
             responsibility: "mounts.runtime",
-            backend: BackendAccess::Library,
-            calls: Rc::clone(&native_calls),
+            connection: ProviderConnectionKind::BuiltIn,
+            calls: Rc::clone(&built_in_calls),
             result: Ok(ProviderState::default()),
         };
-        let cli = FakeProvider {
+        let process = FakeProvider {
             id: "findmnt",
             responsibility: "mounts.runtime",
-            backend: BackendAccess::Executable,
-            calls: Rc::clone(&cli_calls),
+            connection: ProviderConnectionKind::Process,
+            calls: Rc::clone(&process_calls),
             result: Ok(ProviderState::default()),
         };
 
-        let current = probe(&[&cli, &native]);
+        let current = probe(&[&process, &built_in]);
 
-        assert_eq!(native_calls.get(), 0);
-        assert_eq!(cli_calls.get(), 0);
+        assert_eq!(built_in_calls.get(), 0);
+        assert_eq!(process_calls.get(), 0);
         assert!(
             current
                 .diagnostics
@@ -323,7 +328,7 @@ mod tests {
         let first = FakeProvider {
             id: "block",
             responsibility: "block.topology",
-            backend: BackendAccess::Library,
+            connection: ProviderConnectionKind::BuiltIn,
             calls: Rc::new(Cell::new(0)),
             result: Ok(disk_state(id)),
         };
@@ -341,7 +346,7 @@ mod tests {
         let second = FakeProvider {
             id: "zram",
             responsibility: "zram.devices",
-            backend: BackendAccess::Library,
+            connection: ProviderConnectionKind::BuiltIn,
             calls: Rc::new(Cell::new(0)),
             result: Ok(conflicting),
         };
@@ -390,7 +395,7 @@ mod tests {
         let provider = FakeProvider {
             id: "block",
             responsibility: "block.topology",
-            backend: BackendAccess::Library,
+            connection: ProviderConnectionKind::BuiltIn,
             calls: Rc::new(Cell::new(0)),
             result: Ok(contribution),
         };
