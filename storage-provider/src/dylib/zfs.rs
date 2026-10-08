@@ -177,9 +177,14 @@ unsafe extern "C" fn collect_pool(pool: *mut PoolRaw, opaque: *mut c_void) -> c_
         unsafe { (context.api.pool_close)(pool) };
         return 0;
     }
-    // SAFETY: getters borrow the live pool handle and configuration nvlist.
+    // SAFETY: the callback receives a live pool handle and the returned string
+    // is borrowed only while that handle remains open.
     let name = unsafe { copied_string((context.api.pool_name)(pool)) };
+    // SAFETY: the callback receives a live pool handle; a null second argument
+    // requests the current configuration owned by that handle.
     let config = unsafe { (context.api.pool_config)(pool, std::ptr::null_mut()) };
+    // SAFETY: the callback receives a live pool handle and the getter does not
+    // retain it beyond this call.
     let state = unsafe { (context.api.pool_state)(pool) };
     if let Some(name) = name {
         if config.is_null() {
