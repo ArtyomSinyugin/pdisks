@@ -25,6 +25,30 @@ to a separately built logical provider. A provider action remains, for example,
 `LuksAction::Open` regardless of whether the provider is built in, loaded as a
 PDisks plugin, or hosted in another process.
 
+## Provider actions and contracts
+
+`ProviderAction` is a closed serializable enum dispatching typed partition,
+LUKS, LVM, filesystem, Btrfs, and mount actions. Actions contain only domain
+parameters and planned node identities. They never contain backend references,
+library paths, function pointers, closures, or arbitrary command arguments.
+
+Creating actions name their model outputs explicitly through
+`planned_node_id`. Values generated only by a backend, including future UUIDs,
+device numbers, and capacity after provider overhead, remain unknown until
+postcondition probing.
+
+`describe_action` derives one `ActionContract` from the typed action and the
+trusted graph context. It contains prerequisites, provided outputs, resource
+access, the shared predicted effect, invalidated facts, postconditions, and a
+restart policy. Future simulation must consume this `predicted_effect` instead
+of maintaining a second implementation of action semantics.
+
+The JSON contract is informational. After importing a plan,
+`verify_imported_contract` recalculates the complete contract and compares it
+with the imported representation. On success it returns the recalculated
+instance. Editing JSON therefore cannot remove `NoUnexpectedConsumers`, reduce
+resource locks, or weaken postcondition verification.
+
 ## Backend manifests
 
 Backend manifests belong to pdisks. Third-party packages such as `libzfs`,

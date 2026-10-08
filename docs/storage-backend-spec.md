@@ -860,7 +860,53 @@ Action {
 
 Ключевые группы `ActionKind`: `Deactivate`, `Wipe`, `CreateTable`, `CreatePartition`, `ResizePartition`, `SetPartitionAttrs`, `LuksFormat`, `LuksOpen`, `AddKeyslot`, `EnrollTpm2`, `MdCreate`, `MdAdd`, `PvCreate`, `VgCreate`, `LvCreate`, `LvResize`, `PoolCreate`, `DatasetCreate`, `SubvolumeCreate`, `Mkfs`, `FsResize`, `SetFsLabel`, `Mount`, `WriteFstab`, `WriteCrypttab`, `RegenerateInitramfs`, `InstallBootloader`.
 
-### 9.2 Точка невозврата
+Базовый контейнер provider actions закрыт вместе с `NodeKind` и сериализуется
+как данные:
+
+```rust
+#[serde(tag = "provider", content = "operation", rename_all = "snake_case")]
+enum ProviderAction {
+    Partition(PartitionAction),
+    Luks(LuksAction),
+    Lvm(LvmAction),
+    Filesystem(FilesystemAction),
+    Btrfs(BtrfsAction),
+    Mount(MountAction),
+}
+```
+
+Action содержит только параметры предметной области и `planned_node_id` для
+предсказуемых будущих узлов. Ссылки на backend, пути к `.so`, function pointers,
+замыкания и произвольные CLI arguments в action запрещены.
+
+Динамический provider реализует известный host-у набор действий. Совершенно
+новые операции без обновления host потребуют отдельного расширяемого протокола
+со схемой, validation и UI contract; plugin ABI не даёт этого автоматически.
+
+### 9.2 Контракт действия
+
+Из typed action и доверенного контекста одной реализацией вычисляется
+`ActionContract`:
+
+```text
+prerequisites
+provided_outputs
+affected_resources
+predicted_effect
+invalidated_facts
+postconditions
+restart_policy
+```
+
+`predicted_effect` является единственным описанием изменения для planner и
+simulation. Поддерживать вторую ручную реализацию эффекта в simulator нельзя.
+
+Сериализованный contract предназначен для просмотра и review. После импорта
+trusted side полностью пересчитывает его из action и актуального контекста.
+План с удалённым `NoUnexpectedConsumers`, ослабленными resource locks или
+изменёнными postconditions отклоняется до исполнения.
+
+### 9.3 Точка невозврата
 
 Планировщик вычисляет `point_of_no_return` — индекс первого действия класса `Irreversible`. Всё до неё откатывается автоматически. UI **обязан** явно запросить подтверждение перед пересечением, показав, что именно будет уничтожено:
 
@@ -870,14 +916,14 @@ Action {
   /dev/sdb        весь диск, ZFS-пул "old-tank", 4 датасета
 ```
 
-### 9.3 Оптимизации плана
+### 9.4 Оптимизации плана
 
 - **Схлопывание**: `create partition → mkfs → resize` до нужного размера → сразу создать нужного размера
 - **Устранение мусора**: не форматировать то, что будет удалено следующим действием
 - **Параллелизация**: независимые ветви DAG выполняются одновременно (mkfs на 6 дисках — параллельно); ограничение по I/O-бюджету и по общему устройству
 - **Отложенный ресинк**: `mdadm --assume-clean` там, где безопасно (свежий массив под немедленный mkfs), с фиксацией в плане как явного компромисса
 
-### 9.4 Требования
+### 9.5 Требования
 
 - План сериализуем в JSON, YAML, человекочитаемый текст, DOT и в **shell-скрипт** (последнее — для аудита и для случаев, когда администратор хочет выполнить руками; скрипт снабжается комментариями и не является поддерживаемым способом выполнения)
 - Планирование не выполняет никаких изменений и не требует привилегий записи
