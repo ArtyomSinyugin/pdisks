@@ -105,7 +105,7 @@ that exist in the public Rust API today.
 | `libcryptsetup` | LUKS version and UUID | Cipher/PBKDF/header/keyslot/token metadata, active mapping correlation, format/open/close/keyslot/resize/reencrypt plans |
 | `libbd_fs` | Supported filesystem list, static features, resize modes and actual host availability including required utilities | Typed validation requests; mkfs/check/repair/resize/label/UUID actions after the common action safety layer exists |
 | `libbd_lvm` | PV/VG/LV identity, size, membership and basic segment type | Segment graph, thin/cache/RAID relations and usage, degraded/partial state, all validated mutation plans |
-| `libbd_mdraid` | Active arrays and member superblocks with basic RAID levels | Full RAID5/6/10 layout, member slot/role/state, bitmap/resync/degraded state, mutation plans |
+| `libbd_mdraid` | Active arrays, clean/degraded counts and diagnostics, status/bitmap, member superblock size/time/event freshness, and basic RAID layouts | Full RAID5/6/10 layout, member slot/role/state, resync progress and mutation plans |
 | `libbd_mpath` | Member paths joined to device-mapper multipath mappings | WWID identity, path state/priority, health and early path deduplication before content probing |
 | `libbd_loop` | Backing file, offset and runtime flags | Setup/remove/resize actions |
 | `libbd_swap` | Activation state | mkswap/swapon/swapoff/label/UUID actions with error-vs-inactive distinction |

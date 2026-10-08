@@ -284,8 +284,10 @@
           "bd_md_detail_data_free",
           "bd_md_examine",
           "bd_md_examine_data_free",
+          "bd_md_get_bitmap_location",
           "bd_md_init",
-          "bd_md_get_status"
+          "bd_md_get_status",
+          "g_free"
         ]
       },
       "capabilities": ["probe"]

@@ -54,6 +54,8 @@ type Detail = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> *mut Deta
 type DetailFree = unsafe extern "C" fn(*mut DetailRaw);
 type Examine = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> *mut ExamineRaw;
 type ExamineFree = unsafe extern "C" fn(*mut ExamineRaw);
+type GetString = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> *mut c_char;
+type GFree = unsafe extern "C" fn(*mut c_void);
 
 /// Symbols used by the libblockdev mdraid adapter.
 struct Api<'library> {
@@ -63,6 +65,9 @@ struct Api<'library> {
     detail_free: Symbol<'library, DetailFree>,
     examine: Symbol<'library, Examine>,
     examine_free: Symbol<'library, ExamineFree>,
+    status: Symbol<'library, GetString>,
+    bitmap: Symbol<'library, GetString>,
+    g_free: Symbol<'library, GFree>,
 }
 
 impl<'library> Api<'library> {
@@ -77,6 +82,9 @@ impl<'library> Api<'library> {
                 detail_free: load_symbol(library, b"bd_md_detail_data_free\0")?,
                 examine: load_symbol(library, b"bd_md_examine\0")?,
                 examine_free: load_symbol(library, b"bd_md_examine_data_free\0")?,
+                status: load_symbol(library, b"bd_md_get_status\0")?,
+                bitmap: load_symbol(library, b"bd_md_get_bitmap_location\0")?,
+                g_free: load_symbol(library, b"g_free\0")?,
             })
         }
     }
@@ -122,6 +130,8 @@ fn inspect_array(
     let Some(level) = level else {
         return Ok(None);
     };
+    let status = owned_string(api, &path, &api.status);
+    let bitmap = owned_string(api, &path, &api.bitmap);
     // SAFETY: all fields are copied before the guard releases the structure.
     Ok(Some(unsafe {
         MdraidArrayEntry {
@@ -131,6 +141,14 @@ fn inspect_array(
             uuid: copied_string((*detail.pointer).uuid),
             size: (*detail.pointer).array_size,
             raid_devices: (*detail.pointer).raid_devices,
+            total_devices: (*detail.pointer).total_devices,
+            active_devices: (*detail.pointer).active_devices,
+            working_devices: (*detail.pointer).working_devices,
+            failed_devices: (*detail.pointer).failed_devices,
+            spare_devices: (*detail.pointer).spare_devices,
+            clean: (*detail.pointer).clean != 0,
+            status,
+            bitmap,
         }
     }))
 }
@@ -156,8 +174,28 @@ fn inspect_member(
             device_uuid: copied_string((*examine.pointer).dev_uuid),
             metadata: copied_string((*examine.pointer).metadata),
             chunk_size: (*examine.pointer).chunk_size,
+            expected_devices: (*examine.pointer).num_devices,
+            size: (*examine.pointer).size,
+            update_time: (*examine.pointer).update_time,
+            events: (*examine.pointer).events,
         }
     }))
+}
+
+/// Copies and frees one optional GLib string query result.
+fn owned_string(api: &Api<'_>, path: &CString, getter: &GetString) -> Option<String> {
+    // SAFETY: path is NUL-terminated and null GError storage is accepted.
+    let pointer = unsafe { getter(path.as_ptr(), std::ptr::null_mut()) };
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: successful query returns a NUL-terminated GLib allocation.
+    let value = unsafe { CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: the returned allocation is released exactly once with g_free.
+    unsafe { (api.g_free)(pointer.cast()) };
+    Some(value)
 }
 
 /// Converts a Unix path into a native C string.

@@ -364,7 +364,9 @@ impl StateProvider for NativeLocalProvider<'_> {
                 storage_provider::LvmEntry::default()
             }
         };
-        enrich_mdraid(&mut state.graph, &mdraid);
+        state
+            .diagnostics
+            .extend(enrich_mdraid(&mut state.graph, &mdraid));
         enrich_lvm(&mut state.graph, &endpoints, &mappings, &lvm);
         Ok(state)
     }
@@ -822,7 +824,11 @@ fn enrich_multipath(
 }
 
 /// Adds MD array kinds, identities, and member edges.
-fn enrich_mdraid(graph: &mut NodeGraph, topology: &storage_provider::MdraidEntry) {
+fn enrich_mdraid(
+    graph: &mut NodeGraph,
+    topology: &storage_provider::MdraidEntry,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
     for array in &topology.arrays {
         let id = block_node_id(&array.device);
         let mut node = graph.node(&id).cloned().unwrap_or_else(|| Node {
@@ -844,6 +850,25 @@ fn enrich_mdraid(graph: &mut NodeGraph, topology: &storage_provider::MdraidEntry
             }
         }
         graph.insert_node(id, node);
+        if array.failed_devices > 0 || array.active_devices < array.raid_devices {
+            diagnostics.push(Diagnostic {
+                code: "mdraid.array_degraded".to_owned(),
+                severity: DiagnosticSeverity::Warning,
+                subjects: vec![DiagnosticSubject::Node(id)],
+                message: format!(
+                    "MD array {} has {}/{} active devices and {} failed devices",
+                    array.device.display(),
+                    array.active_devices,
+                    array.raid_devices,
+                    array.failed_devices
+                ),
+                evidence: array.status.clone(),
+                suggested_remedy: Some(
+                    "inspect member state and complete recovery before destructive changes"
+                        .to_owned(),
+                ),
+            });
+        }
     }
 
     for member in &topology.members {
@@ -867,6 +892,7 @@ fn enrich_mdraid(graph: &mut NodeGraph, topology: &storage_provider::MdraidEntry
             })),
         });
     }
+    diagnostics
 }
 
 /// Builds the strongest MD kind supported by the available metadata.
@@ -2478,6 +2504,14 @@ mod tests {
             uuid: None,
             size: 1_024,
             raid_devices: 2,
+            total_devices: 2,
+            active_devices: 2,
+            working_devices: 2,
+            failed_devices: 0,
+            spare_devices: 0,
+            clean: true,
+            status: Some("active".to_owned()),
+            bitmap: None,
         };
 
         assert!(matches!(mdraid_kind(&array, &[]), NodeKind::MdArray(_)));

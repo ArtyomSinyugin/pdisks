@@ -587,6 +587,22 @@ pub struct MdraidArrayEntry {
     pub size: u64,
     /// Configured RAID device count.
     pub raid_devices: u64,
+    /// Total devices currently associated with the array.
+    pub total_devices: u64,
+    /// Devices active in the array.
+    pub active_devices: u64,
+    /// Devices considered working by MD.
+    pub working_devices: u64,
+    /// Devices considered failed by MD.
+    pub failed_devices: u64,
+    /// Devices currently assigned as spares.
+    pub spare_devices: u64,
+    /// Whether MD reports the array as clean.
+    pub clean: bool,
+    /// Provider status string.
+    pub status: Option<String>,
+    /// Configured write-intent bitmap location.
+    pub bitmap: Option<String>,
 }
 
 /// One block device carrying an MD member superblock.
@@ -604,6 +620,14 @@ pub struct MdraidMemberEntry {
     pub metadata: Option<String>,
     /// Chunk size in bytes.
     pub chunk_size: u64,
+    /// Number of devices expected by the member superblock.
+    pub expected_devices: u64,
+    /// Component size in bytes.
+    pub size: u64,
+    /// Last superblock update timestamp.
+    pub update_time: u64,
+    /// Superblock event counter used to compare freshness.
+    pub events: u64,
 }
 
 /// LVM topology returned by the libblockdev LVM plugin.
