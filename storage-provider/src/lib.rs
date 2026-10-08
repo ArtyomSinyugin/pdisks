@@ -19,37 +19,39 @@ use thiserror::Error;
 mod dylib;
 
 /// Manifest JSON schema version supported by this release.
-pub const PROVIDER_MANIFEST_VERSION: u16 = 1;
+pub const BACKEND_MANIFEST_VERSION: u16 = 1;
 
-/// Environment variable overriding the provider manifest file.
-pub const PROVIDER_MANIFEST_ENV: &str = "PDISKS_PROVIDER_MANIFEST";
+/// Environment variable overriding the backend manifest file.
+///
+/// The variable name is retained for compatibility with existing deployments.
+pub const BACKEND_MANIFEST_ENV: &str = "PDISKS_PROVIDER_MANIFEST";
 
 /// Provider manifest file used when no environment override is set.
-pub const DEFAULT_PROVIDER_MANIFEST: &str = "/usr/share/pdisks/providers.json";
+pub const DEFAULT_BACKEND_MANIFEST: &str = "/usr/share/pdisks/providers.json";
 
-/// Stable identity of a provider integration.
+/// Stable identity of a concrete system backend integration.
 #[repr(transparent)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ProviderId(String);
+pub struct BackendId(String);
 
-impl ProviderId {
+impl BackendId {
     /// Creates an ID without whitespace.
     pub fn new(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
         (!value.is_empty() && !value.chars().any(char::is_whitespace)).then_some(Self(value))
     }
 
-    /// Returns the opaque provider ID.
+    /// Returns the opaque backend ID.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// Independent roles implemented by a provider integration.
+/// Coarse roles implemented by a concrete system backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderCapability {
+pub enum BackendCapability {
     /// Read-only discovery.
     Probe,
     /// Technology-specific validation.
@@ -60,10 +62,10 @@ pub enum ProviderCapability {
     Execute,
 }
 
-/// Native library expected by a provider integration.
+/// Native library expected by a system backend integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderLibrary {
+pub struct BackendLibrary {
     /// Absolute path supplied by the target package build.
     pub path: PathBuf,
     /// Symbols required by the compiled pdisks adapter.
@@ -74,7 +76,7 @@ pub struct ProviderLibrary {
     pub auxiliary: Vec<AuxiliaryLibrary>,
 }
 
-/// Additional dynamic library retained by a multi-library provider adapter.
+/// Additional dynamic library retained by a multi-library backend adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuxiliaryLibrary {
@@ -85,64 +87,65 @@ pub struct AuxiliaryLibrary {
     pub required_symbols: BTreeSet<String>,
 }
 
-/// Versioned project-owned collection of provider integrations.
+/// Versioned project-owned collection of system backend integrations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderManifests {
+pub struct BackendManifests {
     /// Version of this JSON structure, not of any native library.
     pub manifest_version: u16,
-    /// Optional integrations known to this pdisks build.
-    pub providers: Vec<ProviderManifest>,
+    /// Optional backend integrations known to this pdisks build.
+    #[serde(rename = "providers")]
+    pub backends: Vec<BackendManifest>,
 }
 
-/// Project-owned description of one optional provider integration.
+/// Project-owned description of one optional system backend integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderManifest {
+pub struct BackendManifest {
     /// Stable integration identity.
-    pub id: ProviderId,
+    pub id: BackendId,
     /// Preferred native library, when this integration has one.
     #[serde(default)]
-    pub library: Option<ProviderLibrary>,
+    pub library: Option<BackendLibrary>,
     /// Fallback command-line tool, when this integration has one.
     #[serde(default)]
     pub executable: Option<PathBuf>,
     /// Roles exposed after a backend passes availability checks.
-    pub capabilities: BTreeSet<ProviderCapability>,
+    pub capabilities: BTreeSet<BackendCapability>,
 }
 
-/// Available backend selected for a provider integration.
+/// Mechanism used to call a concrete system backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderBackend {
-    /// Native library loaded by a provider-specific FFI adapter.
+pub enum BackendAccess {
+    /// Native library loaded by a backend-specific C FFI adapter.
     Library,
-    /// External command invoked by a provider-specific parser.
-    Cli,
+    /// External command invoked by a backend-specific typed wrapper.
+    Executable,
 }
 
-/// Available provider integration registered for later initialization.
+/// Available system backend registered for use by a logical provider.
 #[derive(Debug)]
-pub struct RegisteredProvider {
-    manifest: ProviderManifest,
+pub struct RegisteredBackend {
+    manifest: BackendManifest,
     manifest_path: PathBuf,
-    backend: LoadedBackend,
+    access: LoadedBackendAccess,
 }
 
-/// Resources retained for the selected provider backend.
+/// Resources retained for the selected system backend access mechanism.
 #[derive(Debug)]
-enum LoadedBackend {
+enum LoadedBackendAccess {
     /// Loaded native library kept alive for its future typed FFI adapter.
     Library {
         /// Handle retained so resolved symbols cannot outlive their library.
         library: dylib::LoadedLibrary,
     },
     /// Available command-line backend.
-    Cli,
+    Executable,
 }
 
-impl RegisteredProvider {
-    /// Returns the validated provider descriptor.
-    pub fn manifest(&self) -> &ProviderManifest {
+impl RegisteredBackend {
+    /// Returns the validated backend descriptor.
+    pub fn manifest(&self) -> &BackendManifest {
         &self.manifest
     }
 
@@ -151,30 +154,30 @@ impl RegisteredProvider {
         &self.manifest_path
     }
 
-    /// Returns the backend found on this host.
-    pub fn backend(&self) -> ProviderBackend {
-        match self.backend {
-            LoadedBackend::Library { .. } => ProviderBackend::Library,
-            LoadedBackend::Cli => ProviderBackend::Cli,
+    /// Returns the mechanism used to access this backend on the host.
+    pub fn access(&self) -> BackendAccess {
+        match self.access {
+            LoadedBackendAccess::Library { .. } => BackendAccess::Library,
+            LoadedBackendAccess::Executable => BackendAccess::Executable,
         }
     }
 
     /// Reads the live mount table through a registered libmount backend.
     ///
-    /// The provider manifest must select a dynamic library exporting the
+    /// The backend manifest must select a dynamic library exporting the
     /// libmount symbols used by this adapter. CLI-backed providers are rejected.
     pub fn probe_libmount(&self) -> Result<Vec<LibmountEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_libmount(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_libmount(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Enumerates live Linux block endpoints through libudev.
     pub fn probe_udev_blocks(&self) -> Result<Vec<UdevBlockEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_udev_blocks(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_udev_blocks(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
@@ -183,25 +186,25 @@ impl RegisteredProvider {
         &self,
         devices: &[PathBuf],
     ) -> Result<Vec<FdiskTable>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_fdisk_partitions(devices),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_fdisk_partitions(devices),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reads cached and freshly probed content signatures through libblkid.
     pub fn probe_blkid_signatures(&self) -> Result<Vec<BlkidEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_blkid_signatures(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_blkid_signatures(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reads live device-mapper names, targets, and backing devices.
     pub fn probe_devmapper(&self) -> Result<Vec<DevmapperEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_devmapper(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_devmapper(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
@@ -210,33 +213,33 @@ impl RegisteredProvider {
         &self,
         devices: &[PathBuf],
     ) -> Result<Vec<CryptsetupEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_cryptsetup(devices),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_cryptsetup(devices),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reads loop-device backing files through the libblockdev loop plugin.
     pub fn probe_loop(&self, devices: &[PathBuf]) -> Result<Vec<LoopEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_loop(devices),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_loop(devices),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reads activation state for known swap devices through libblockdev.
     pub fn probe_swap(&self, devices: &[PathBuf]) -> Result<Vec<SwapEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_swap(devices),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_swap(devices),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reads multipath member devices through the libblockdev mpath plugin.
     pub fn probe_multipath(&self) -> Result<MultipathEntry, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_multipath(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_multipath(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
@@ -246,17 +249,17 @@ impl RegisteredProvider {
         arrays: &[PathBuf],
         members: &[PathBuf],
     ) -> Result<MdraidEntry, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_mdraid(arrays, members),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_mdraid(arrays, members),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reads LVM PV, VG, and LV topology through the libblockdev LVM plugin.
     pub fn probe_lvm(&self) -> Result<LvmEntry, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_lvm(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_lvm(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
@@ -265,9 +268,9 @@ impl RegisteredProvider {
         &self,
         mountpoints: &[PathBuf],
     ) -> Result<Vec<BtrfsEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_btrfs(mountpoints),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_btrfs(mountpoints),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
@@ -276,33 +279,33 @@ impl RegisteredProvider {
         &self,
         devices: &[PathBuf],
     ) -> Result<Vec<BtrfsFilesystemEntry>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_btrfs_filesystems(devices),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_btrfs_filesystems(devices),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reports operation groups available through libblockdev-btrfs.
     pub fn probe_btrfs_capabilities(&self) -> Result<BtrfsCapabilities, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_btrfs_capabilities(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_btrfs_capabilities(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reads imported ZFS pools and datasets through libzfs.
     pub fn probe_zfs(&self) -> Result<ZfsEntry, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_zfs(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_zfs(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
     /// Reads the live subsystem, controller, and namespace tree through libnvme.
     pub fn probe_nvme(&self) -> Result<NvmeEntry, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_nvme(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_nvme(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 
@@ -314,9 +317,9 @@ impl RegisteredProvider {
     pub fn probe_filesystem_capabilities(
         &self,
     ) -> Result<Vec<FilesystemCapabilities>, NativeProbeError> {
-        match &self.backend {
-            LoadedBackend::Library { library } => library.probe_filesystem_capabilities(),
-            LoadedBackend::Cli => Err(NativeProbeError::LibraryRequired),
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.probe_filesystem_capabilities(),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
         }
     }
 }
@@ -1021,40 +1024,40 @@ pub struct LibmountEntry {
     pub options: Vec<String>,
 }
 
-/// Failure while calling a provider-specific dynamic-library adapter.
+/// Failure while calling a backend-specific dynamic-library adapter.
 #[derive(Debug, Error)]
 pub enum NativeProbeError {
-    /// The registered provider selected a CLI backend instead of a library.
-    #[error("native provider library is required")]
+    /// The registered backend selected an executable instead of a library.
+    #[error("native backend library is required")]
     LibraryRequired,
-    /// A required symbol was absent from the loaded provider library.
-    #[error("provider library does not export {symbol}")]
+    /// A required symbol was absent from the loaded backend library.
+    #[error("backend library does not export {symbol}")]
     MissingSymbol {
         /// Missing C symbol name.
         symbol: &'static str,
     },
-    /// The native provider returned an error code.
-    #[error("native provider call {operation} failed with code {code}")]
+    /// The native backend returned an error code.
+    #[error("native backend call {operation} failed with code {code}")]
     CallFailed {
         /// Native operation that failed.
         operation: &'static str,
         /// Provider-specific return code.
         code: i32,
     },
-    /// The native provider could not allocate a required object.
-    #[error("native provider could not allocate {object}")]
+    /// The native backend could not allocate a required object.
+    #[error("native backend could not allocate {object}")]
     AllocationFailed {
         /// Native object whose constructor returned null.
         object: &'static str,
     },
     /// A device path contained an interior NUL byte and cannot cross C FFI.
-    #[error("native provider cannot inspect path containing NUL: {path:?}")]
+    #[error("native backend cannot inspect path containing NUL: {path:?}")]
     InvalidPath {
         /// Rejected device path.
         path: PathBuf,
     },
-    /// A native provider returned structurally invalid data.
-    #[error("native provider returned invalid data from {operation}")]
+    /// A native backend returned structurally invalid data.
+    #[error("native backend returned invalid data from {operation}")]
     InvalidData {
         /// Native operation whose result violated its public ABI contract.
         operation: &'static str,
@@ -1063,27 +1066,27 @@ pub enum NativeProbeError {
 
 /// Deterministic registry containing only integrations available on this host.
 #[derive(Debug, Default)]
-pub struct ProviderRegistry {
-    providers: BTreeMap<ProviderId, RegisteredProvider>,
+pub struct BackendRegistry {
+    backends: BTreeMap<BackendId, RegisteredBackend>,
 }
 
-impl ProviderRegistry {
+impl BackendRegistry {
     /// Loads manifests from the environment override or the system file.
-    pub fn load() -> Result<Self, ProviderError> {
-        let path = std::env::var_os(PROVIDER_MANIFEST_ENV)
-            .map_or_else(|| PathBuf::from(DEFAULT_PROVIDER_MANIFEST), PathBuf::from);
+    pub fn load() -> Result<Self, BackendRegistryError> {
+        let path = std::env::var_os(BACKEND_MANIFEST_ENV)
+            .map_or_else(|| PathBuf::from(DEFAULT_BACKEND_MANIFEST), PathBuf::from);
         Self::load_from(path)
     }
 
-    /// Loads all provider declarations from one JSON file.
+    /// Loads all backend declarations from one JSON file.
     ///
-    /// A well-formed provider whose declared backends are unavailable on the
+    /// A well-formed backend whose system dependency is unavailable on the
     /// host is skipped. Optional system packages therefore do not prevent startup.
-    pub fn load_from(path: impl AsRef<Path>) -> Result<Self, ProviderError> {
+    pub fn load_from(path: impl AsRef<Path>) -> Result<Self, BackendRegistryError> {
         let path = path.as_ref();
         let manifests = read_manifests(path)?;
         let mut registry = Self::default();
-        for manifest in manifests.providers {
+        for manifest in manifests.backends {
             registry.register(path, manifest)?;
         }
         Ok(registry)
@@ -1093,23 +1096,23 @@ impl ProviderRegistry {
     ///
     /// Unlike runtime discovery, this fails when any declared optional
     /// dependency is unavailable or lacks its required symbols.
-    pub fn validate_dependencies(path: impl AsRef<Path>) -> Result<(), ProviderError> {
+    pub fn validate_dependencies(path: impl AsRef<Path>) -> Result<(), BackendRegistryError> {
         let path = path.as_ref();
-        for manifest in read_manifests(path)?.providers {
+        for manifest in read_manifests(path)?.backends {
             validate_manifest(path, &manifest)?;
             if let Some(library) = &manifest.library
                 && dylib::LoadedLibrary::load(library).is_none()
             {
-                return Err(ProviderError::UnavailableLibrary {
-                    provider: manifest.id,
+                return Err(BackendRegistryError::UnavailableLibrary {
+                    backend: manifest.id,
                     library: library.path.clone(),
                 });
             }
             if let Some(executable) = &manifest.executable
                 && !is_executable_file(executable)
             {
-                return Err(ProviderError::UnavailableExecutable {
-                    provider: manifest.id,
+                return Err(BackendRegistryError::UnavailableExecutable {
+                    backend: manifest.id,
                     executable: executable.clone(),
                 });
             }
@@ -1117,52 +1120,56 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Returns an available provider by stable ID.
-    pub fn get(&self, id: &ProviderId) -> Option<&RegisteredProvider> {
-        self.providers.get(id)
+    /// Returns an available backend by stable ID.
+    pub fn get(&self, id: &BackendId) -> Option<&RegisteredBackend> {
+        self.backends.get(id)
     }
 
-    /// Iterates over available providers in deterministic ID order.
-    pub fn providers(&self) -> impl ExactSizeIterator<Item = &RegisteredProvider> {
-        self.providers.values()
+    /// Iterates over available backends in deterministic ID order.
+    pub fn backends(&self) -> impl ExactSizeIterator<Item = &RegisteredBackend> {
+        self.backends.values()
     }
 
-    /// Validates and conditionally registers one provider declaration.
-    fn register(&mut self, path: &Path, manifest: ProviderManifest) -> Result<(), ProviderError> {
+    /// Validates and conditionally registers one backend declaration.
+    fn register(
+        &mut self,
+        path: &Path,
+        manifest: BackendManifest,
+    ) -> Result<(), BackendRegistryError> {
         validate_manifest(path, &manifest)?;
 
-        let Some(backend) = available_backend(&manifest) else {
+        let Some(access) = available_backend_access(&manifest) else {
             return Ok(());
         };
         let id = manifest.id.clone();
-        if self.providers.contains_key(&id) {
-            return Err(ProviderError::DuplicateProvider(id));
+        if self.backends.contains_key(&id) {
+            return Err(BackendRegistryError::DuplicateBackend(id));
         }
-        self.providers.insert(
+        self.backends.insert(
             id,
-            RegisteredProvider {
+            RegisteredBackend {
                 manifest,
                 manifest_path: path.to_path_buf(),
-                backend,
+                access,
             },
         );
         Ok(())
     }
 }
 
-/// Reads and validates the versioned provider collection.
-fn read_manifests(path: &Path) -> Result<ProviderManifests, ProviderError> {
-    let bytes = fs::read(path).map_err(|source| ProviderError::ReadManifest {
+/// Reads and validates the versioned backend collection.
+fn read_manifests(path: &Path) -> Result<BackendManifests, BackendRegistryError> {
+    let bytes = fs::read(path).map_err(|source| BackendRegistryError::ReadManifest {
         path: path.to_path_buf(),
         source,
     })?;
-    let manifests: ProviderManifests =
-        serde_json::from_slice(&bytes).map_err(|source| ProviderError::ParseManifest {
+    let manifests: BackendManifests =
+        serde_json::from_slice(&bytes).map_err(|source| BackendRegistryError::ParseManifest {
             path: path.to_path_buf(),
             source,
         })?;
-    if manifests.manifest_version != PROVIDER_MANIFEST_VERSION {
-        return Err(ProviderError::UnsupportedManifestVersion {
+    if manifests.manifest_version != BACKEND_MANIFEST_VERSION {
+        return Err(BackendRegistryError::UnsupportedManifestVersion {
             path: path.to_path_buf(),
             version: manifests.manifest_version,
         });
@@ -1171,9 +1178,9 @@ fn read_manifests(path: &Path) -> Result<ProviderManifests, ProviderError> {
 }
 
 /// Validates fields that cross the filesystem and dynamic-loader boundary.
-fn validate_manifest(path: &Path, manifest: &ProviderManifest) -> Result<(), ProviderError> {
+fn validate_manifest(path: &Path, manifest: &BackendManifest) -> Result<(), BackendRegistryError> {
     if manifest.library.is_none() && manifest.executable.is_none() {
-        return Err(ProviderError::MissingBackend {
+        return Err(BackendRegistryError::MissingBackend {
             path: path.to_path_buf(),
         });
     }
@@ -1186,7 +1193,7 @@ fn validate_manifest(path: &Path, manifest: &ProviderManifest) -> Result<(), Pro
     if let Some(executable) = &manifest.executable
         && !executable.is_absolute()
     {
-        return Err(ProviderError::RelativeExecutable {
+        return Err(BackendRegistryError::RelativeExecutable {
             path: path.to_path_buf(),
             executable: executable.clone(),
         });
@@ -1199,15 +1206,15 @@ fn validate_library_fields(
     manifest_path: &Path,
     library_path: &Path,
     symbols: &BTreeSet<String>,
-) -> Result<(), ProviderError> {
+) -> Result<(), BackendRegistryError> {
     if !library_path.is_absolute() {
-        return Err(ProviderError::RelativeLibrary {
+        return Err(BackendRegistryError::RelativeLibrary {
             path: manifest_path.to_path_buf(),
             library: library_path.to_path_buf(),
         });
     }
     if let Some(symbol) = symbols.iter().find(|symbol| symbol.as_bytes().contains(&0)) {
-        return Err(ProviderError::InvalidLibrarySymbol {
+        return Err(BackendRegistryError::InvalidLibrarySymbol {
             path: manifest_path.to_path_buf(),
             symbol: symbol.clone(),
         });
@@ -1216,19 +1223,19 @@ fn validate_library_fields(
 }
 
 /// Chooses the preferred backend that is actually available on this host.
-fn available_backend(manifest: &ProviderManifest) -> Option<LoadedBackend> {
+fn available_backend_access(manifest: &BackendManifest) -> Option<LoadedBackendAccess> {
     if let Some(library) = manifest
         .library
         .as_ref()
         .and_then(dylib::LoadedLibrary::load)
     {
-        Some(LoadedBackend::Library { library })
+        Some(LoadedBackendAccess::Library { library })
     } else if manifest
         .executable
         .as_ref()
         .is_some_and(|path| is_executable_file(path))
     {
-        Some(LoadedBackend::Cli)
+        Some(LoadedBackendAccess::Executable)
     } else {
         None
     }
@@ -1240,51 +1247,51 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-/// Provider manifest discovery or validation failure.
+/// Backend manifest discovery or validation failure.
 #[derive(Debug, Error)]
-pub enum ProviderError {
+pub enum BackendRegistryError {
     /// Manifest file could not be read.
-    #[error("cannot read provider manifest {path:?}: {source}")]
+    #[error("cannot read backend manifest {path:?}: {source}")]
     ReadManifest {
         path: PathBuf,
         source: std::io::Error,
     },
     /// Manifest JSON did not match the strict schema.
-    #[error("cannot parse provider manifest {path:?}: {source}")]
+    #[error("cannot parse backend manifest {path:?}: {source}")]
     ParseManifest {
         path: PathBuf,
         source: serde_json::Error,
     },
     /// Manifest uses a JSON schema unknown to this release.
-    #[error("provider manifest {path:?} uses unsupported schema version {version}")]
+    #[error("backend manifest {path:?} uses unsupported schema version {version}")]
     UnsupportedManifestVersion { path: PathBuf, version: u16 },
     /// A library selected for an RPM build is missing or ABI-incompatible.
-    #[error("provider {provider:?} cannot load library {library:?} with its required symbols")]
+    #[error("backend {backend:?} cannot load library {library:?} with its required symbols")]
     UnavailableLibrary {
-        provider: ProviderId,
+        backend: BackendId,
         library: PathBuf,
     },
     /// A command selected for an RPM build is missing or not executable.
-    #[error("provider {provider:?} has unavailable executable {executable:?}")]
+    #[error("backend {backend:?} has unavailable executable {executable:?}")]
     UnavailableExecutable {
-        provider: ProviderId,
+        backend: BackendId,
         executable: PathBuf,
     },
     /// Manifest declares neither a library nor a command fallback.
-    #[error("provider manifest {path:?} declares no backend")]
+    #[error("backend manifest {path:?} declares no system access")]
     MissingBackend { path: PathBuf },
     /// Relative library paths would make privileged loading process-dependent.
-    #[error("provider manifest {path:?} has relative library {library:?}")]
+    #[error("backend manifest {path:?} has relative library {library:?}")]
     RelativeLibrary { path: PathBuf, library: PathBuf },
     /// A symbol name cannot be passed to the native loader.
-    #[error("provider manifest {path:?} has invalid library symbol {symbol:?}")]
+    #[error("backend manifest {path:?} has invalid library symbol {symbol:?}")]
     InvalidLibrarySymbol { path: PathBuf, symbol: String },
     /// Relative executable paths would make invocation process-dependent.
-    #[error("provider manifest {path:?} has relative executable {executable:?}")]
+    #[error("backend manifest {path:?} has relative executable {executable:?}")]
     RelativeExecutable { path: PathBuf, executable: PathBuf },
     /// More than one available manifest declared the same ID.
-    #[error("duplicate provider ID {0:?}")]
-    DuplicateProvider(ProviderId),
+    #[error("duplicate backend ID {0:?}")]
+    DuplicateBackend(BackendId),
 }
 
 #[cfg(test)]
@@ -1307,17 +1314,17 @@ mod tests {
     }
 
     /// Builds the smallest command-backed provider manifest.
-    fn manifest(id: &str, executable: &str) -> ProviderManifest {
-        ProviderManifest {
-            id: ProviderId::new(id).unwrap_or_else(|| unreachable!()),
+    fn manifest(id: &str, executable: &str) -> BackendManifest {
+        BackendManifest {
+            id: BackendId::new(id).unwrap_or_else(|| unreachable!()),
             library: None,
             executable: Some(PathBuf::from(executable)),
-            capabilities: BTreeSet::from([ProviderCapability::Probe]),
+            capabilities: BTreeSet::from([BackendCapability::Probe]),
         }
     }
 
     /// Writes one versioned provider collection fixture.
-    fn write_manifests(directory: &Path, manifests: ProviderManifests) -> PathBuf {
+    fn write_manifests(directory: &Path, manifests: BackendManifests) -> PathBuf {
         let path = directory.join("providers.json");
         let json = serde_json::to_vec(&manifests)
             .unwrap_or_else(|error| panic!("serialize manifest fixture: {error}"));
@@ -1326,10 +1333,10 @@ mod tests {
     }
 
     /// Wraps provider declarations in the current file schema.
-    fn manifests(providers: Vec<ProviderManifest>) -> ProviderManifests {
-        ProviderManifests {
-            manifest_version: PROVIDER_MANIFEST_VERSION,
-            providers,
+    fn manifests(backends: Vec<BackendManifest>) -> BackendManifests {
+        BackendManifests {
+            manifest_version: BACKEND_MANIFEST_VERSION,
+            backends,
         }
     }
 
@@ -1345,13 +1352,13 @@ mod tests {
             ]),
         );
 
-        let registry = ProviderRegistry::load_from(path)
+        let registry = BackendRegistry::load_from(path)
             .unwrap_or_else(|error| panic!("load providers: {error}"));
-        ProviderRegistry::validate_dependencies(directory.join("providers.json"))
+        BackendRegistry::validate_dependencies(directory.join("providers.json"))
             .unwrap_or_else(|error| panic!("validate provider dependencies: {error}"));
         assert_eq!(
             registry
-                .providers()
+                .backends()
                 .map(|provider| provider.manifest().id.as_str())
                 .collect::<Vec<_>>(),
             ["block", "zfs"]
@@ -1368,12 +1375,12 @@ mod tests {
             manifests(vec![manifest("zfs", "/definitely/missing/zfs")]),
         );
 
-        let registry = ProviderRegistry::load_from(path)
+        let registry = BackendRegistry::load_from(path)
             .unwrap_or_else(|error| panic!("load providers: {error}"));
-        assert_eq!(registry.providers().len(), 0);
+        assert_eq!(registry.backends().len(), 0);
         assert!(matches!(
-            ProviderRegistry::validate_dependencies(directory.join("providers.json")),
-            Err(ProviderError::UnavailableExecutable { .. })
+            BackendRegistry::validate_dependencies(directory.join("providers.json")),
+            Err(BackendRegistryError::UnavailableExecutable { .. })
         ));
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
     }
@@ -1383,13 +1390,13 @@ mod tests {
     fn registry_rejects_unsupported_manifest_schema() {
         let directory = fixture_dir();
         let mut incompatible = manifests(vec![manifest("block", "/bin/true")]);
-        incompatible.manifest_version = PROVIDER_MANIFEST_VERSION + 1;
+        incompatible.manifest_version = BACKEND_MANIFEST_VERSION + 1;
         let path = write_manifests(&directory, incompatible);
 
         assert!(matches!(
-            ProviderRegistry::load_from(path),
-            Err(ProviderError::UnsupportedManifestVersion { version, .. })
-                if version == PROVIDER_MANIFEST_VERSION + 1
+            BackendRegistry::load_from(path),
+            Err(BackendRegistryError::UnsupportedManifestVersion { version, .. })
+                if version == BACKEND_MANIFEST_VERSION + 1
         ));
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
     }
@@ -1401,25 +1408,25 @@ mod tests {
         let mut relative = manifest("block", "bin/true");
         let path = write_manifests(&directory, manifests(vec![relative.clone()]));
         assert!(matches!(
-            ProviderRegistry::load_from(&path),
-            Err(ProviderError::RelativeExecutable { .. })
+            BackendRegistry::load_from(&path),
+            Err(BackendRegistryError::RelativeExecutable { .. })
         ));
 
         relative.executable = None;
-        relative.library = Some(ProviderLibrary {
+        relative.library = Some(BackendLibrary {
             path: PathBuf::from("/usr/lib64/libblock.so"),
             required_symbols: BTreeSet::from([String::from("bad\0symbol")]),
             auxiliary: Vec::new(),
         });
         write_manifests(&directory, manifests(vec![relative]));
         assert!(matches!(
-            ProviderRegistry::load_from(path),
-            Err(ProviderError::InvalidLibrarySymbol { .. })
+            BackendRegistry::load_from(path),
+            Err(BackendRegistryError::InvalidLibrarySymbol { .. })
         ));
 
         let mut relative_auxiliary = manifest("block", "/bin/true");
         relative_auxiliary.executable = None;
-        relative_auxiliary.library = Some(ProviderLibrary {
+        relative_auxiliary.library = Some(BackendLibrary {
             path: PathBuf::from("/usr/lib64/libblock.so"),
             required_symbols: BTreeSet::new(),
             auxiliary: vec![AuxiliaryLibrary {
@@ -1429,8 +1436,8 @@ mod tests {
         });
         let path = write_manifests(&directory, manifests(vec![relative_auxiliary]));
         assert!(matches!(
-            ProviderRegistry::load_from(path),
-            Err(ProviderError::RelativeLibrary { .. })
+            BackendRegistry::load_from(path),
+            Err(BackendRegistryError::RelativeLibrary { .. })
         ));
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
     }

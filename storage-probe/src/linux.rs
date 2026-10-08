@@ -16,7 +16,7 @@ use storage_core::model::{
     PartitionAttributes, PartitionTable, Presence, Relation, RelationKind, Transport, ZfsMember,
     ZfsParity, ZfsVdevClass, ZfsVdevKind,
 };
-use storage_provider::{ProviderBackend, RegisteredProvider, UdevBlockEntry};
+use storage_provider::{BackendAccess, RegisteredBackend, UdevBlockEntry};
 use uuid::Uuid;
 
 use crate::{
@@ -34,57 +34,57 @@ pub struct LinuxProbe {
 
 /// Native libmount adapter responsible only for runtime mount discovery.
 pub struct LibmountProvider<'a> {
-    provider: &'a RegisteredProvider,
+    provider: &'a RegisteredBackend,
 }
 
 /// Native adapter joining udev endpoints, fdisk topology, and blkid content.
 pub struct NativeBlockProvider<'a> {
-    udev: &'a RegisteredProvider,
-    fdisk: &'a RegisteredProvider,
-    blkid: &'a RegisteredProvider,
+    udev: &'a RegisteredBackend,
+    fdisk: &'a RegisteredBackend,
+    blkid: &'a RegisteredBackend,
 }
 
 /// Native adapter extending the block graph with dm and LUKS topology.
 pub struct NativeMapperProvider<'a> {
     block: NativeBlockProvider<'a>,
-    devmapper: &'a RegisteredProvider,
-    cryptsetup: &'a RegisteredProvider,
+    devmapper: &'a RegisteredBackend,
+    cryptsetup: &'a RegisteredBackend,
 }
 
 /// Native adapter extending mapper state with loop, swap, and multipath data.
 pub struct NativeRuntimeProvider<'a> {
     mapper: NativeMapperProvider<'a>,
-    loop_provider: &'a RegisteredProvider,
-    swap: &'a RegisteredProvider,
-    multipath: &'a RegisteredProvider,
+    loop_provider: &'a RegisteredBackend,
+    swap: &'a RegisteredBackend,
+    multipath: &'a RegisteredBackend,
 }
 
 /// Complete native adapter for the implemented Linux local-storage stack.
 pub struct NativeLocalProvider<'a> {
     runtime: NativeRuntimeProvider<'a>,
-    lvm: &'a RegisteredProvider,
-    mdraid: &'a RegisteredProvider,
+    lvm: &'a RegisteredBackend,
+    mdraid: &'a RegisteredBackend,
 }
 
 /// Native adapter adding Btrfs, ZFS, NVMe, and mounts to local-storage state.
 pub struct NativeSystemProvider<'a> {
     local: NativeLocalProvider<'a>,
-    libmount: &'a RegisteredProvider,
-    btrfs_subvolumes: &'a RegisteredProvider,
-    btrfs: &'a RegisteredProvider,
-    zfs: &'a RegisteredProvider,
-    nvme: &'a RegisteredProvider,
+    libmount: &'a RegisteredBackend,
+    btrfs_subvolumes: &'a RegisteredBackend,
+    btrfs: &'a RegisteredBackend,
+    zfs: &'a RegisteredBackend,
+    nvme: &'a RegisteredBackend,
 }
 
 impl<'a> NativeSystemProvider<'a> {
     /// Extends an assembled local provider with the remaining native sources.
     pub const fn new(
         local: NativeLocalProvider<'a>,
-        libmount: &'a RegisteredProvider,
-        btrfs_subvolumes: &'a RegisteredProvider,
-        btrfs: &'a RegisteredProvider,
-        zfs: &'a RegisteredProvider,
-        nvme: &'a RegisteredProvider,
+        libmount: &'a RegisteredBackend,
+        btrfs_subvolumes: &'a RegisteredBackend,
+        btrfs: &'a RegisteredBackend,
+        zfs: &'a RegisteredBackend,
+        nvme: &'a RegisteredBackend,
     ) -> Self {
         Self {
             local,
@@ -101,16 +101,16 @@ impl<'a> NativeLocalProvider<'a> {
     /// Binds every native provider currently feeding local-storage state.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
-        udev: &'a RegisteredProvider,
-        fdisk: &'a RegisteredProvider,
-        blkid: &'a RegisteredProvider,
-        devmapper: &'a RegisteredProvider,
-        cryptsetup: &'a RegisteredProvider,
-        loop_provider: &'a RegisteredProvider,
-        swap: &'a RegisteredProvider,
-        multipath: &'a RegisteredProvider,
-        lvm: &'a RegisteredProvider,
-        mdraid: &'a RegisteredProvider,
+        udev: &'a RegisteredBackend,
+        fdisk: &'a RegisteredBackend,
+        blkid: &'a RegisteredBackend,
+        devmapper: &'a RegisteredBackend,
+        cryptsetup: &'a RegisteredBackend,
+        loop_provider: &'a RegisteredBackend,
+        swap: &'a RegisteredBackend,
+        multipath: &'a RegisteredBackend,
+        lvm: &'a RegisteredBackend,
+        mdraid: &'a RegisteredBackend,
     ) -> Self {
         Self {
             runtime: NativeRuntimeProvider::new(
@@ -133,14 +133,14 @@ impl<'a> NativeRuntimeProvider<'a> {
     /// Binds native providers required by the current runtime topology layer.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
-        udev: &'a RegisteredProvider,
-        fdisk: &'a RegisteredProvider,
-        blkid: &'a RegisteredProvider,
-        devmapper: &'a RegisteredProvider,
-        cryptsetup: &'a RegisteredProvider,
-        loop_provider: &'a RegisteredProvider,
-        swap: &'a RegisteredProvider,
-        multipath: &'a RegisteredProvider,
+        udev: &'a RegisteredBackend,
+        fdisk: &'a RegisteredBackend,
+        blkid: &'a RegisteredBackend,
+        devmapper: &'a RegisteredBackend,
+        cryptsetup: &'a RegisteredBackend,
+        loop_provider: &'a RegisteredBackend,
+        swap: &'a RegisteredBackend,
+        multipath: &'a RegisteredBackend,
     ) -> Self {
         Self {
             mapper: NativeMapperProvider::new(udev, fdisk, blkid, devmapper, cryptsetup),
@@ -154,11 +154,11 @@ impl<'a> NativeRuntimeProvider<'a> {
 impl<'a> NativeMapperProvider<'a> {
     /// Binds all native providers required for block, mapper, and LUKS state.
     pub const fn new(
-        udev: &'a RegisteredProvider,
-        fdisk: &'a RegisteredProvider,
-        blkid: &'a RegisteredProvider,
-        devmapper: &'a RegisteredProvider,
-        cryptsetup: &'a RegisteredProvider,
+        udev: &'a RegisteredBackend,
+        fdisk: &'a RegisteredBackend,
+        blkid: &'a RegisteredBackend,
+        devmapper: &'a RegisteredBackend,
+        cryptsetup: &'a RegisteredBackend,
     ) -> Self {
         Self {
             block: NativeBlockProvider::new(udev, fdisk, blkid),
@@ -171,9 +171,9 @@ impl<'a> NativeMapperProvider<'a> {
 impl<'a> NativeBlockProvider<'a> {
     /// Binds the three complementary native block-discovery providers.
     pub const fn new(
-        udev: &'a RegisteredProvider,
-        fdisk: &'a RegisteredProvider,
-        blkid: &'a RegisteredProvider,
+        udev: &'a RegisteredBackend,
+        fdisk: &'a RegisteredBackend,
+        blkid: &'a RegisteredBackend,
     ) -> Self {
         Self { udev, fdisk, blkid }
     }
@@ -188,8 +188,8 @@ impl StateProvider for NativeBlockProvider<'_> {
         "block.current-state"
     }
 
-    fn backend(&self) -> ProviderBackend {
-        ProviderBackend::Library
+    fn backend_access(&self) -> BackendAccess {
+        BackendAccess::Library
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -206,8 +206,8 @@ impl StateProvider for NativeMapperProvider<'_> {
         "block.current-state"
     }
 
-    fn backend(&self) -> ProviderBackend {
-        ProviderBackend::Library
+    fn backend_access(&self) -> BackendAccess {
+        BackendAccess::Library
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -263,8 +263,8 @@ impl StateProvider for NativeRuntimeProvider<'_> {
         "block.current-state"
     }
 
-    fn backend(&self) -> ProviderBackend {
-        ProviderBackend::Library
+    fn backend_access(&self) -> BackendAccess {
+        BackendAccess::Library
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -333,8 +333,8 @@ impl StateProvider for NativeLocalProvider<'_> {
         "block.current-state"
     }
 
-    fn backend(&self) -> ProviderBackend {
-        ProviderBackend::Library
+    fn backend_access(&self) -> BackendAccess {
+        BackendAccess::Library
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -383,8 +383,8 @@ impl StateProvider for NativeSystemProvider<'_> {
         "storage.current-state"
     }
 
-    fn backend(&self) -> ProviderBackend {
-        ProviderBackend::Library
+    fn backend_access(&self) -> BackendAccess {
+        BackendAccess::Library
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -478,7 +478,7 @@ impl NativeBlockProvider<'_> {
 
 impl<'a> LibmountProvider<'a> {
     /// Binds the adapter to a library-backed registry entry.
-    pub const fn new(provider: &'a RegisteredProvider) -> Self {
+    pub const fn new(provider: &'a RegisteredBackend) -> Self {
         Self { provider }
     }
 }
@@ -492,8 +492,8 @@ impl StateProvider for LibmountProvider<'_> {
         "mounts.runtime"
     }
 
-    fn backend(&self) -> ProviderBackend {
-        self.provider.backend()
+    fn backend_access(&self) -> BackendAccess {
+        self.provider.access()
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
@@ -1907,8 +1907,8 @@ impl StateProvider for FixtureCliProvider {
         "fixture.linux-state"
     }
 
-    fn backend(&self) -> ProviderBackend {
-        ProviderBackend::Cli
+    fn backend_access(&self) -> BackendAccess {
+        BackendAccess::Executable
     }
 
     fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {

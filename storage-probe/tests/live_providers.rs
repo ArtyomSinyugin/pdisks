@@ -8,7 +8,7 @@ use storage_probe::{
     LibmountProvider, NativeBlockProvider, NativeLocalProvider, NativeMapperProvider,
     NativeSystemProvider, StateProvider, assemble,
 };
-use storage_provider::{ProviderBackend, ProviderRegistry, RegisteredProvider};
+use storage_provider::{BackendAccess, BackendRegistry, RegisteredBackend};
 
 /// One required native integration and the canonical model area it serves.
 struct ExpectedProvider {
@@ -126,15 +126,15 @@ fn manifest_path() -> PathBuf {
 }
 
 /// Loads the real provider registry selected by the test environment.
-fn registry() -> ProviderRegistry {
-    ProviderRegistry::load_from(manifest_path())
+fn registry() -> BackendRegistry {
+    BackendRegistry::load_from(manifest_path())
         .unwrap_or_else(|error| panic!("load installed provider manifest: {error}"))
 }
 
 /// Finds one provider by its stable manifest ID.
-fn provider<'a>(registry: &'a ProviderRegistry, id: &str) -> &'a RegisteredProvider {
+fn provider<'a>(registry: &'a BackendRegistry, id: &str) -> &'a RegisteredBackend {
     registry
-        .providers()
+        .backends()
         .find(|provider| provider.manifest().id.as_str() == id)
         .unwrap_or_else(|| panic!("required native provider {id} is absent"))
 }
@@ -144,7 +144,7 @@ fn provider<'a>(registry: &'a ProviderRegistry, id: &str) -> &'a RegisteredProvi
 /// Resolves every required `.so` and prints its model responsibility.
 fn installed_native_provider_abi_matrix_matches_manifest() {
     let path = manifest_path();
-    ProviderRegistry::validate_dependencies(&path)
+    BackendRegistry::validate_dependencies(&path)
         .unwrap_or_else(|error| panic!("native dependency validation failed: {error}"));
     let registry = registry();
 
@@ -163,7 +163,7 @@ fn installed_native_provider_abi_matrix_matches_manifest() {
             .library
             .as_ref()
             .unwrap_or_else(|| panic!("{} has no native library", expected.id));
-        assert_eq!(registered.backend(), ProviderBackend::Library);
+        assert_eq!(registered.access(), BackendAccess::Library);
         println!(
             "{:<22} {:<9} {:<28} {:<8} {}",
             expected.id,
@@ -210,7 +210,7 @@ fn native_current_state_adapter_matrix_is_complete() {
         println!(
             "{:<22} backend={:?} responsibility={:<28} adapter={}",
             expected.id,
-            registered.backend(),
+            registered.access(),
             expected.responsibility,
             if expected.responsibility == "storage.operations" {
                 "N/A"
@@ -337,7 +337,7 @@ fn native_libmount_populates_current_state() {
     println!(
         "provider: {} ({:?})",
         descriptor.manifest().id.as_str(),
-        descriptor.backend()
+        descriptor.access()
     );
     println!(
         "library: {}",

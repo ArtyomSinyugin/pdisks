@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, process::Command};
 
-use storage_provider::ProviderRegistry;
+use storage_provider::BackendRegistry;
 
 /// Finds a provider executable without depending on the caller's `PATH`.
 fn tool(name: &str) -> PathBuf {
@@ -115,6 +115,6 @@ fn installed_provider_manifests_match_host() {
     let path = std::env::var_os("PDISKS_PROVIDER_MANIFEST")
         .unwrap_or_else(|| panic!("PDISKS_PROVIDER_MANIFEST is required"));
     let path = PathBuf::from(path);
-    ProviderRegistry::validate_dependencies(path)
+    BackendRegistry::validate_dependencies(path)
         .unwrap_or_else(|error| panic!("provider dependency validation failed: {error}"));
 }

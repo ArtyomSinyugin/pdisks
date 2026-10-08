@@ -6,7 +6,7 @@ use storage_core::model::{
     CurrentState, Diagnostic, DiagnosticSeverity, DiagnosticSubject, Environment, MountState,
     NodeGraph, NodeId, ObservedMount, SystemEnvironment,
 };
-use storage_provider::ProviderBackend;
+use storage_provider::BackendAccess;
 use thiserror::Error;
 
 /// Successful read-only contribution from one provider.
@@ -54,7 +54,7 @@ pub trait StateProvider {
     fn responsibility(&self) -> &str;
 
     /// Backend used by this adapter.
-    fn backend(&self) -> ProviderBackend;
+    fn backend_access(&self) -> BackendAccess;
 
     /// Reads current state without performing storage mutations.
     fn probe(&self) -> Result<ProviderState, ProviderProbeError>;
@@ -88,7 +88,7 @@ pub fn probe(providers: &[&dyn StateProvider]) -> CurrentState {
             }
             Err(error) => state.diagnostics.push(provider_failure(
                 adapter.id(),
-                adapter.backend(),
+                adapter.backend_access(),
                 format!("{}: {}", error.code, error.message),
             )),
         }
@@ -165,7 +165,7 @@ fn merge_provider_state(
 }
 
 /// Converts total provider failure into a current-state diagnostic.
-fn provider_failure(provider_id: &str, backend: ProviderBackend, evidence: String) -> Diagnostic {
+fn provider_failure(provider_id: &str, backend: BackendAccess, evidence: String) -> Diagnostic {
     Diagnostic {
         code: "provider.probe_failed".into(),
         severity: DiagnosticSeverity::MissingInformation,
@@ -188,7 +188,7 @@ fn responsibility_conflict(responsibility: &str, providers: &[&dyn StateProvider
         evidence: Some(
             providers
                 .iter()
-                .map(|provider| format!("{} ({:?})", provider.id(), provider.backend()))
+                .map(|provider| format!("{} ({:?})", provider.id(), provider.backend_access()))
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
@@ -212,7 +212,7 @@ mod tests {
     struct FakeProvider {
         id: &'static str,
         responsibility: &'static str,
-        backend: ProviderBackend,
+        backend: BackendAccess,
         calls: Rc<Cell<u32>>,
         result: Result<ProviderState, ProviderProbeError>,
     }
@@ -226,7 +226,7 @@ mod tests {
             self.responsibility
         }
 
-        fn backend(&self) -> ProviderBackend {
+        fn backend_access(&self) -> BackendAccess {
             self.backend
         }
 
@@ -266,14 +266,14 @@ mod tests {
         let native = FakeProvider {
             id: "block",
             responsibility: "block.topology",
-            backend: ProviderBackend::Library,
+            backend: BackendAccess::Library,
             calls: Rc::clone(&native_calls),
             result: Ok(disk_state(id)),
         };
         let cli = FakeProvider {
             id: "mounts",
             responsibility: "mounts.runtime",
-            backend: ProviderBackend::Cli,
+            backend: BackendAccess::Executable,
             calls: Rc::clone(&cli_calls),
             result: Ok(ProviderState::default()),
         };
@@ -293,14 +293,14 @@ mod tests {
         let native = FakeProvider {
             id: "libmount",
             responsibility: "mounts.runtime",
-            backend: ProviderBackend::Library,
+            backend: BackendAccess::Library,
             calls: Rc::clone(&native_calls),
             result: Ok(ProviderState::default()),
         };
         let cli = FakeProvider {
             id: "findmnt",
             responsibility: "mounts.runtime",
-            backend: ProviderBackend::Cli,
+            backend: BackendAccess::Executable,
             calls: Rc::clone(&cli_calls),
             result: Ok(ProviderState::default()),
         };
@@ -323,7 +323,7 @@ mod tests {
         let first = FakeProvider {
             id: "block",
             responsibility: "block.topology",
-            backend: ProviderBackend::Library,
+            backend: BackendAccess::Library,
             calls: Rc::new(Cell::new(0)),
             result: Ok(disk_state(id)),
         };
@@ -341,7 +341,7 @@ mod tests {
         let second = FakeProvider {
             id: "zram",
             responsibility: "zram.devices",
-            backend: ProviderBackend::Library,
+            backend: BackendAccess::Library,
             calls: Rc::new(Cell::new(0)),
             result: Ok(conflicting),
         };
@@ -390,7 +390,7 @@ mod tests {
         let provider = FakeProvider {
             id: "block",
             responsibility: "block.topology",
-            backend: ProviderBackend::Library,
+            backend: BackendAccess::Library,
             calls: Rc::new(Cell::new(0)),
             result: Ok(contribution),
         };

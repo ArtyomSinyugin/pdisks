@@ -8,10 +8,10 @@ use std::{ffi::c_void, mem::ManuallyDrop, path::PathBuf};
 use libloading::{Library, Symbol};
 
 use crate::{
-    BlkidEntry, BtrfsCapabilities, BtrfsEntry, BtrfsFilesystemEntry, CryptsetupEntry,
-    DevmapperEntry, FdiskTable, FilesystemCapabilities, LibmountEntry, LoopEntry, LvmEntry,
-    MdraidEntry, MultipathEntry, NativeProbeError, NvmeEntry, ProviderLibrary, SwapEntry,
-    UdevBlockEntry, ZfsEntry,
+    BackendLibrary, BlkidEntry, BtrfsCapabilities, BtrfsEntry, BtrfsFilesystemEntry,
+    CryptsetupEntry, DevmapperEntry, FdiskTable, FilesystemCapabilities, LibmountEntry, LoopEntry,
+    LvmEntry, MdraidEntry, MultipathEntry, NativeProbeError, NvmeEntry, SwapEntry, UdevBlockEntry,
+    ZfsEntry,
 };
 
 mod blkid;
@@ -31,7 +31,7 @@ mod swap;
 mod udev;
 mod zfs;
 
-/// Loaded native library retained for a provider-specific typed FFI adapter.
+/// Loaded native library retained for a backend-specific typed C FFI adapter.
 pub(super) struct LoadedLibrary {
     /// Process-lifetime handle for a library whose initializers may register
     /// global state that cannot be undone safely by `dlclose`.
@@ -49,7 +49,7 @@ impl std::fmt::Debug for LoadedLibrary {
 
 impl LoadedLibrary {
     /// Loads a native library and resolves every symbol declared by its manifest.
-    pub(super) fn load(requirement: &ProviderLibrary) -> Option<Self> {
+    pub(super) fn load(requirement: &BackendLibrary) -> Option<Self> {
         // SAFETY: loading a library may run its loader hooks. The manifest path
         // is absolute and package-owned; the handle is retained in `Self`.
         let Ok(library) = (unsafe { Library::new(&requirement.path) }) else {
