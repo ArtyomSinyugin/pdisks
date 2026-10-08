@@ -17,11 +17,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod action;
+mod contract;
 mod dylib;
 mod logical;
 mod luks;
 mod transport;
 
+pub use action::{
+    BtrfsAction, FilesystemAction, LvmAction, MountAction, PartitionAction, ProviderAction,
+};
+pub use contract::{
+    ActionContract, ActionContractMismatch, ActionDescriptionContext, ActionOutput,
+    ActionPrerequisite, ActionResource, FactInvalidation, FactKind, FactScope, GraphEffect,
+    MountEffect, NodeKindClass, Postcondition, PredictedEffect, ResourceAccess, ResourceAccessMode,
+    RestartPolicy, describe_action, verify_imported_contract,
+};
 pub use logical::{LogicalProvider, ProviderId};
 pub use luks::{
     CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProvider,
@@ -1457,6 +1467,3 @@ mod tests {
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
     }
 }
-pub use action::{
-    BtrfsAction, FilesystemAction, LvmAction, MountAction, PartitionAction, ProviderAction,
-};
