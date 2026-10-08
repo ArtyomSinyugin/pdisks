@@ -654,6 +654,12 @@ pub struct LvmPvEntry {
     pub vg_uuid: Option<String>,
     /// PV size in bytes.
     pub size: u64,
+    /// Unallocated bytes on the PV.
+    pub free: u64,
+    /// Byte offset of the first physical extent.
+    pub data_offset: u64,
+    /// Whether LVM reports the PV as missing.
+    pub missing: bool,
 }
 
 /// One LVM volume group.
@@ -667,6 +673,12 @@ pub struct LvmVgEntry {
     pub size: u64,
     /// Physical extent size in bytes.
     pub extent_size: u64,
+    /// Unallocated bytes in the volume group.
+    pub free: u64,
+    /// Number of physical volumes in the group.
+    pub pv_count: u64,
+    /// Whether the volume group is exported.
+    pub exported: bool,
 }
 
 /// One LVM logical volume.
@@ -682,6 +694,37 @@ pub struct LvmLvEntry {
     pub size: u64,
     /// Provider segment type.
     pub segment_type: Option<String>,
+    /// Native LVM attribute string.
+    pub attributes: Option<String>,
+    /// Origin LV name for snapshots.
+    pub origin: Option<String>,
+    /// Pool LV name for thin or cached volumes.
+    pub pool: Option<String>,
+    /// Data LV name used by a pool.
+    pub data: Option<String>,
+    /// Metadata LV name used by a pool.
+    pub metadata: Option<String>,
+    /// Provider role list.
+    pub roles: Option<String>,
+    /// Data usage scaled according to the LVM report API.
+    pub data_percent: u64,
+    /// Metadata usage scaled according to the LVM report API.
+    pub metadata_percent: u64,
+    /// Mirror or RAID copy progress scaled according to the LVM report API.
+    pub copy_percent: u64,
+    /// Physical allocation segments reported for the LV.
+    pub segments: Vec<LvmSegmentEntry>,
+}
+
+/// One physical allocation segment of an LVM logical volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LvmSegmentEntry {
+    /// Segment length in physical extents.
+    pub size_extents: u64,
+    /// Starting physical extent on the member PV.
+    pub start_extent: u64,
+    /// Physical-volume device hosting the segment.
+    pub device: Option<PathBuf>,
 }
 
 /// Subvolumes observed below one mounted Btrfs filesystem.

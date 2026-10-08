@@ -8,7 +8,7 @@ use std::{
 use libloading::{Library, Symbol};
 
 use super::load_symbol;
-use crate::{LvmEntry, LvmLvEntry, LvmPvEntry, LvmVgEntry, NativeProbeError};
+use crate::{LvmEntry, LvmLvEntry, LvmPvEntry, LvmSegmentEntry, LvmVgEntry, NativeProbeError};
 
 const MAX_NATIVE_ENTRIES: usize = 65_536;
 
@@ -22,6 +22,14 @@ struct PvRaw {
     pe_start: u64,
     vg_name: *mut c_char,
     vg_uuid: *mut c_char,
+    vg_size: u64,
+    vg_free: u64,
+    vg_extent_size: u64,
+    vg_extent_count: u64,
+    vg_free_count: u64,
+    vg_pv_count: u64,
+    pv_tags: *mut *mut c_char,
+    missing: c_int,
 }
 
 /// C prefix of `BDLVMVGdata` through the fields consumed here.
@@ -32,6 +40,19 @@ struct VgRaw {
     size: u64,
     free: u64,
     extent_size: u64,
+    extent_count: u64,
+    free_count: u64,
+    pv_count: u64,
+    exported: c_int,
+    vg_tags: *mut *mut c_char,
+}
+
+/// C representation of one `BDLVMSEGdata` element.
+#[repr(C)]
+struct SegmentRaw {
+    size_pe: u64,
+    pv_start_pe: u64,
+    pvdev: *mut c_char,
 }
 
 /// C prefix of `BDLVMLVdata` through the fields consumed here.
@@ -43,6 +64,19 @@ struct LvRaw {
     size: u64,
     attr: *mut c_char,
     segtype: *mut c_char,
+    origin: *mut c_char,
+    pool_lv: *mut c_char,
+    data_lv: *mut c_char,
+    metadata_lv: *mut c_char,
+    roles: *mut c_char,
+    move_pv: *mut c_char,
+    data_percent: u64,
+    metadata_percent: u64,
+    copy_percent: u64,
+    lv_tags: *mut *mut c_char,
+    data_lvs: *mut *mut c_char,
+    metadata_lvs: *mut *mut c_char,
+    segments: *mut *mut SegmentRaw,
 }
 
 type Init = unsafe extern "C" fn() -> c_int;
@@ -139,6 +173,9 @@ fn read_pvs(api: &Api<'_>) -> Result<Vec<LvmPvEntry>, NativeProbeError> {
                     vg_name: copied_nonempty((*item.pointer).vg_name),
                     vg_uuid: copied_nonempty((*item.pointer).vg_uuid),
                     size: (*item.pointer).pv_size,
+                    free: (*item.pointer).pv_free,
+                    data_offset: (*item.pointer).pe_start,
+                    missing: (*item.pointer).missing != 0,
                 }
             });
         }
@@ -178,6 +215,9 @@ fn read_vgs(api: &Api<'_>) -> Result<Vec<LvmVgEntry>, NativeProbeError> {
                     uuid,
                     size: (*item.pointer).size,
                     extent_size: (*item.pointer).extent_size,
+                    free: (*item.pointer).free,
+                    pv_count: (*item.pointer).pv_count,
+                    exported: (*item.pointer).exported != 0,
                 }
             });
         }
@@ -220,12 +260,49 @@ fn read_lvs(api: &Api<'_>, vg_name: &str) -> Result<Vec<LvmLvEntry>, NativeProbe
                     uuid,
                     size: (*item.pointer).size,
                     segment_type: copied_nonempty((*item.pointer).segtype),
+                    attributes: copied_nonempty((*item.pointer).attr),
+                    origin: copied_nonempty((*item.pointer).origin),
+                    pool: copied_nonempty((*item.pointer).pool_lv),
+                    data: copied_nonempty((*item.pointer).data_lv),
+                    metadata: copied_nonempty((*item.pointer).metadata_lv),
+                    roles: copied_nonempty((*item.pointer).roles),
+                    data_percent: (*item.pointer).data_percent,
+                    metadata_percent: (*item.pointer).metadata_percent,
+                    copy_percent: (*item.pointer).copy_percent,
+                    segments: copy_segments((*item.pointer).segments)?,
                 }
             });
         }
     }
     drop(array);
     Err(invalid("bd_lvm_lvs"))
+}
+
+/// Copies a null-terminated segment array owned by its parent LV result.
+unsafe fn copy_segments(
+    pointer: *mut *mut SegmentRaw,
+) -> Result<Vec<LvmSegmentEntry>, NativeProbeError> {
+    if pointer.is_null() {
+        return Ok(Vec::new());
+    }
+    let mut segments = Vec::new();
+    for index in 0..MAX_NATIVE_ENTRIES {
+        // SAFETY: caller guarantees the parent LV and its terminated segment
+        // array remain live while this function copies fields.
+        let raw = unsafe { *pointer.add(index) };
+        if raw.is_null() {
+            return Ok(segments);
+        }
+        // SAFETY: raw points to one live segment owned by the parent LV.
+        segments.push(unsafe {
+            LvmSegmentEntry {
+                size_extents: (*raw).size_pe,
+                start_extent: (*raw).pv_start_pe,
+                device: copied_nonempty((*raw).pvdev).map(PathBuf::from),
+            }
+        });
+    }
+    Err(invalid("bd_lvm_lvs segments"))
 }
 
 /// Closes one initialized standalone plugin session.

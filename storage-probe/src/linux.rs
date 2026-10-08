@@ -367,7 +367,9 @@ impl StateProvider for NativeLocalProvider<'_> {
         state
             .diagnostics
             .extend(enrich_mdraid(&mut state.graph, &mdraid));
-        enrich_lvm(&mut state.graph, &endpoints, &mappings, &lvm);
+        state
+            .diagnostics
+            .extend(enrich_lvm(&mut state.graph, &endpoints, &mappings, &lvm));
         Ok(state)
     }
 }
@@ -957,7 +959,8 @@ fn enrich_lvm(
     endpoints: &[UdevBlockEntry],
     mappings: &[storage_provider::DevmapperEntry],
     topology: &storage_provider::LvmEntry,
-) {
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
     let endpoint_paths = endpoints
         .iter()
         .map(|entry| ((entry.major, entry.minor), entry.devnode.clone()))
@@ -1006,7 +1009,25 @@ fn enrich_lvm(
         if !node.size.identities.contains(&identity) {
             node.size.identities.push(identity);
         }
+        node.size.presence = if pv.missing {
+            Presence::Missing
+        } else {
+            Presence::Present
+        };
         graph.insert_node(id, node);
+        if pv.missing {
+            diagnostics.push(Diagnostic {
+                code: "lvm.pv_missing".to_owned(),
+                severity: DiagnosticSeverity::Warning,
+                subjects: vec![DiagnosticSubject::Node(id)],
+                message: format!("LVM physical volume {} is missing", pv.device.display()),
+                evidence: pv.vg_name.clone(),
+                suggested_remedy: Some(
+                    "restore or replace the missing PV before modifying the volume group"
+                        .to_owned(),
+                ),
+            });
+        }
         if let Some(vg_name) = pv.vg_name.as_deref()
             && let Some(vg_id) = vg_ids.get(vg_name)
         {
@@ -1018,6 +1039,7 @@ fn enrich_lvm(
         }
     }
 
+    let mut lv_ids = HashMap::new();
     for lv in &topology.lvs {
         let mapping = mappings.iter().find(|mapping| {
             mapping.uuid.as_deref().is_some_and(|uuid| {
@@ -1057,6 +1079,7 @@ fn enrich_lvm(
                 size: facts,
             },
         );
+        lv_ids.insert((lv.vg_name.as_str(), lv.name.as_str()), id);
         if let Some(vg_id) = vg_ids.get(lv.vg_name.as_str()) {
             graph.insert_dependency(Dependency {
                 from: *vg_id,
@@ -1065,6 +1088,33 @@ fn enrich_lvm(
             });
         }
     }
+    for lv in &topology.lvs {
+        let Some(id) = lv_ids
+            .get(&(lv.vg_name.as_str(), lv.name.as_str()))
+            .copied()
+        else {
+            continue;
+        };
+        if let Some(origin) = lv.origin.as_deref()
+            && let Some(origin_id) = lv_ids.get(&(lv.vg_name.as_str(), origin)).copied()
+        {
+            graph.insert_relation(Relation {
+                from: id,
+                to: origin_id,
+                kind: RelationKind::SnapshotOf,
+            });
+        }
+        if let Some(pool) = lv.pool.as_deref()
+            && let Some(pool_id) = lv_ids.get(&(lv.vg_name.as_str(), pool)).copied()
+        {
+            graph.insert_dependency(Dependency {
+                from: pool_id,
+                to: id,
+                kind: DependencyKind::Provides,
+            });
+        }
+    }
+    diagnostics
 }
 
 /// Maps LVM segment names that do not require missing geometry fields.
@@ -2459,12 +2509,18 @@ mod tests {
                 vg_name: Some("vg".to_owned()),
                 vg_uuid: Some("aaaaaaaa".to_owned()),
                 size: 512_000,
+                free: 0,
+                data_offset: 1_048_576,
+                missing: false,
             }],
             vgs: vec![LvmVgEntry {
                 name: "vg".to_owned(),
                 uuid: "aaaaaaaa".to_owned(),
                 size: 512_000,
                 extent_size: 4_194_304,
+                free: 0,
+                pv_count: 1,
+                exported: false,
             }],
             lvs: vec![LvmLvEntry {
                 name: "root".to_owned(),
@@ -2472,10 +2528,21 @@ mod tests {
                 uuid: "bbbbbbbb".to_owned(),
                 size: 512_000,
                 segment_type: Some("linear".to_owned()),
+                attributes: Some("-wi-a-----".to_owned()),
+                origin: None,
+                pool: None,
+                data: None,
+                metadata: None,
+                roles: None,
+                data_percent: 0,
+                metadata_percent: 0,
+                copy_percent: 0,
+                segments: Vec::new(),
             }],
         };
 
-        enrich_lvm(&mut graph, &[mapper_endpoint], &mappings, &topology);
+        let diagnostics = enrich_lvm(&mut graph, &[mapper_endpoint], &mappings, &topology);
+        assert!(diagnostics.is_empty());
 
         let vg_id = stable_node_id("lvm-vg", "aaaaaaaa");
         let lv_id = block_node_id(Path::new("/dev/dm-0"));
