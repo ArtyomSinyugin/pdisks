@@ -1,12 +1,41 @@
-# Provider manifests
+# Providers, backends, and connections
 
-Provider manifests belong to pdisks. Third-party packages such as `libzfs`,
+PDisks treats three independently evolving concepts as separate contracts:
+
+| Concept | Examples | Responsibility |
+|---|---|---|
+| Logical provider | `luks`, `lvm`, `partition`, `filesystem` | Object semantics, typed actions, constraints, validation and translation into the PDisks model |
+| Technology backend | `libcryptsetup`, `libfdisk`, `libbd_lvm` | Concrete calls to the operating system and native APIs |
+| Provider connection | built-in Rust, `.so` through Stabby, separate process | Delivery of PDisks provider requests and responses |
+
+For example, the built-in `LuksProvider` owns `LuksAction::{Format, Open,
+Close, Resize}`, validates those actions against `NodeGraph`, and translates
+cryptsetup records into `LuksObservation`. Its `CryptsetupBackend` is currently
+implemented by a registered `libcryptsetup` backend.
+
+There are two unrelated ABI boundaries:
+
+```text
+PDisks host     <-> PDisks provider plugin   future project-owned Stabby ABI
+PDisks provider <-> libcryptsetup            existing upstream C ABI
+```
+
+Stabby must not wrap or redefine libcryptsetup. It will only connect the host
+to a separately built logical provider. A provider action remains, for example,
+`LuksAction::Open` regardless of whether the provider is built in, loaded as a
+PDisks plugin, or hosted in another process.
+
+## Backend manifests
+
+Backend manifests belong to pdisks. Third-party packages such as `libzfs`,
 LVM, and libfdisk do not contain or maintain them.
 
-Each manifest describes one pdisks integration and the native library symbols
+Each manifest describes one system backend integration and the native symbols
 or command it needs. `manifest_version` versions this JSON schema only. Native
 API requirements differ between integrations and are expressed by
-`library.required_symbols` plus provider-specific adapter tests.
+`library.required_symbols` plus backend-specific adapter tests. The JSON field
+is still named `providers` for schema-version-1 compatibility; Rust code exposes
+these records as `BackendManifest` through `BackendRegistry`.
 
 At runtime pdisks reads one manifest file and registers capabilities only when
 the declared library loads with every required symbol, or when the declared
@@ -92,7 +121,7 @@ does not create a second CLI fallback backend.
 `Probe` below means data is copied into typed Rust observations and, where
 applicable, joined into `CurrentState`. `Execute` remains disabled until the
 project has serializable actions, focused plan-generation tests, precondition
-checks, and rollback semantics. The provider manifest declares only operations
+checks, and rollback semantics. The backend manifest declares only operations
 that exist in the public Rust API today.
 
 | Provider | Implemented now | Required next work |
