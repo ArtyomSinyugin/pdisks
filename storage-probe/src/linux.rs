@@ -21,7 +21,6 @@ use uuid::Uuid;
 
 use crate::{
     assemble::{self, ProviderProbeError, ProviderState, StateProvider},
-    error::Result,
     parse::{LsblkDevice, LsblkOutput, mounts::MountsOutput, sysfs::SysfsOutput},
     snapshot::ProbeSnapshot,
 };
@@ -1875,16 +1874,16 @@ impl LinuxProbe {
     }
 
     /// Calls providers and publishes one assembled current state.
-    pub fn probe(&self) -> Result<ProbeSnapshot> {
+    pub fn probe(&self) -> ProbeSnapshot {
         let providers = self
             .providers
             .iter()
             .map(|provider| provider.as_ref())
             .collect::<Vec<_>>();
-        Ok(ProbeSnapshot {
+        ProbeSnapshot {
             generation: self.generation,
             current: assemble::probe(&providers),
-        })
+        }
     }
 }
 

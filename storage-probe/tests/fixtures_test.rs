@@ -13,7 +13,7 @@ fn fixture_dir(name: &str) -> PathBuf {
 #[test]
 fn probe_empty_sata_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("empty-sata"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
     // CurrentState will be populated in future work
@@ -22,7 +22,7 @@ fn probe_empty_sata_fixture() {
 #[test]
 fn probe_nvme_gpt_ext4_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("nvme-gpt-ext4"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }
@@ -30,7 +30,7 @@ fn probe_nvme_gpt_ext4_fixture() {
 #[test]
 fn probe_mdraid1_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("mdraid1"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }
@@ -38,7 +38,7 @@ fn probe_mdraid1_fixture() {
 #[test]
 fn probe_lvm_simple_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("lvm-simple"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }
@@ -46,7 +46,7 @@ fn probe_lvm_simple_fixture() {
 #[test]
 fn probe_luks_lvm_ext4_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("luks-lvm-ext4"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }
@@ -54,7 +54,7 @@ fn probe_luks_lvm_ext4_fixture() {
 #[test]
 fn probe_btrfs_single_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("btrfs-single"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }
@@ -62,7 +62,7 @@ fn probe_btrfs_single_fixture() {
 #[test]
 fn probe_btrfs_multidevice_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("btrfs-multidevice"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }
@@ -70,7 +70,7 @@ fn probe_btrfs_multidevice_fixture() {
 #[test]
 fn probe_btrfs_subvolumes_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("btrfs-subvolumes"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }
@@ -78,7 +78,7 @@ fn probe_btrfs_subvolumes_fixture() {
 #[test]
 fn probe_mounted_root_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("mounted-root"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }
@@ -86,7 +86,7 @@ fn probe_mounted_root_fixture() {
 #[test]
 fn probe_broken_fixture() {
     let probe = LinuxProbe::with_fixtures(fixture_dir("broken"));
-    let snapshot = probe.probe().expect("probe should succeed");
+    let snapshot = probe.probe();
 
     assert_eq!(snapshot.generation, 1);
 }

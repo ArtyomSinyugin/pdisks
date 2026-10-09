@@ -16,8 +16,7 @@ fn fixture_dir(name: &str) -> PathBuf {
 #[test]
 fn empty_disk_provider_output_populates_canonical_graph() {
     let snapshot = LinuxProbe::with_fixtures(fixture_dir("empty-sata"))
-        .probe()
-        .expect("fixture probe should succeed");
+        .probe();
 
     assert!(
         snapshot
@@ -32,8 +31,7 @@ fn empty_disk_provider_output_populates_canonical_graph() {
 #[test]
 fn findmnt_provider_output_populates_mount_state() {
     let snapshot = LinuxProbe::with_fixtures(fixture_dir("mounted-root"))
-        .probe()
-        .expect("fixture probe should succeed");
+        .probe();
 
     assert_eq!(snapshot.current.mounts.entries.len(), 2);
     assert!(
@@ -50,7 +48,6 @@ fn findmnt_provider_output_populates_mount_state() {
 fn assembled_current_state_round_trips_through_json() {
     let current = LinuxProbe::with_fixtures(fixture_dir("nvme-gpt-ext4"))
         .probe()
-        .expect("fixture probe should succeed")
         .current;
     let json = serde_json::to_vec(&current).expect("current state should serialize");
     let decoded = serde_json::from_slice(&json).expect("current state should deserialize");
