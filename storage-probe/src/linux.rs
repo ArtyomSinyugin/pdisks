@@ -1933,9 +1933,9 @@ impl LinuxProbe {
     /// responsibilities unavailable through a library, using
     /// [`LinuxProbe::from_providers`].
     pub fn with_fixtures(fixtures_dir: impl Into<PathBuf>) -> Self {
-        Self::from_providers(vec![Box::new(FixtureCliProvider {
-            fixtures_dir: fixtures_dir.into(),
-        })])
+        Self::from_providers(vec![Box::new(linux_fixtures::FixtureCliProvider::new(
+            fixtures_dir,
+        ))])
     }
 
     /// Calls providers and publishes one assembled current state.
@@ -1950,66 +1950,6 @@ impl LinuxProbe {
             current: assemble::probe(&providers),
         }
     }
-}
-
-/// Recorded command output used only by fixture tests.
-struct FixtureCliProvider {
-    fixtures_dir: PathBuf,
-}
-
-impl StateProvider for FixtureCliProvider {
-    fn id(&self) -> &str {
-        "linux-block"
-    }
-
-    fn responsibility(&self) -> &str {
-        "fixture.linux-state"
-    }
-
-    fn connection_kind(&self) -> ProviderConnectionKind {
-        ProviderConnectionKind::BuiltIn
-    }
-
-    fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
-        let lsblk = read_json::<LsblkOutput>(&self.fixtures_dir.join("lsblk.json"))?;
-        let sysfs = read_optional_json::<SysfsOutput>(&self.fixtures_dir.join("sysfs.json"))?;
-        let mounts = read_optional_json::<MountsOutput>(&self.fixtures_dir.join("findmnt.json"))?;
-        Ok(assemble_linux_block_state(
-            &lsblk,
-            sysfs.as_ref(),
-            mounts.as_ref(),
-        ))
-    }
-}
-
-/// Reads one required JSON fixture.
-fn read_json<T>(path: &Path) -> std::result::Result<T, ProviderProbeError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    let bytes = std::fs::read(path).map_err(|error| {
-        ProviderProbeError::new(
-            "fixture.read_failed",
-            format!("{}: {error}", path.display()),
-        )
-    })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        ProviderProbeError::new(
-            "fixture.parse_failed",
-            format!("{}: {error}", path.display()),
-        )
-    })
-}
-
-/// Reads one optional JSON fixture.
-fn read_optional_json<T>(path: &Path) -> std::result::Result<Option<T>, ProviderProbeError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    if !path.exists() {
-        return Ok(None);
-    }
-    read_json(path).map(Some)
 }
 
 /// Converts the block-provider DTOs into one canonical provider contribution.
@@ -2428,6 +2368,88 @@ fn transport(name: &str) -> Option<Transport> {
         Some(Transport::Mmc)
     } else {
         None
+    }
+}
+
+mod linux_fixtures {
+    //! Fixture-backed provider used by integration tests.
+
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        ProviderConnectionKind, ProviderProbeError, ProviderState, StateProvider,
+        assemble_linux_block_state,
+    };
+    use crate::parse::{LsblkOutput, mounts::MountsOutput, sysfs::SysfsOutput};
+
+    /// Replays recorded Linux command outputs as a provider contribution.
+    pub(super) struct FixtureCliProvider {
+        fixtures_dir: PathBuf,
+    }
+
+    impl FixtureCliProvider {
+        /// Creates a fixture provider rooted at one recorded probe directory.
+        pub(super) fn new(fixtures_dir: impl Into<PathBuf>) -> Self {
+            Self {
+                fixtures_dir: fixtures_dir.into(),
+            }
+        }
+    }
+
+    impl StateProvider for FixtureCliProvider {
+        fn id(&self) -> &str {
+            "linux-block"
+        }
+
+        fn responsibility(&self) -> &str {
+            "fixture.linux-state"
+        }
+
+        fn connection_kind(&self) -> ProviderConnectionKind {
+            ProviderConnectionKind::BuiltIn
+        }
+
+        fn probe(&self) -> std::result::Result<ProviderState, ProviderProbeError> {
+            let lsblk = read_json::<LsblkOutput>(&self.fixtures_dir.join("lsblk.json"))?;
+            let sysfs = read_optional_json::<SysfsOutput>(&self.fixtures_dir.join("sysfs.json"))?;
+            let mounts =
+                read_optional_json::<MountsOutput>(&self.fixtures_dir.join("findmnt.json"))?;
+            Ok(assemble_linux_block_state(
+                &lsblk,
+                sysfs.as_ref(),
+                mounts.as_ref(),
+            ))
+        }
+    }
+
+    /// Reads one required JSON fixture.
+    fn read_json<T>(path: &Path) -> std::result::Result<T, ProviderProbeError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let bytes = std::fs::read(path).map_err(|error| {
+            ProviderProbeError::new(
+                "fixture.read_failed",
+                format!("{}: {error}", path.display()),
+            )
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            ProviderProbeError::new(
+                "fixture.parse_failed",
+                format!("{}: {error}", path.display()),
+            )
+        })
+    }
+
+    /// Reads one optional JSON fixture.
+    fn read_optional_json<T>(path: &Path) -> std::result::Result<Option<T>, ProviderProbeError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_json(path).map(Some)
     }
 }
 
