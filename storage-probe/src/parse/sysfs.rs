@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::collections::HashMap;
 
 /// Raw sysfs JSON structure.
 #[derive(Debug, Deserialize)]
@@ -32,39 +31,4 @@ pub struct SysfsDevice {
     pub removable: bool,
     #[serde(default)]
     pub read_only: bool,
-}
-
-/// Parsed sysfs information keyed by device name.
-#[derive(Debug, Clone, Default)]
-pub struct SysfsInfo {
-    pub devices: HashMap<String, SysfsDevice>,
-}
-
-impl SysfsOutput {
-    pub fn into_info(self) -> SysfsInfo {
-        let devices = self
-            .devices
-            .into_iter()
-            .map(|d| (d.name.clone(), d))
-            .collect();
-        SysfsInfo { devices }
-    }
-}
-
-impl<'a> SysfsOutput {
-    /// Borrowed variant of [`SysfsOutput::into_info`].
-    pub fn info_ref(&'a self) -> SysfsRef<'a> {
-        SysfsRef { output: self }
-    }
-}
-
-/// Borrowed view over parsed sysfs data.
-pub struct SysfsRef<'a> {
-    output: &'a SysfsOutput,
-}
-
-impl SysfsRef<'_> {
-    pub fn get(&self, name: &str) -> Option<&SysfsDevice> {
-        self.output.devices.iter().find(|d| d.name == name)
-    }
 }
