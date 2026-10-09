@@ -1454,7 +1454,7 @@ mod tests {
             target: backing,
             planned_node_id: NodeId::new(),
             version: storage_core::model::LuksVersion::Luks2,
-            credential: crate::CredentialRef::new("agent://root").unwrap_or_else(|| unreachable!()),
+            credential: crate::CredentialRef::from_uuid(uuid::Uuid::nil()),
         });
         let context = ActionDescriptionContext { graph: &graph };
         let imported = describe_action(&action, context);

@@ -14,22 +14,21 @@ use crate::{
     BackendId, CryptsetupEntry, LogicalProvider, NativeProbeError, ProviderId, RegisteredBackend,
 };
 
-/// Reference to credential material held outside serializable plans.
+/// Opaque identity of credential material held outside serializable plans.
 #[repr(transparent)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct CredentialRef(String);
+pub struct CredentialRef(Uuid);
 
 impl CredentialRef {
-    /// Creates a non-empty opaque credential reference.
-    pub fn new(value: impl Into<String>) -> Option<Self> {
-        let value = value.into();
-        (!value.is_empty()).then_some(Self(value))
+    /// Creates a reference from an identity assigned by a credential store.
+    pub const fn from_uuid(value: Uuid) -> Self {
+        Self(value)
     }
 
-    /// Returns the opaque reference without resolving credential material.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// Returns the opaque identity without resolving credential material.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
     }
 }
 
@@ -213,23 +212,16 @@ fn translate_header(header: CryptsetupEntry) -> Result<LuksObservation, LuksVali
 /// Checks one LUKS action against the canonical graph.
 fn validate_action(action: &LuksAction, graph: &NodeGraph) -> Vec<Diagnostic> {
     match action {
-        LuksAction::Format {
-            target, credential, ..
-        } => {
-            let mut diagnostics = validate_kind(
-                graph,
-                *target,
-                "luks.format.unsupported_target",
-                "LUKS format requires a block-providing target",
-                is_format_target,
-            );
-            validate_credential(credential, *target, &mut diagnostics);
-            diagnostics
-        }
+        LuksAction::Format { target, .. } => validate_kind(
+            graph,
+            *target,
+            "luks.format.unsupported_target",
+            "LUKS format requires a block-providing target",
+            is_format_target,
+        ),
         LuksAction::Open {
             container,
             mapping_name,
-            credential,
             ..
         } => {
             let mut diagnostics = validate_kind(
@@ -246,7 +238,6 @@ fn validate_action(action: &LuksAction, graph: &NodeGraph) -> Vec<Diagnostic> {
                     "device-mapper name must be non-empty and contain neither '/' nor NUL",
                 ));
             }
-            validate_credential(credential, *container, &mut diagnostics);
             diagnostics
         }
         LuksAction::Close { mapping } => {
@@ -263,21 +254,6 @@ fn validate_action(action: &LuksAction, graph: &NodeGraph) -> Vec<Diagnostic> {
             }
             diagnostics
         }
-    }
-}
-
-/// Rejects malformed credential references without resolving any secret.
-fn validate_credential(
-    credential: &CredentialRef,
-    target: NodeId,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if credential.as_str().is_empty() {
-        diagnostics.push(action_diagnostic(
-            "luks.action.empty_credential_ref",
-            target,
-            "LUKS action requires a non-empty external credential reference",
-        ));
     }
 }
 
@@ -389,12 +365,15 @@ mod tests {
     /// Ensures actions remain serializable provider semantics rather than backend calls.
     #[test]
     fn luks_action_round_trips_without_secret_material() {
+        let credential = CredentialRef::from_uuid(
+            Uuid::parse_str("b6545f46-c01f-4b70-92f3-82a921539b6f")
+                .unwrap_or_else(|error| panic!("parse credential UUID: {error}")),
+        );
         let action = LuksAction::Open {
             container: NodeId::new(),
             planned_node_id: NodeId::new(),
             mapping_name: "crypt-root".to_owned(),
-            credential: CredentialRef::new("secret-service://root")
-                .unwrap_or_else(|| unreachable!()),
+            credential,
             read_only: false,
         };
         let json = serde_json::to_string(&action)
@@ -403,7 +382,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("deserialize LUKS action: {error}"));
 
         assert_eq!(restored, action);
-        assert!(!json.contains("passphrase"));
+        assert!(json.contains(&credential.as_uuid().to_string()));
+        assert!(serde_json::from_str::<CredentialRef>(r#""actual-passphrase""#).is_err());
     }
 
     /// Ensures logical validation rejects opening a non-LUKS node.
@@ -420,7 +400,7 @@ mod tests {
                 container: disk,
                 planned_node_id: NodeId::new(),
                 mapping_name: "crypt-root".to_owned(),
-                credential: CredentialRef::new("agent://root").unwrap_or_else(|| unreachable!()),
+                credential: CredentialRef::from_uuid(Uuid::nil()),
                 read_only: false,
             },
             &graph,
