@@ -15,8 +15,7 @@ fn fixture_dir(name: &str) -> PathBuf {
 
 #[test]
 fn empty_disk_provider_output_populates_canonical_graph() {
-    let snapshot = LinuxProbe::with_fixtures(fixture_dir("empty-sata"))
-        .probe();
+    let snapshot = LinuxProbe::with_fixtures(fixture_dir("empty-sata")).probe();
 
     assert!(
         snapshot
@@ -30,8 +29,7 @@ fn empty_disk_provider_output_populates_canonical_graph() {
 
 #[test]
 fn findmnt_provider_output_populates_mount_state() {
-    let snapshot = LinuxProbe::with_fixtures(fixture_dir("mounted-root"))
-        .probe();
+    let snapshot = LinuxProbe::with_fixtures(fixture_dir("mounted-root")).probe();
 
     assert_eq!(snapshot.current.mounts.entries.len(), 2);
     assert!(

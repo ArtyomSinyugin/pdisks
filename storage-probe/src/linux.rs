@@ -2448,7 +2448,10 @@ mod tests {
                             PathBuf::from("/dev/dm-0"),
                             PathBuf::from("/dev/mapper/vg-root"),
                         ],
-                        devno: DeviceNumber { major: 253, minor: 0 },
+                        devno: DeviceNumber {
+                            major: 253,
+                            minor: 0,
+                        },
                         geometry: None,
                         read_only: None,
                     }),
