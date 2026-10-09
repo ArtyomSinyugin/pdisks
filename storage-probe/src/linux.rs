@@ -235,13 +235,15 @@ impl NativeMapperProvider<'_> {
             .map(|entry| entry.device.clone())
             .collect::<Vec<_>>();
         let luks_provider = storage_provider::LuksProvider::new(self.cryptsetup);
-        let luks = match luks_provider.probe(&luks_devices) {
-            Ok(entries) => entries,
-            Err(error) => {
-                push_native_failure(&mut state, "cryptsetup", error.to_string());
-                Vec::new()
-            }
-        };
+        let luks_report = luks_provider.probe(&luks_devices);
+        for failure in luks_report.failures {
+            push_native_failure(
+                &mut state,
+                "cryptsetup",
+                format!("{:?}: {}", failure.device, failure.error),
+            );
+        }
+        let luks = luks_report.observations;
         let mappings = match self.devmapper.probe_devmapper() {
             Ok(entries) => entries,
             Err(error) => {

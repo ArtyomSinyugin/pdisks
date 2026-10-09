@@ -140,13 +140,29 @@ impl<B> LuksProvider<B> {
 }
 
 impl<B: CryptsetupBackend> LuksProvider<B> {
-    /// Probes headers and converts backend records into LUKS semantics.
-    pub fn probe(&self, devices: &[PathBuf]) -> Result<Vec<LuksObservation>, LuksValidationError> {
-        self.backend
-            .probe_headers(devices)?
-            .into_iter()
-            .map(translate_header)
-            .collect()
+    /// Probes headers independently so one device failure keeps other observations.
+    pub fn probe(&self, devices: &[PathBuf]) -> LuksProbeReport {
+        let mut report = LuksProbeReport::default();
+        for device in devices {
+            match self.backend.probe_headers(std::slice::from_ref(device)) {
+                Ok(headers) => {
+                    for header in headers {
+                        match translate_header(header) {
+                            Ok(observation) => report.observations.push(observation),
+                            Err(error) => report.failures.push(LuksProbeFailure {
+                                device: device.clone(),
+                                error,
+                            }),
+                        }
+                    }
+                }
+                Err(error) => report.failures.push(LuksProbeFailure {
+                    device: device.clone(),
+                    error: error.into(),
+                }),
+            }
+        }
+        report
     }
 }
 
@@ -180,6 +196,24 @@ pub enum LuksValidationError {
         /// Type string copied from libcryptsetup.
         luks_type: String,
     },
+}
+
+/// Partial result of probing a set of LUKS devices.
+#[derive(Debug, Default)]
+pub struct LuksProbeReport {
+    /// Successfully translated LUKS observations.
+    pub observations: Vec<LuksObservation>,
+    /// Device-specific failures that did not discard successful observations.
+    pub failures: Vec<LuksProbeFailure>,
+}
+
+/// Failure associated with one requested LUKS device.
+#[derive(Debug)]
+pub struct LuksProbeFailure {
+    /// Device whose probe failed.
+    pub device: PathBuf,
+    /// Backend or translation failure returned for the device.
+    pub error: LuksValidationError,
 }
 
 /// Converts one libcryptsetup-shaped record into provider-owned semantics.
@@ -327,6 +361,7 @@ mod tests {
     struct FakeBackend {
         id: BackendId,
         headers: Vec<CryptsetupEntry>,
+        failed_device: Option<PathBuf>,
     }
 
     impl CryptsetupBackend for FakeBackend {
@@ -336,9 +371,23 @@ mod tests {
 
         fn probe_headers(
             &self,
-            _devices: &[PathBuf],
+            devices: &[PathBuf],
         ) -> Result<Vec<CryptsetupEntry>, NativeProbeError> {
-            Ok(self.headers.clone())
+            if devices
+                .iter()
+                .any(|device| self.failed_device.as_ref() == Some(device))
+            {
+                return Err(NativeProbeError::CallFailed {
+                    operation: "fake_probe",
+                    code: 1,
+                });
+            }
+            Ok(self
+                .headers
+                .iter()
+                .filter(|header| devices.contains(&header.device))
+                .cloned()
+                .collect())
         }
     }
 
@@ -392,6 +441,7 @@ mod tests {
         let backend = FakeBackend {
             id: BackendId::new("cryptsetup-luks").unwrap_or_else(|| unreachable!()),
             headers: Vec::new(),
+            failed_device: None,
         };
         let provider = LuksProvider::new(backend);
         let (graph, disk) = graph_with(NodeKind::Disk);
@@ -428,18 +478,47 @@ mod tests {
                 keyslots_size: Some(16_744_448),
                 keyslots: Vec::new(),
             }],
+            failed_device: None,
         };
         let provider = LuksProvider::new(backend);
-        let observations = provider
-            .probe(&[PathBuf::from("/dev/vda1")])
-            .unwrap_or_else(|error| panic!("probe LUKS: {error}"));
+        let report = provider.probe(&[PathBuf::from("/dev/vda1")]);
 
-        assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].version, LuksVersion::Luks2);
-        assert_eq!(observations[0].payload_offset, Bytes::new(16_384));
+        assert!(report.failures.is_empty());
+        assert_eq!(report.observations.len(), 1);
+        assert_eq!(report.observations[0].version, LuksVersion::Luks2);
+        assert_eq!(report.observations[0].payload_offset, Bytes::new(16_384));
         assert!(matches!(
-            observations[0].identity,
+            report.observations[0].identity,
             Some(ExternalId::LuksUuid(_))
         ));
+    }
+
+    /// Ensures one failed device does not discard another device's observation.
+    #[test]
+    fn provider_preserves_partial_probe_results() {
+        let good_device = PathBuf::from("/dev/vda1");
+        let failed_device = PathBuf::from("/dev/vdb1");
+        let backend = FakeBackend {
+            id: BackendId::new("cryptsetup-luks").unwrap_or_else(|| unreachable!()),
+            headers: vec![CryptsetupEntry {
+                device: good_device.clone(),
+                luks_type: "LUKS2".to_owned(),
+                uuid: None,
+                cipher: None,
+                cipher_mode: None,
+                data_offset_sectors: 32,
+                sector_size: None,
+                volume_key_size: None,
+                metadata_size: None,
+                keyslots_size: None,
+                keyslots: Vec::new(),
+            }],
+            failed_device: Some(failed_device.clone()),
+        };
+        let report = LuksProvider::new(backend).probe(&[good_device, failed_device.clone()]);
+
+        assert_eq!(report.observations.len(), 1);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].device, failed_device);
     }
 }

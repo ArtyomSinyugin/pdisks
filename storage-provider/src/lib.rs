@@ -34,8 +34,8 @@ pub use contract::{
 };
 pub use logical::{LogicalProvider, ProviderId};
 pub use luks::{
-    CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProvider,
-    LuksValidationError,
+    CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProbeFailure,
+    LuksProbeReport, LuksProvider, LuksValidationError,
 };
 pub use transport::{
     PROVIDER_PROTOCOL_VERSION, ProviderBinding, ProviderConnection, ProviderConnectionKind,
