@@ -1,4 +1,19 @@
 //! Linux probe orchestration and fixture-backed CLI adapter.
+//!
+//! NativeSystemProvider
+//! Btrfs · ZFS · NVMe · mounts
+//!        🡻
+//! NativeLocalProvider
+//! LVM · MD RAID
+//!        🡻
+//! NativeRuntimeProvider
+//! Loop · Swap · Multipath
+//!        🡻
+//! NativeMapperProvider
+//! Device Mapper · LUKS
+//!        🡻
+//! NativeBlockProvider
+//! Udev · libfdisk · libblkid
 
 use std::{
     collections::{HashMap, HashSet},
