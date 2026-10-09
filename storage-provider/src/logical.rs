@@ -7,7 +7,7 @@ use crate::BackendId;
 
 /// Stable identity of a logical provider such as `luks` or `lvm`.
 #[repr(transparent)]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ProviderId(String);
 
@@ -21,6 +21,20 @@ impl ProviderId {
     /// Returns the opaque provider ID.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(
+                "provider ID must be non-empty and contain no whitespace",
+            )
+        })
     }
 }
 
@@ -41,4 +55,16 @@ pub trait LogicalProvider {
 
     /// Checks technology-specific constraints without changing the system.
     fn validate_action(&self, action: &Self::Action, graph: &NodeGraph) -> Vec<Diagnostic>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that JSON cannot bypass provider-ID constructor invariants.
+    #[test]
+    fn provider_id_rejects_invalid_json() {
+        assert!(serde_json::from_str::<ProviderId>(r#""""#).is_err());
+        assert!(serde_json::from_str::<ProviderId>(r#""two words""#).is_err());
+    }
 }

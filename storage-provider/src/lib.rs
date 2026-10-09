@@ -56,7 +56,7 @@ pub const DEFAULT_BACKEND_MANIFEST: &str = "/usr/share/pdisks/providers.json";
 
 /// Stable identity of a concrete system backend integration.
 #[repr(transparent)]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct BackendId(String);
 
@@ -70,6 +70,20 @@ impl BackendId {
     /// Returns the opaque backend ID.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(
+                "backend ID must be non-empty and contain no whitespace",
+            )
+        })
     }
 }
 
@@ -1465,5 +1479,12 @@ mod tests {
             Err(BackendRegistryError::RelativeLibrary { .. })
         ));
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
+    }
+
+    /// Verifies that JSON cannot bypass backend-ID constructor invariants.
+    #[test]
+    fn backend_id_rejects_invalid_json() {
+        assert!(serde_json::from_str::<BackendId>(r#""""#).is_err());
+        assert!(serde_json::from_str::<BackendId>(r#""two words""#).is_err());
     }
 }
