@@ -413,7 +413,10 @@ impl StateProvider for NativeSystemProvider<'_> {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        state.mounts = mount_entries.into_iter().map(observed_mount).collect();
+        state.mounts = mount_entries
+            .into_iter()
+            .map(|entry| observed_mount(entry, Some(&state.graph)))
+            .collect();
 
         let btrfs = match self.btrfs_subvolumes.probe_btrfs(&btrfs_mountpoints) {
             Ok(entries) => entries,
@@ -504,7 +507,7 @@ impl StateProvider for LibmountProvider<'_> {
             .probe_libmount()
             .map_err(|error| ProviderProbeError::new("libmount.probe_failed", error.to_string()))?
             .into_iter()
-            .map(observed_mount)
+            .map(|entry| observed_mount(entry, None))
             .collect();
         Ok(ProviderState {
             mounts,
@@ -514,11 +517,17 @@ impl StateProvider for LibmountProvider<'_> {
 }
 
 /// Converts one native libmount record into the canonical mount model.
-fn observed_mount(entry: storage_provider::LibmountEntry) -> ObservedMount {
+fn observed_mount(
+    entry: storage_provider::LibmountEntry,
+    graph: Option<&NodeGraph>,
+) -> ObservedMount {
     let source = entry.source.to_string_lossy();
     ObservedMount {
         source: if source.starts_with("/dev/") {
-            MountSource::Filesystem(content_node_id(&source))
+            graph.map_or_else(
+                || MountSource::Filesystem(content_node_id(&source)),
+                |graph| mount_filesystem_source(&source, graph),
+            )
         } else {
             external_mount_source(&source, &entry.filesystem_type)
         },
@@ -526,6 +535,33 @@ fn observed_mount(entry: storage_provider::LibmountEntry) -> ObservedMount {
         options: entry.options,
         context: MountContext::Host,
     }
+}
+
+/// Resolves a mount path through block aliases before creating a content ID.
+fn mount_filesystem_source(source: &str, graph: &NodeGraph) -> MountSource {
+    let direct = content_node_id(source);
+    if graph.node(&direct).is_some() {
+        return MountSource::Filesystem(direct);
+    }
+
+    let path = Path::new(source);
+    let Some(block_id) = graph.nodes().find_map(|(id, node)| {
+        node.size
+            .block
+            .as_ref()
+            .filter(|block| block.paths.iter().any(|candidate| candidate == path))
+            .map(|_| *id)
+    }) else {
+        return MountSource::Filesystem(direct);
+    };
+
+    graph
+        .dependencies()
+        .find_map(|dependency| {
+            (dependency.from == block_id && dependency.kind == DependencyKind::Backs)
+                .then_some(dependency.to)
+        })
+        .map_or(MountSource::Filesystem(direct), MountSource::Filesystem)
 }
 
 /// Joins complementary native observations into one non-conflicting graph.
@@ -2378,6 +2414,65 @@ mod tests {
         NvmeSubsystemEntry, ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry, ZfsPoolEntry,
         ZfsVdevClass as ProviderZfsVdevClass, ZfsVdevEntry, ZfsVdevKind as ProviderZfsVdevKind,
     };
+
+    /// Ensures mapper aliases resolve to the canonical filesystem content node.
+    #[test]
+    fn mapper_mount_alias_resolves_content_node() {
+        let block_id = block_node_id(Path::new("/dev/dm-0"));
+        let content_id = content_node_id("/dev/dm-0");
+        let mut graph = NodeGraph::new();
+        graph.insert_node(
+            block_id,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Unknown("device-mapper endpoint".to_owned()),
+                    size: None,
+                },
+                size: NodeFacts {
+                    block: Some(BlockFacts {
+                        paths: vec![
+                            PathBuf::from("/dev/dm-0"),
+                            PathBuf::from("/dev/mapper/vg-root"),
+                        ],
+                        devno: DeviceNumber { major: 253, minor: 0 },
+                        geometry: None,
+                        read_only: None,
+                    }),
+                    ..NodeFacts::default()
+                },
+            },
+        );
+        graph.insert_node(
+            content_id,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Filesystem {
+                        kind: FilesystemKind::Ext4,
+                        label: None,
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        graph.insert_dependency(Dependency {
+            from: block_id,
+            to: content_id,
+            kind: DependencyKind::Backs,
+        });
+
+        let mount = observed_mount(
+            storage_provider::LibmountEntry {
+                source: std::ffi::OsString::from("/dev/mapper/vg-root"),
+                target: PathBuf::from("/"),
+                filesystem_type: "ext4".to_owned(),
+                options: Vec::new(),
+            },
+            Some(&graph),
+        );
+
+        assert_eq!(mount.source, MountSource::Filesystem(content_id));
+    }
 
     /// Ensures native partial observations become one connected canonical graph.
     #[test]
