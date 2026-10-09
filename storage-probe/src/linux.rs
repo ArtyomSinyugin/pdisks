@@ -250,7 +250,7 @@ impl NativeMapperProvider<'_> {
                 Vec::new()
             }
         };
-        enrich_luks(&mut state.graph, &luks);
+        enrich_luks(&mut state, &luks);
         enrich_devmapper(&mut state.graph, &endpoints, &mappings);
         Ok((state, endpoints, signatures, mappings))
     }
@@ -695,26 +695,40 @@ fn push_native_failure(state: &mut ProviderState, provider: &str, evidence: Stri
 }
 
 /// Replaces blkid's generic LUKS signature nodes with cryptsetup metadata.
-fn enrich_luks(graph: &mut NodeGraph, entries: &[storage_provider::LuksObservation]) {
+fn enrich_luks(state: &mut ProviderState, entries: &[storage_provider::LuksObservation]) {
     for entry in entries {
         let id = content_node_id(&entry.device.to_string_lossy());
-        let Some(mut node) = graph.node(&id).cloned() else {
+        let Some(mut node) = state.graph.node(&id).cloned() else {
             continue;
         };
         node.kind.kind = NodeKind::LuksContainer {
             version: entry.version,
         };
-        node.kind.size = node
-            .kind
-            .size
-            .map(|size| Bytes::new(size.as_u64().saturating_sub(entry.payload_offset.as_u64())));
+        node.kind.size = node.kind.size.and_then(|size| {
+            size.as_u64()
+                .checked_sub(entry.payload_offset.as_u64())
+                .map(Bytes::new)
+                .or_else(|| {
+                    state.diagnostics.push(Diagnostic {
+                        code: "luks.invalid_payload_offset".to_owned(),
+                        severity: DiagnosticSeverity::MissingInformation,
+                        subjects: vec![DiagnosticSubject::Node(id)],
+                        message: "LUKS payload offset exceeds the observed device size".to_owned(),
+                        evidence: None,
+                        suggested_remedy: Some(
+                            "verify cryptsetup metadata and repeat probing".to_owned(),
+                        ),
+                    });
+                    None
+                })
+        });
         node.size.identities.retain(|identity| {
             !matches!(identity, ExternalId::Filesystem { fs_type, .. } if fs_type == "crypto_LUKS")
         });
         if let Some(identity) = &entry.identity {
             node.size.identities.push(identity.clone());
         }
-        graph.insert_node(id, node);
+        state.graph.insert_node(id, node);
     }
 }
 
@@ -2568,7 +2582,7 @@ mod tests {
             removable: None,
             zoned: None,
         };
-        let mut graph = assemble_native_block_state(
+        let graph = assemble_native_block_state(
             &[endpoint],
             &[],
             &[BlkidEntry {
@@ -2581,8 +2595,12 @@ mod tests {
         )
         .graph;
 
+        let mut state = ProviderState {
+            graph,
+            ..ProviderState::default()
+        };
         enrich_luks(
-            &mut graph,
+            &mut state,
             &[LuksObservation {
                 device: PathBuf::from("/dev/vda1"),
                 version: LuksVersion::Luks2,
@@ -2610,7 +2628,8 @@ mod tests {
             }],
         );
 
-        let node = graph
+        let node = state
+            .graph
             .node(&content_node_id("/dev/vda1"))
             .unwrap_or_else(|| panic!("LUKS content node is missing"));
         assert_eq!(
