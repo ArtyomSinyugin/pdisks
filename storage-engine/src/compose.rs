@@ -14,7 +14,8 @@ use thiserror::Error;
 
 use crate::{
     ActionDependency, ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError,
-    ExecutionPlan, FragmentId, PlannedAction, Projection,
+    ExecutionPlan, FragmentId, GoalAspect, GoalStatus, PlanSimulationError, PlannedAction,
+    Projection, compare_goal, simulate_plan_with_evidence,
 };
 
 /// Mutable action retained only while a plan is being composed.
@@ -66,7 +67,16 @@ pub fn compose_plan_for_goal_with_evidence(
     capacity_evidence: &[CapacityEvidence],
 ) -> Result<ExecutionPlan, CompositionError> {
     validate_intent_coverage(&goal.intents, &fragments)?;
-    compose_plan_with_evidence(current, fragments, capacity_evidence)
+    let plan = compose_plan_with_evidence(current, fragments, capacity_evidence)?;
+    let simulation = simulate_plan_with_evidence(current, &plan, capacity_evidence)
+        .map_err(CompositionError::FinalSimulation)?;
+    if let Some(check) = compare_goal(&simulation.projection, goal)
+        .into_iter()
+        .find(|check| matches!(check.status, GoalStatus::Violated { .. }))
+    {
+        return Err(CompositionError::GoalNotReached(check.aspect));
+    }
+    Ok(plan)
 }
 
 /// Builds one immutable plan using provider capacity evidence for the baseline.
@@ -798,6 +808,12 @@ pub enum CompositionError {
         /// Index in `DesiredState::intents`.
         index: usize,
     },
+    /// Replaying the frozen plan failed during final goal analysis.
+    #[error("final plan simulation failed: {0}")]
+    FinalSimulation(PlanSimulationError),
+    /// The final projection has a known mismatch with the requested goal.
+    #[error("final plan projection does not reach goal aspect {0:?}")]
+    GoalNotReached(GoalAspect),
 }
 
 #[cfg(test)]
@@ -1285,6 +1301,34 @@ mod tests {
                 .predicted_effect
                 .graph
                 .is_empty()
+        );
+    }
+
+    /// A transition-safe but incomplete plan cannot pass final goal validation.
+    #[test]
+    fn rejects_plan_that_does_not_reach_requested_graph() {
+        let (current, _vg) = current_with_vg();
+        let mut goal_graph = current.graph.clone();
+        goal_graph.insert_node(
+            NodeId::new(),
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Disk,
+                    size: Some(Bytes::new(1)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let goal = DesiredState {
+            graph: goal_graph,
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+
+        assert_eq!(
+            compose_plan_for_goal(&current, &goal, Vec::new()),
+            Err(CompositionError::GoalNotReached(GoalAspect::Graph))
         );
     }
 }

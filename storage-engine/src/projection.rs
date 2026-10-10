@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use storage_core::model::{
@@ -22,6 +22,7 @@ pub struct Projection {
     graph: NodeGraph,
     runtime_mounts: Vec<ObservedMount>,
     persistent_mounts: Vec<MountEntry>,
+    projected_persistent_targets: Vec<(PathBuf, MountContext)>,
     activations: HashMap<NodeId, bool>,
     block_interfaces: HashMap<NodeId, BlockInterfaceAccess>,
     available_capacity: HashMap<AllocationDomain, AllocationQuantity>,
@@ -36,6 +37,7 @@ impl Projection {
             graph: current.graph.clone(),
             runtime_mounts: current.mounts.entries.clone(),
             persistent_mounts: Vec::new(),
+            projected_persistent_targets: Vec::new(),
             activations: HashMap::new(),
             block_interfaces: HashMap::new(),
             available_capacity: HashMap::new(),
@@ -77,6 +79,13 @@ impl Projection {
     /// persistent mount configuration.
     pub fn persistent_mounts(&self) -> &[MountEntry] {
         &self.persistent_mounts
+    }
+
+    /// Reports whether a simulated effect established knowledge about one persistent target.
+    pub fn persistent_mount_was_projected(&self, target: &Path, context: &MountContext) -> bool {
+        self.projected_persistent_targets
+            .iter()
+            .any(|candidate| candidate.0 == target && candidate.1 == *context)
     }
 
     /// Returns a simulated activation request for a node, when one was applied.
@@ -507,14 +516,24 @@ impl Projection {
                         current.target != entry.target || current.context != entry.context
                     });
                     self.persistent_mounts.push(entry.clone());
+                    self.mark_persistent_target(&entry.target, &entry.context);
                 }
                 MountEffect::RemovePersistent { target, context } => {
                     self.persistent_mounts
                         .retain(|entry| entry.target != *target || entry.context != *context);
+                    self.mark_persistent_target(target, context);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Marks a persistent mount target as determined by a predicted effect.
+    fn mark_persistent_target(&mut self, target: &Path, context: &MountContext) {
+        if !self.persistent_mount_was_projected(target, context) {
+            self.projected_persistent_targets
+                .push((target.to_path_buf(), context.clone()));
+        }
     }
 
     /// Records runtime guarantees exported by a successfully projected action.
