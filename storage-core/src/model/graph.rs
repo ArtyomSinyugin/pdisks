@@ -38,6 +38,24 @@ impl NodeGraph {
         self.relations.insert(relation)
     }
 
+    /// Removes a node, returning its last published value when present.
+    ///
+    /// Incident edges are intentionally left untouched so a caller can apply
+    /// one graph-effect batch in its declared or validated order.
+    pub fn remove_node(&mut self, id: &NodeId) -> Option<Node> {
+        self.nodes.remove(id)
+    }
+
+    /// Removes an exact dependency edge, returning whether it was present.
+    pub fn remove_dependency(&mut self, dependency: &Dependency) -> bool {
+        self.dependencies.remove(dependency)
+    }
+
+    /// Removes an exact non-owning relation, returning whether it was present.
+    pub fn remove_relation(&mut self, relation: &Relation) -> bool {
+        self.relations.remove(relation)
+    }
+
     /// Returns a node by canonical identity.
     pub fn node(&self, id: &NodeId) -> Option<&Node> {
         self.nodes.get(id)
@@ -122,4 +140,95 @@ pub enum RelationKind {
     SnapshotOf,
     NvmeAttachedTo,
     Replicates,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{NodeFacts, NodeKind, NodeSpec};
+
+    /// Builds a minimal node for graph mutation tests.
+    fn disk_node() -> Node {
+        Node {
+            kind: NodeSpec {
+                kind: NodeKind::Disk,
+                size: None,
+            },
+            size: NodeFacts::default(),
+        }
+    }
+
+    /// Removing a node does not silently rewrite separately modelled edges.
+    #[test]
+    fn remove_node_leaves_edges_for_the_effect_batch() {
+        let from = NodeId::new();
+        let to = NodeId::new();
+        let dependency = Dependency {
+            from,
+            to,
+            kind: DependencyKind::Backs,
+        };
+        let relation = Relation {
+            from,
+            to,
+            kind: RelationKind::SnapshotOf,
+        };
+        let mut graph = NodeGraph::new();
+        graph.insert_node(from, disk_node());
+        graph.insert_node(to, disk_node());
+        graph.insert_dependency(dependency.clone());
+        graph.insert_relation(relation.clone());
+
+        assert_eq!(graph.remove_node(&from), Some(disk_node()));
+        assert!(graph.node(&from).is_none());
+        assert!(graph.node(&to).is_some());
+        assert!(graph.dependencies().any(|edge| edge == &dependency));
+        assert!(graph.relations().any(|edge| edge == &relation));
+    }
+
+    /// Edge removals require an exact match and preserve unrelated edges.
+    #[test]
+    fn remove_edges_matches_exact_values() {
+        let from = NodeId::new();
+        let to = NodeId::new();
+        let other = NodeId::new();
+        let dependency = Dependency {
+            from,
+            to,
+            kind: DependencyKind::Backs,
+        };
+        let retained_dependency = Dependency {
+            from,
+            to: other,
+            kind: DependencyKind::Backs,
+        };
+        let relation = Relation {
+            from,
+            to,
+            kind: RelationKind::Replicates,
+        };
+        let retained_relation = Relation {
+            from,
+            to: other,
+            kind: RelationKind::Replicates,
+        };
+        let mut graph = NodeGraph::new();
+        graph.insert_dependency(dependency.clone());
+        graph.insert_dependency(retained_dependency.clone());
+        graph.insert_relation(relation.clone());
+        graph.insert_relation(retained_relation.clone());
+
+        assert!(graph.remove_dependency(&dependency));
+        assert!(!graph.remove_dependency(&dependency));
+        assert!(graph.remove_relation(&relation));
+        assert!(!graph.remove_relation(&relation));
+        assert_eq!(
+            graph.dependencies().collect::<Vec<_>>(),
+            vec![&retained_dependency]
+        );
+        assert_eq!(
+            graph.relations().collect::<Vec<_>>(),
+            vec![&retained_relation]
+        );
+    }
 }
