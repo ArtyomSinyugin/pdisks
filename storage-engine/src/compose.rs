@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 
 use storage_core::model::{CurrentState, DiagnosticSeverity, MountSource, NodeId};
 use storage_provider::{
-    ActionContract, ActionOutput, ActionPrerequisite, BlockInterfaceAccess, BtrfsAction,
-    DependencyReason, FilesystemAction, FragmentOrigin, LocalActionId, LuksAction, LvmAction,
-    MountAction, PartitionAction, PlanFragment, ProviderAction,
+    ActionContract, ActionOutput, ActionPrerequisite, ActionResource, BlockInterfaceAccess,
+    BtrfsAction, DependencyReason, FilesystemAction, FragmentOrigin, LocalActionId, LuksAction,
+    LvmAction, MountAction, PartitionAction, PlanFragment, ProviderAction, ResourceAccessMode,
 };
 use thiserror::Error;
 
@@ -73,6 +73,7 @@ pub fn compose_plan_with_evidence(
     let final_order = topological_order(draft.len(), &dependencies)?;
     let final_contracts = simulate_order(current, capacity_evidence, &draft, &final_order)?;
     validate_declared_requirements(&requirements, &final_contracts)?;
+    validate_resource_order(&final_contracts, &dependencies)?;
 
     let actions = draft
         .into_iter()
@@ -284,6 +285,67 @@ fn validate_declared_requirements(
         }
     }
     Ok(())
+}
+
+/// Rejects conflicting accesses when the DAG does not define their order.
+fn validate_resource_order(
+    contracts: &HashMap<ActionId, ActionContract>,
+    dependencies: &[ActionDependency],
+) -> Result<(), CompositionError> {
+    let mut actions = contracts.keys().copied().collect::<Vec<_>>();
+    actions.sort_unstable();
+    for (index, first) in actions.iter().enumerate() {
+        for second in &actions[index + 1..] {
+            let first_contract = &contracts[first];
+            let second_contract = &contracts[second];
+            let Some(resource) = conflicting_resource(first_contract, second_contract) else {
+                continue;
+            };
+            if !dependency_path(*first, *second, dependencies)
+                && !dependency_path(*second, *first, dependencies)
+            {
+                return Err(CompositionError::AmbiguousResourceOrder {
+                    first: *first,
+                    second: *second,
+                    resource,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns one shared resource for which at least one action requests a write.
+fn conflicting_resource(first: &ActionContract, second: &ActionContract) -> Option<ActionResource> {
+    first.affected_resources.iter().find_map(|left| {
+        second.affected_resources.iter().find_map(|right| {
+            (left.resource == right.resource
+                && (left.mode == ResourceAccessMode::Write
+                    || right.mode == ResourceAccessMode::Write))
+                .then(|| left.resource.clone())
+        })
+    })
+}
+
+/// Reports whether the dependency DAG orders one action before another.
+fn dependency_path(before: ActionId, after: ActionId, dependencies: &[ActionDependency]) -> bool {
+    let mut pending = vec![before];
+    let mut visited = HashSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        for dependency in dependencies
+            .iter()
+            .filter(|dependency| dependency.before == current)
+        {
+            if dependency.after == after {
+                return true;
+            }
+            pending.push(dependency.after);
+        }
+    }
+    false
 }
 
 /// Simulates all actions in one candidate topological order.
@@ -601,6 +663,18 @@ pub enum CompositionError {
     /// Provider evidence contains duplicate allocation domains.
     #[error(transparent)]
     CapacityEvidence(#[from] CapacityEvidenceError),
+    /// Two actions conflict on one resource without a semantic ordering edge.
+    #[error(
+        "actions {first:?} and {second:?} access resource {resource:?} without an ordering dependency"
+    )]
+    AmbiguousResourceOrder {
+        /// First conflicting action.
+        first: ActionId,
+        /// Second conflicting action.
+        second: ActionId,
+        /// Shared resource that requires serialization.
+        resource: ActionResource,
+    },
 }
 
 #[cfg(test)]
@@ -995,5 +1069,47 @@ mod tests {
             compose_plan_with_evidence(&current, vec![fragment], &evidence),
             Err(CompositionError::ActionRejected(_))
         ));
+    }
+
+    /// Conflicting writes need a provider- or recipe-owned semantic order.
+    #[test]
+    fn rejects_unordered_resource_writes() {
+        let (current, vg) = current_with_vg();
+        let first = LocalActionId::new(0);
+        let second = LocalActionId::new(1);
+        let mut fragment = PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: first,
+                    operation: ProviderAction::Lvm(LvmAction::SetActivation {
+                        target: vg,
+                        active: false,
+                    }),
+                },
+                FragmentAction {
+                    id: second,
+                    operation: ProviderAction::Lvm(LvmAction::SetActivation {
+                        target: vg,
+                        active: true,
+                    }),
+                },
+            ],
+            dependencies: Vec::new(),
+            external_requirements: Vec::new(),
+            origin: origin(vg, "ordered activation"),
+            diagnostics: Vec::new(),
+        };
+
+        assert!(matches!(
+            compose_plan(&current, vec![fragment.clone()]),
+            Err(CompositionError::AmbiguousResourceOrder { .. })
+        ));
+
+        fragment.dependencies.push(FragmentDependency {
+            before: first,
+            after: second,
+            reason: DependencyReason::ResourceCoordination,
+        });
+        assert!(compose_plan(&current, vec![fragment]).is_ok());
     }
 }

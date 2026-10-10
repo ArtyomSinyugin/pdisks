@@ -873,11 +873,17 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
                 NodeKindClass::LvmLv,
                 ResizeSafety::DEPENDENTS,
             );
-            write(&mut result, ActionResource::LvmMetadata(*lv));
+            if let Some(vg) = lvm_volume_group(context.graph, *lv) {
+                write(&mut result, ActionResource::LvmMetadata(vg));
+            }
             result
         }
         LvmAction::RemoveLv { lv } => {
-            remove_node_contract(context, *lv, NodeKindClass::LvmLv, true)
+            let mut result = remove_node_contract(context, *lv, NodeKindClass::LvmLv, true);
+            if let Some(vg) = lvm_volume_group(context.graph, *lv) {
+                write(&mut result, ActionResource::LvmMetadata(vg));
+            }
+            result
         }
         LvmAction::SetActivation { target, active } => {
             let mut result = contract(RestartPolicy::Idempotent);
@@ -1501,6 +1507,18 @@ fn lvm_create_allocation(
     Some(AllocationQuantity::new(size.as_u64().div_ceil(extent_size)))
 }
 
+/// Returns the volume-group metadata domain that owns one logical volume.
+fn lvm_volume_group(graph: &NodeGraph, lv: NodeId) -> Option<NodeId> {
+    graph.dependencies().find_map(|dependency| {
+        (dependency.to == lv
+            && dependency.kind == DependencyKind::Provides
+            && graph
+                .node(&dependency.from)
+                .is_some_and(|node| matches!(node.kind.kind, NodeKind::LvmVg { .. })))
+        .then_some(dependency.from)
+    })
+}
+
 /// Returns the graph node referenced by a mount source, when one exists.
 fn mount_source_node(source: &MountSource) -> Option<NodeId> {
     match source {
@@ -1569,7 +1587,9 @@ fn add_output_resources(contract: &mut ActionContract) {
 
 #[cfg(test)]
 mod tests {
-    use storage_core::model::{LuksVersion, LvmLv, LvmLvKind, Node, NodeFacts, Presence};
+    use storage_core::model::{
+        Dependency, DependencyKind, LuksVersion, LvmLv, LvmLvKind, Node, NodeFacts, Presence,
+    };
 
     use super::*;
 
@@ -1801,5 +1821,68 @@ mod tests {
                     amount: allocation,
                 })
         );
+    }
+
+    /// Existing-LV mutations lock their owning VG rather than using the LV as a metadata domain.
+    #[test]
+    fn lvm_mutations_use_volume_group_metadata_domain() {
+        let vg = NodeId::new();
+        let lv = NodeId::new();
+        let mut graph = NodeGraph::new();
+        graph.insert_node(
+            vg,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmVg {
+                        name: "vg0".to_owned(),
+                        extent_size: Some(Bytes::new(4)),
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        graph.insert_node(
+            lv,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmLv(LvmLv {
+                        name: "data".to_owned(),
+                        kind: LvmLvKind::Linear,
+                    }),
+                    size: Some(Bytes::new(60)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        graph.insert_dependency(Dependency {
+            from: vg,
+            to: lv,
+            kind: DependencyKind::Provides,
+        });
+
+        for action in [
+            LvmAction::ResizeLv {
+                lv,
+                new_size: Bytes::new(80),
+            },
+            LvmAction::RemoveLv { lv },
+        ] {
+            let contract = describe_action(
+                &ProviderAction::Lvm(action),
+                ActionDescriptionContext { graph: &graph },
+            );
+
+            assert!(contract.affected_resources.contains(&ResourceAccess {
+                resource: ActionResource::LvmMetadata(vg),
+                mode: ResourceAccessMode::Write,
+            }));
+            assert!(
+                !contract
+                    .affected_resources
+                    .iter()
+                    .any(|access| { access.resource == ActionResource::LvmMetadata(lv) })
+            );
+        }
     }
 }
