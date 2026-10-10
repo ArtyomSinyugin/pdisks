@@ -10,9 +10,9 @@ use storage_core::model::{
     NodeGraph, NodeId, NodeKind, ObservedMount,
 };
 use storage_provider::{
-    ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite,
-    BlockInterfaceAccess, GraphEffect, MountEffect, NodeKindClass, PredictedEffect, ProviderAction,
-    describe_action,
+    ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite, AllocationDomain,
+    AllocationEffect, AllocationQuantity, BlockInterfaceAccess, GraphEffect, MountEffect,
+    NodeKindClass, PredictedEffect, ProviderAction, describe_action,
 };
 use thiserror::Error;
 
@@ -24,6 +24,8 @@ pub struct Projection {
     persistent_mounts: Vec<MountEntry>,
     activations: HashMap<NodeId, bool>,
     block_interfaces: HashMap<NodeId, BlockInterfaceAccess>,
+    available_capacity: HashMap<AllocationDomain, AllocationQuantity>,
+    projected_allocations: HashSet<AllocationDomain>,
     projected_graph_nodes: Vec<NodeId>,
 }
 
@@ -36,8 +38,27 @@ impl Projection {
             persistent_mounts: Vec::new(),
             activations: HashMap::new(),
             block_interfaces: HashMap::new(),
+            available_capacity: HashMap::new(),
+            projected_allocations: HashSet::new(),
             projected_graph_nodes: Vec::new(),
         }
+    }
+
+    /// Adds provider evidence about baseline free capacity.
+    pub fn with_capacity_evidence(
+        mut self,
+        evidence: &[CapacityEvidence],
+    ) -> Result<Self, CapacityEvidenceError> {
+        for item in evidence {
+            if self
+                .available_capacity
+                .insert(item.domain.clone(), item.available)
+                .is_some()
+            {
+                return Err(CapacityEvidenceError::DuplicateDomain(item.domain.clone()));
+            }
+        }
+        Ok(self)
     }
 
     /// Returns the effective graph after all successfully applied effects.
@@ -109,6 +130,7 @@ impl Projection {
         let mut candidate = self.clone();
         candidate.apply_graph_effects(&effect.graph)?;
         candidate.apply_mount_effects(&effect.mounts)?;
+        candidate.apply_allocation_effects(&effect.allocations)?;
         candidate.validate_edges()?;
         *self = candidate;
         Ok(())
@@ -176,6 +198,9 @@ impl Projection {
             }
             ActionPrerequisite::BackingSizeAtLeast { node, size } => {
                 self.evaluate_backing_size(*node, *size)
+            }
+            ActionPrerequisite::CapacityAvailable { domain, amount } => {
+                self.evaluate_capacity(domain, *amount)
             }
             ActionPrerequisite::MountTargetAvailable { target, context } => {
                 if self.mount_at(target, context).is_some() {
@@ -306,6 +331,33 @@ impl Projection {
                     CheckEvidence::ObservedSnapshot
                 },
             )
+        }
+    }
+
+    /// Checks cumulative free capacity in one provider allocation domain.
+    fn evaluate_capacity(
+        &self,
+        domain: &AllocationDomain,
+        amount: Option<AllocationQuantity>,
+    ) -> CheckStatus {
+        let Some(amount) = amount else {
+            return CheckStatus::Unknown {
+                required_evidence: "provider allocation calculation for this layout".to_owned(),
+            };
+        };
+        let Some(available) = self.available_capacity.get(domain) else {
+            return CheckStatus::Unknown {
+                required_evidence: "provider allocation-capacity evidence".to_owned(),
+            };
+        };
+        if *available < amount {
+            CheckStatus::Violated {
+                reason: "allocation domain has insufficient free capacity".to_owned(),
+            }
+        } else if self.projected_allocations.contains(domain) {
+            CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
+        } else {
+            CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot)
         }
     }
 
@@ -474,6 +526,38 @@ impl Projection {
         }
     }
 
+    /// Applies cumulative reserve and release effects to known capacity evidence.
+    fn apply_allocation_effects(
+        &mut self,
+        effects: &[AllocationEffect],
+    ) -> Result<(), EffectApplicationError> {
+        for effect in effects {
+            match effect {
+                AllocationEffect::Reserve { domain, amount } => {
+                    let Some(available) = self.available_capacity.get_mut(domain) else {
+                        continue;
+                    };
+                    let Some(remaining) = available.get().checked_sub(amount.get()) else {
+                        return Err(EffectApplicationError::InsufficientCapacity(domain.clone()));
+                    };
+                    *available = AllocationQuantity::new(remaining);
+                    self.projected_allocations.insert(domain.clone());
+                }
+                AllocationEffect::Release { domain, amount } => {
+                    let Some(available) = self.available_capacity.get_mut(domain) else {
+                        continue;
+                    };
+                    let Some(total) = available.get().checked_add(amount.get()) else {
+                        return Err(EffectApplicationError::CapacityOverflow(domain.clone()));
+                    };
+                    *available = AllocationQuantity::new(total);
+                    self.projected_allocations.insert(domain.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Replaces one node only after a type-specific update succeeds.
     fn update_node(
         &mut self,
@@ -552,6 +636,23 @@ pub struct PrerequisiteCheck {
     pub status: CheckStatus,
 }
 
+/// Read-only provider evidence about one allocation domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityEvidence {
+    /// Domain to which the observation applies.
+    pub domain: AllocationDomain,
+    /// Free capacity observed for the planning baseline.
+    pub available: AllocationQuantity,
+}
+
+/// Invalid set of provider capacity evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CapacityEvidenceError {
+    /// More than one observation was supplied for one domain.
+    #[error("duplicate capacity evidence for allocation domain {0:?}")]
+    DuplicateDomain(AllocationDomain),
+}
+
 /// Trusted contract and checks produced while simulating one action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulatedAction {
@@ -616,6 +717,12 @@ pub enum EffectApplicationError {
     /// A runtime mount effect targets an occupied namespace path.
     #[error("runtime mount target {0:?} is already occupied")]
     OccupiedMountTarget(PathBuf),
+    /// A reserve effect exceeds known free capacity.
+    #[error("insufficient capacity in allocation domain {0:?}")]
+    InsufficientCapacity(AllocationDomain),
+    /// A release effect overflows the capacity representation.
+    #[error("capacity overflow in allocation domain {0:?}")]
+    CapacityOverflow(AllocationDomain),
 }
 
 /// Reports whether a node kind satisfies a coarse provider contract class.
@@ -754,6 +861,7 @@ mod tests {
                 },
             ],
             mounts: Vec::new(),
+            allocations: Vec::new(),
         };
 
         assert_eq!(
@@ -779,6 +887,7 @@ mod tests {
         let effect = PredictedEffect {
             graph: Vec::new(),
             mounts: vec![MountEffect::SetPersistent(entry.clone())],
+            allocations: Vec::new(),
         };
 
         assert!(projection.apply_effect(&effect).is_ok());
@@ -876,6 +985,25 @@ mod tests {
             checks.as_slice(),
             [PrerequisiteCheck {
                 status: CheckStatus::Violated { .. },
+                ..
+            }]
+        ));
+    }
+
+    /// Missing provider capacity evidence remains an explicit unknown.
+    #[test]
+    fn capacity_is_unknown_without_provider_evidence() {
+        let (current, disk) = current_with_disk();
+        let projection = Projection::from_current(&current);
+        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::CapacityAvailable {
+            domain: AllocationDomain::LvmVolumeGroup(disk),
+            amount: Some(AllocationQuantity::new(1)),
+        }]);
+
+        assert!(matches!(
+            checks.as_slice(),
+            [PrerequisiteCheck {
+                status: CheckStatus::Unknown { .. },
                 ..
             }]
         ));

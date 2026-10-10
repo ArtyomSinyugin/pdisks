@@ -11,8 +11,8 @@ use storage_provider::{
 use thiserror::Error;
 
 use crate::{
-    ActionDependency, ActionId, ActionSimulationError, ExecutionPlan, FragmentId, PlannedAction,
-    Projection,
+    ActionDependency, ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError,
+    ExecutionPlan, FragmentId, PlannedAction, Projection,
 };
 
 /// Mutable action retained only while a plan is being composed.
@@ -44,6 +44,15 @@ pub fn compose_plan(
     current: &CurrentState,
     fragments: Vec<PlanFragment>,
 ) -> Result<ExecutionPlan, CompositionError> {
+    compose_plan_with_evidence(current, fragments, &[])
+}
+
+/// Builds one immutable plan using provider capacity evidence for the baseline.
+pub fn compose_plan_with_evidence(
+    current: &CurrentState,
+    fragments: Vec<PlanFragment>,
+    capacity_evidence: &[CapacityEvidence],
+) -> Result<ExecutionPlan, CompositionError> {
     let FlattenedFragments {
         actions: draft,
         mut dependencies,
@@ -52,11 +61,17 @@ pub fn compose_plan(
     bind_planned_nodes(current, &draft, &mut dependencies)?;
 
     let first_order = topological_order(draft.len(), &dependencies)?;
-    let first_contracts = simulate_order(current, &draft, &first_order)?;
-    resolve_requirements(current, &requirements, &first_contracts, &mut dependencies)?;
+    let first_contracts = simulate_order(current, capacity_evidence, &draft, &first_order)?;
+    resolve_requirements(
+        current,
+        capacity_evidence,
+        &requirements,
+        &first_contracts,
+        &mut dependencies,
+    )?;
 
     let final_order = topological_order(draft.len(), &dependencies)?;
-    let final_contracts = simulate_order(current, &draft, &final_order)?;
+    let final_contracts = simulate_order(current, capacity_evidence, &draft, &final_order)?;
     validate_declared_requirements(&requirements, &final_contracts)?;
 
     let actions = draft
@@ -199,11 +214,14 @@ fn bind_planned_nodes(
 /// Resolves cross-fragment conditions from baseline evidence or action outputs.
 fn resolve_requirements(
     current: &CurrentState,
+    capacity_evidence: &[CapacityEvidence],
     requirements: &[PendingRequirement],
     contracts: &HashMap<ActionId, ActionContract>,
     dependencies: &mut Vec<ActionDependency>,
 ) -> Result<(), CompositionError> {
-    let baseline = Projection::from_current(current);
+    let baseline = Projection::from_current(current)
+        .with_capacity_evidence(capacity_evidence)
+        .map_err(CompositionError::CapacityEvidence)?;
     for requirement in requirements {
         let baseline_check = baseline
             .evaluate_prerequisites(std::slice::from_ref(&requirement.prerequisite))
@@ -271,10 +289,13 @@ fn validate_declared_requirements(
 /// Simulates all actions in one candidate topological order.
 fn simulate_order(
     current: &CurrentState,
+    capacity_evidence: &[CapacityEvidence],
     actions: &[DraftAction],
     order: &[ActionId],
 ) -> Result<HashMap<ActionId, ActionContract>, CompositionError> {
-    let mut projection = Projection::from_current(current);
+    let mut projection = Projection::from_current(current)
+        .with_capacity_evidence(capacity_evidence)
+        .map_err(CompositionError::CapacityEvidence)?;
     let mut contracts = HashMap::new();
     for id in order {
         let action = &actions[id.get() as usize];
@@ -482,6 +503,7 @@ fn requirement_can_be_checked_live(
         | ActionPrerequisite::DistinctNodes(_)
         | ActionPrerequisite::DependentsFitWithin { .. }
         | ActionPrerequisite::BackingSizeAtLeast { .. }
+        | ActionPrerequisite::CapacityAvailable { .. }
         | ActionPrerequisite::MountTargetAvailable { .. } => false,
     }
 }
@@ -576,6 +598,9 @@ pub enum CompositionError {
     /// Internal analysis did not produce a trusted action contract.
     #[error("action {0:?} has no analysed contract")]
     MissingAnalysedContract(ActionId),
+    /// Provider evidence contains duplicate allocation domains.
+    #[error(transparent)]
+    CapacityEvidence(#[from] CapacityEvidenceError),
 }
 
 #[cfg(test)]
@@ -588,7 +613,8 @@ mod tests {
         SystemEnvironment,
     };
     use storage_provider::{
-        ExternalRequirement, FragmentAction, FragmentDependency, LvmAction, MountAction,
+        AllocationDomain, AllocationQuantity, ExternalRequirement, FragmentAction,
+        FragmentDependency, LvmAction, MountAction,
     };
 
     use super::*;
@@ -603,7 +629,7 @@ mod tests {
                 kind: NodeSpec {
                     kind: NodeKind::LvmVg {
                         name: "vg0".to_owned(),
-                        extent_size: Some(Bytes::new(4 * 1024 * 1024)),
+                        extent_size: Some(Bytes::new(1)),
                     },
                     size: None,
                 },
@@ -933,6 +959,41 @@ mod tests {
         assert!(matches!(
             ordered[1].operation,
             ProviderAction::Lvm(LvmAction::ResizeLv { .. })
+        ));
+    }
+
+    /// Cumulative reservations reject two locally valid allocations over capacity.
+    #[test]
+    fn rejects_cumulative_volume_group_overallocation() {
+        let (current, vg) = current_with_vg();
+        let fragment = PlanFragment {
+            actions: ["one", "two"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| FragmentAction {
+                    id: LocalActionId::new(index as u32),
+                    operation: ProviderAction::Lvm(LvmAction::CreateLv {
+                        vg,
+                        planned_node_id: NodeId::new(),
+                        name: name.to_owned(),
+                        size: Bytes::new(60),
+                        layout: LvmLvKind::Linear,
+                    }),
+                })
+                .collect(),
+            dependencies: Vec::new(),
+            external_requirements: Vec::new(),
+            origin: origin(vg, "allocate two LVs"),
+            diagnostics: Vec::new(),
+        };
+        let evidence = [CapacityEvidence {
+            domain: AllocationDomain::LvmVolumeGroup(vg),
+            available: AllocationQuantity::new(100),
+        }];
+
+        assert!(matches!(
+            compose_plan_with_evidence(&current, vec![fragment], &evidence),
+            Err(CompositionError::ActionRejected(_))
         ));
     }
 }

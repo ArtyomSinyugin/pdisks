@@ -84,6 +84,13 @@ pub enum ActionPrerequisite {
         /// Capacity required from its direct backing node.
         size: Bytes,
     },
+    /// A planning allocation domain must retain enough free capacity.
+    CapacityAvailable {
+        /// Provider-owned allocation domain.
+        domain: AllocationDomain,
+        /// Provider-calculated units consumed by this action, when known.
+        amount: Option<AllocationQuantity>,
+    },
     /// A mount target must not already be occupied in the selected context.
     MountTargetAvailable {
         /// Requested target path.
@@ -160,6 +167,32 @@ pub enum BlockInterfaceAccess {
     ReadWrite,
 }
 
+/// Provider-owned domain whose free capacity is tracked during planning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationDomain {
+    /// Allocatable extents belonging to one LVM volume group.
+    LvmVolumeGroup(NodeId),
+}
+
+/// Count of provider-defined allocation units within one domain.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AllocationQuantity(u64);
+
+impl AllocationQuantity {
+    /// Creates an allocation-unit count.
+    pub const fn new(units: u64) -> Self {
+        Self(units)
+    }
+
+    /// Returns the provider-defined unit count.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// One resource touched by an action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceAccess {
@@ -207,6 +240,29 @@ pub struct PredictedEffect {
     pub graph: Vec<GraphEffect>,
     /// Changes to runtime or persistent mounts.
     pub mounts: Vec<MountEffect>,
+    /// Changes to planning-only allocation accounting.
+    #[serde(default)]
+    pub allocations: Vec<AllocationEffect>,
+}
+
+/// One predicted change to planning-only resource accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationEffect {
+    /// Consumes capacity from a provider-owned allocation domain.
+    Reserve {
+        /// Domain whose free capacity decreases.
+        domain: AllocationDomain,
+        /// Capacity consumed after successful completion.
+        amount: AllocationQuantity,
+    },
+    /// Returns capacity to a provider-owned allocation domain.
+    Release {
+        /// Domain whose free capacity increases.
+        domain: AllocationDomain,
+        /// Capacity returned after successful completion.
+        amount: AllocationQuantity,
+    },
 }
 
 /// One predicted canonical-graph change.
@@ -773,6 +829,14 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
         } => {
             let mut result = contract(RestartPolicy::ReprobeThenRetry);
             require_kind(&mut result, *vg, NodeKindClass::LvmVg);
+            let allocation_domain = AllocationDomain::LvmVolumeGroup(*vg);
+            let allocation = lvm_create_allocation(context.graph, *vg, *size, layout);
+            result
+                .prerequisites
+                .push(ActionPrerequisite::CapacityAvailable {
+                    domain: allocation_domain.clone(),
+                    amount: allocation,
+                });
             write(&mut result, ActionResource::LvmMetadata(*vg));
             let spec = NodeSpec {
                 kind: NodeKind::LvmLv(storage_core::model::LvmLv {
@@ -787,11 +851,21 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
                 kind: DependencyKind::Provides,
             };
             insert_node_with_dependency(&mut result, *planned_node_id, spec, dependency);
+            if let Some(amount) = allocation {
+                result
+                    .predicted_effect
+                    .allocations
+                    .push(AllocationEffect::Reserve {
+                        domain: allocation_domain,
+                        amount,
+                    });
+            }
             invalidate(&mut result, *vg, FactKind::Geometry);
             invalidate(&mut result, *vg, FactKind::Topology);
             result
         }
         LvmAction::ResizeLv { lv, new_size } => {
+            // shortcut: allocation accounting covers CreateLv first, extend it when existing LVM allocation evidence is modelled.
             let mut result = resize_contract(
                 context,
                 *lv,
@@ -1406,6 +1480,27 @@ fn known_size(graph: &NodeGraph, node: NodeId) -> Option<Bytes> {
     graph.node(&node).and_then(|node| node.kind.size)
 }
 
+/// Calculates linear-LV allocation in VG extents when the extent size is known.
+fn lvm_create_allocation(
+    graph: &NodeGraph,
+    vg: NodeId,
+    size: Bytes,
+    layout: &storage_core::model::LvmLvKind,
+) -> Option<AllocationQuantity> {
+    // shortcut: non-linear LVM layouts need provider-specific placement and redundancy accounting.
+    if !matches!(layout, storage_core::model::LvmLvKind::Linear) {
+        return None;
+    }
+    let extent_size = match &graph.node(&vg)?.kind.kind {
+        NodeKind::LvmVg {
+            extent_size: Some(extent_size),
+            ..
+        } if extent_size.as_u64() > 0 => extent_size.as_u64(),
+        _ => return None,
+    };
+    Some(AllocationQuantity::new(size.as_u64().div_ceil(extent_size)))
+}
+
 /// Returns the graph node referenced by a mount source, when one exists.
 fn mount_source_node(source: &MountSource) -> Option<NodeId> {
     match source {
@@ -1653,6 +1748,57 @@ mod tests {
                 .contains(&ActionOutput::BlockInterface {
                     node: lv,
                     access: BlockInterfaceAccess::ReadWrite,
+                })
+        );
+    }
+
+    /// LV creation reserves capacity in the same VG domain it validates.
+    #[test]
+    fn lvm_create_contract_reserves_volume_group_capacity() {
+        let vg = NodeId::new();
+        let lv = NodeId::new();
+        let size = Bytes::new(60);
+        let mut graph = NodeGraph::new();
+        graph.insert_node(
+            vg,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmVg {
+                        name: "vg0".to_owned(),
+                        extent_size: Some(Bytes::new(4)),
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let action = ProviderAction::Lvm(LvmAction::CreateLv {
+            vg,
+            planned_node_id: lv,
+            name: "data".to_owned(),
+            size,
+            layout: LvmLvKind::Linear,
+        });
+        let domain = AllocationDomain::LvmVolumeGroup(vg);
+        let allocation = AllocationQuantity::new(15);
+
+        let contract = describe_action(&action, ActionDescriptionContext { graph: &graph });
+
+        assert!(
+            contract
+                .prerequisites
+                .contains(&ActionPrerequisite::CapacityAvailable {
+                    domain: domain.clone(),
+                    amount: Some(allocation),
+                })
+        );
+        assert!(
+            contract
+                .predicted_effect
+                .allocations
+                .contains(&AllocationEffect::Reserve {
+                    domain,
+                    amount: allocation,
                 })
         );
     }
