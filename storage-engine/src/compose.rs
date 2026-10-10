@@ -480,6 +480,8 @@ fn requirement_can_be_checked_live(
         | ActionPrerequisite::NodeKind { .. }
         | ActionPrerequisite::NoUnexpectedConsumers(_)
         | ActionPrerequisite::DistinctNodes(_)
+        | ActionPrerequisite::DependentsFitWithin { .. }
+        | ActionPrerequisite::BackingSizeAtLeast { .. }
         | ActionPrerequisite::MountTargetAvailable { .. } => false,
     }
 }
@@ -581,8 +583,9 @@ mod tests {
     use std::path::PathBuf;
 
     use storage_core::model::{
-        Bytes, Diagnostic, Environment, FilesystemKind, LvmLvKind, MountContext, MountState, Node,
-        NodeFacts, NodeKind, NodeSpec, SystemEnvironment,
+        Bytes, Dependency, DependencyKind, Diagnostic, Environment, FilesystemKind, LvmLv,
+        LvmLvKind, MountContext, MountState, Node, NodeFacts, NodeKind, NodeSpec,
+        SystemEnvironment,
     };
     use storage_provider::{
         ExternalRequirement, FragmentAction, FragmentDependency, LvmAction, MountAction,
@@ -626,6 +629,87 @@ mod tests {
         FragmentOrigin::Change {
             subject,
             description: description.to_owned(),
+        }
+    }
+
+    /// Builds a baseline with an ext4 filesystem backed by one LV.
+    fn current_with_lv_and_filesystem() -> (CurrentState, NodeId, NodeId) {
+        let (mut current, vg) = current_with_vg();
+        let lv = NodeId::new();
+        let filesystem = NodeId::new();
+        current.graph.insert_node(
+            lv,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmLv(LvmLv {
+                        name: "data".to_owned(),
+                        kind: LvmLvKind::Linear,
+                    }),
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        current.graph.insert_node(
+            filesystem,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Filesystem {
+                        kind: FilesystemKind::Ext4,
+                        label: Some("data".to_owned()),
+                    },
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        current.graph.insert_dependency(Dependency {
+            from: vg,
+            to: lv,
+            kind: DependencyKind::Provides,
+        });
+        current.graph.insert_dependency(Dependency {
+            from: lv,
+            to: filesystem,
+            kind: DependencyKind::Backs,
+        });
+        (current, lv, filesystem)
+    }
+
+    /// Builds a resize fragment with the requested semantic order.
+    fn resize_fragment(lv: NodeId, filesystem: NodeId, filesystem_first: bool) -> PlanFragment {
+        let resize_lv = LocalActionId::new(1);
+        let resize_filesystem = LocalActionId::new(2);
+        let (before, after) = if filesystem_first {
+            (resize_filesystem, resize_lv)
+        } else {
+            (resize_lv, resize_filesystem)
+        };
+        PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: resize_lv,
+                    operation: ProviderAction::Lvm(LvmAction::ResizeLv {
+                        lv,
+                        new_size: Bytes::new(60),
+                    }),
+                },
+                FragmentAction {
+                    id: resize_filesystem,
+                    operation: ProviderAction::Filesystem(FilesystemAction::Resize {
+                        filesystem,
+                        new_size: Bytes::new(60),
+                    }),
+                },
+            ],
+            dependencies: vec![FragmentDependency {
+                before,
+                after,
+                reason: DependencyReason::ResizeSafety,
+            }],
+            external_requirements: Vec::new(),
+            origin: origin(lv, "shrink filesystem and LV"),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -818,5 +902,37 @@ mod tests {
             compose_plan(&current, vec![fragment]),
             Err(CompositionError::DependencyCycle)
         );
+    }
+
+    /// Shrinking the lower LV before its filesystem is rejected.
+    #[test]
+    fn rejects_backing_shrink_before_filesystem_shrink() {
+        let (current, lv, filesystem) = current_with_lv_and_filesystem();
+        let fragment = resize_fragment(lv, filesystem, false);
+
+        assert!(matches!(
+            compose_plan(&current, vec![fragment]),
+            Err(CompositionError::ActionRejected(_))
+        ));
+    }
+
+    /// Shrinking the filesystem first leaves a safe intermediate state.
+    #[test]
+    fn accepts_filesystem_shrink_before_backing_shrink() {
+        let (current, lv, filesystem) = current_with_lv_and_filesystem();
+        let fragment = resize_fragment(lv, filesystem, true);
+
+        let plan = compose_plan(&current, vec![fragment])
+            .unwrap_or_else(|error| panic!("compose safe shrink plan: {error}"));
+        let ordered = plan.ordered_actions();
+
+        assert!(matches!(
+            ordered[0].operation,
+            ProviderAction::Filesystem(FilesystemAction::Resize { .. })
+        ));
+        assert!(matches!(
+            ordered[1].operation,
+            ProviderAction::Lvm(LvmAction::ResizeLv { .. })
+        ));
     }
 }

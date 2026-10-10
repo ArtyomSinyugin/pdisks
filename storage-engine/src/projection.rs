@@ -6,8 +6,8 @@ use std::{
 };
 
 use storage_core::model::{
-    CurrentState, FilesystemKind, MountContext, MountEntry, Node, NodeFacts, NodeGraph, NodeId,
-    NodeKind, ObservedMount,
+    CurrentState, DependencyKind, FilesystemKind, MountContext, MountEntry, Node, NodeFacts,
+    NodeGraph, NodeId, NodeKind, ObservedMount,
 };
 use storage_provider::{
     ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite,
@@ -24,7 +24,7 @@ pub struct Projection {
     persistent_mounts: Vec<MountEntry>,
     activations: HashMap<NodeId, bool>,
     block_interfaces: HashMap<NodeId, BlockInterfaceAccess>,
-    projected_nodes: Vec<NodeId>,
+    projected_graph_nodes: Vec<NodeId>,
 }
 
 impl Projection {
@@ -36,7 +36,7 @@ impl Projection {
             persistent_mounts: Vec::new(),
             activations: HashMap::new(),
             block_interfaces: HashMap::new(),
-            projected_nodes: Vec::new(),
+            projected_graph_nodes: Vec::new(),
         }
     }
 
@@ -171,6 +171,12 @@ impl Projection {
                     }
                 }
             }
+            ActionPrerequisite::DependentsFitWithin { node, size } => {
+                self.evaluate_dependent_sizes(*node, *size)
+            }
+            ActionPrerequisite::BackingSizeAtLeast { node, size } => {
+                self.evaluate_backing_size(*node, *size)
+            }
             ActionPrerequisite::MountTargetAvailable { target, context } => {
                 if self.mount_at(target, context).is_some() {
                     CheckStatus::Violated {
@@ -217,9 +223,95 @@ impl Projection {
         }
     }
 
+    /// Checks direct block consumers against a proposed lower-layer capacity.
+    fn evaluate_dependent_sizes(
+        &self,
+        node: NodeId,
+        size: storage_core::model::Bytes,
+    ) -> CheckStatus {
+        if self.graph.node(&node).is_none() {
+            return CheckStatus::Violated {
+                reason: "referenced node is absent".to_owned(),
+            };
+        }
+        let mut found = false;
+        let mut predicted = self.projected_graph_nodes.contains(&node);
+        for dependency in self.graph.dependencies().filter(|dependency| {
+            dependency.from == node && matches!(dependency.kind, DependencyKind::Backs)
+        }) {
+            found = true;
+            predicted |= self.projected_graph_nodes.contains(&dependency.to);
+            let Some(dependent) = self.graph.node(&dependency.to) else {
+                return CheckStatus::Violated {
+                    reason: "dependent node is absent".to_owned(),
+                };
+            };
+            let Some(dependent_size) = dependent.kind.size else {
+                return CheckStatus::Unknown {
+                    required_evidence: "dependent capacity observation".to_owned(),
+                };
+            };
+            if dependent_size > size {
+                return CheckStatus::Violated {
+                    reason: "an upper layer exceeds the proposed backing capacity".to_owned(),
+                };
+            }
+        }
+        if found {
+            CheckStatus::Satisfied(if predicted {
+                CheckEvidence::PredictedEffect
+            } else {
+                CheckEvidence::ObservedSnapshot
+            })
+        } else {
+            self.satisfied_for_node(node)
+        }
+    }
+
+    /// Checks the direct block backing against a proposed upper-layer capacity.
+    fn evaluate_backing_size(&self, node: NodeId, size: storage_core::model::Bytes) -> CheckStatus {
+        if self.graph.node(&node).is_none() {
+            return CheckStatus::Violated {
+                reason: "referenced node is absent".to_owned(),
+            };
+        }
+        let Some(dependency) = self.graph.dependencies().find(|dependency| {
+            dependency.to == node && matches!(dependency.kind, DependencyKind::Backs)
+        }) else {
+            return CheckStatus::Unknown {
+                required_evidence: "direct backing relationship".to_owned(),
+            };
+        };
+        let Some(backing) = self.graph.node(&dependency.from) else {
+            return CheckStatus::Violated {
+                reason: "backing node is absent".to_owned(),
+            };
+        };
+        let Some(backing_size) = backing.kind.size else {
+            return CheckStatus::Unknown {
+                required_evidence: "backing capacity observation".to_owned(),
+            };
+        };
+        if backing_size < size {
+            CheckStatus::Violated {
+                reason: "backing capacity is smaller than the requested size".to_owned(),
+            }
+        } else {
+            CheckStatus::Satisfied(
+                if self.projected_graph_nodes.contains(&node)
+                    || self.projected_graph_nodes.contains(&dependency.from)
+                {
+                    CheckEvidence::PredictedEffect
+                } else {
+                    CheckEvidence::ObservedSnapshot
+                },
+            )
+        }
+    }
+
     /// Identifies whether a satisfied fact came from the snapshot or projection.
     fn satisfied_for_node(&self, node: NodeId) -> CheckStatus {
-        let evidence = if self.projected_nodes.contains(&node) {
+        let evidence = if self.projected_graph_nodes.contains(&node) {
             CheckEvidence::PredictedEffect
         } else {
             CheckEvidence::ObservedSnapshot
@@ -245,13 +337,14 @@ impl Projection {
                             size: NodeFacts::default(),
                         },
                     );
-                    self.projected_nodes.push(*id);
+                    self.projected_graph_nodes.push(*id);
                 }
                 GraphEffect::RemoveNode(node) => {
                     if self.graph.remove_node(node).is_none() {
                         return Err(EffectApplicationError::MissingNode(*node));
                     }
-                    self.projected_nodes.retain(|candidate| candidate != node);
+                    self.projected_graph_nodes
+                        .retain(|candidate| candidate != node);
                     self.activations.remove(node);
                     self.block_interfaces.remove(node);
                 }
@@ -395,6 +488,9 @@ impl Projection {
             return Err(EffectApplicationError::WrongNodeKind { node: id, effect });
         }
         self.graph.insert_node(id, node);
+        if !self.projected_graph_nodes.contains(&id) {
+            self.projected_graph_nodes.push(id);
+        }
         Ok(())
     }
 

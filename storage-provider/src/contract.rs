@@ -70,6 +70,20 @@ pub enum ActionPrerequisite {
     },
     /// Every listed node must be distinct.
     DistinctNodes(Vec<NodeId>),
+    /// Every directly backed upper layer must fit within a new capacity.
+    DependentsFitWithin {
+        /// Lower-layer node whose exposed capacity will change.
+        node: NodeId,
+        /// Capacity that remains available after the action.
+        size: Bytes,
+    },
+    /// The direct backing layer must provide at least the requested capacity.
+    BackingSizeAtLeast {
+        /// Upper-layer node whose capacity will change.
+        node: NodeId,
+        /// Capacity required from its direct backing node.
+        size: Bytes,
+    },
     /// A mount target must not already be occupied in the selected context.
     MountTargetAvailable {
         /// Requested target path.
@@ -571,7 +585,13 @@ fn describe_partition(
         PartitionAction::Resize {
             partition,
             new_size,
-        } => resize_contract(*partition, *new_size, NodeKindClass::Partition),
+        } => resize_contract(
+            context,
+            *partition,
+            *new_size,
+            NodeKindClass::Partition,
+            ResizeSafety::DEPENDENTS,
+        ),
         PartitionAction::Delete { partition } => {
             remove_node_contract(context, *partition, NodeKindClass::Partition, true)
         }
@@ -662,7 +682,13 @@ fn describe_luks(action: &LuksAction, context: ActionDescriptionContext<'_>) -> 
             remove_node_contract(context, *mapping, NodeKindClass::DmCryptMapping, true)
         }
         LuksAction::Resize { mapping, new_size } => match new_size {
-            Some(size) => resize_contract(*mapping, *size, NodeKindClass::DmCryptMapping),
+            Some(size) => resize_contract(
+                context,
+                *mapping,
+                *size,
+                NodeKindClass::DmCryptMapping,
+                ResizeSafety::BOTH,
+            ),
             None => {
                 let mut result = contract(RestartPolicy::ReprobeThenRetry);
                 require_kind(&mut result, *mapping, NodeKindClass::DmCryptMapping);
@@ -766,7 +792,13 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
             result
         }
         LvmAction::ResizeLv { lv, new_size } => {
-            let mut result = resize_contract(*lv, *new_size, NodeKindClass::LvmLv);
+            let mut result = resize_contract(
+                context,
+                *lv,
+                *new_size,
+                NodeKindClass::LvmLv,
+                ResizeSafety::DEPENDENTS,
+            );
             write(&mut result, ActionResource::LvmMetadata(*lv));
             result
         }
@@ -810,7 +842,7 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
 /// Describes ordinary filesystem actions.
 fn describe_filesystem(
     action: &FilesystemAction,
-    _context: ActionDescriptionContext<'_>,
+    context: ActionDescriptionContext<'_>,
 ) -> ActionContract {
     match action {
         FilesystemAction::Create {
@@ -840,7 +872,13 @@ fn describe_filesystem(
         FilesystemAction::Resize {
             filesystem,
             new_size,
-        } => resize_contract(*filesystem, *new_size, NodeKindClass::Filesystem),
+        } => resize_contract(
+            context,
+            *filesystem,
+            *new_size,
+            NodeKindClass::Filesystem,
+            ResizeSafety::BACKING,
+        ),
         FilesystemAction::Check { filesystem, .. } => inspection_contract(*filesystem),
         FilesystemAction::Repair { filesystem, .. } => {
             let mut result = contract(RestartPolicy::ManualRecovery);
@@ -1151,12 +1189,26 @@ fn destructive_contract(node: NodeId, restart_policy: RestartPolicy) -> ActionCo
 }
 
 /// Builds a contract for a predictable size change.
-fn resize_contract(node: NodeId, size: Bytes, expected: NodeKindClass) -> ActionContract {
+fn resize_contract(
+    context: ActionDescriptionContext<'_>,
+    node: NodeId,
+    size: Bytes,
+    expected: NodeKindClass,
+    safety: ResizeSafety,
+) -> ActionContract {
     let mut result = contract(RestartPolicy::ReprobeThenRetry);
     require_kind(&mut result, node, expected);
-    result
-        .prerequisites
-        .push(ActionPrerequisite::NoUnexpectedConsumers(node));
+    let current_size = known_size(context.graph, node);
+    if safety.dependents && current_size.is_none_or(|current| current > size) {
+        result
+            .prerequisites
+            .push(ActionPrerequisite::DependentsFitWithin { node, size });
+    }
+    if safety.backing && current_size.is_none_or(|current| current < size) {
+        result
+            .prerequisites
+            .push(ActionPrerequisite::BackingSizeAtLeast { node, size });
+    }
     write(&mut result, ActionResource::Node(node));
     result
         .predicted_effect
@@ -1167,6 +1219,33 @@ fn resize_contract(node: NodeId, size: Bytes, expected: NodeKindClass) -> Action
         .postconditions
         .push(Postcondition::NodeSize { node, size });
     result
+}
+
+/// Capacity relationships that must hold around one resize action.
+#[derive(Debug, Clone, Copy)]
+struct ResizeSafety {
+    dependents: bool,
+    backing: bool,
+}
+
+impl ResizeSafety {
+    /// Checks only upper layers that consume this node.
+    const DEPENDENTS: Self = Self {
+        dependents: true,
+        backing: false,
+    };
+
+    /// Checks only the lower layer that backs this node.
+    const BACKING: Self = Self {
+        dependents: false,
+        backing: true,
+    };
+
+    /// Checks capacity on both sides of this node.
+    const BOTH: Self = Self {
+        dependents: true,
+        backing: true,
+    };
 }
 
 /// Builds a contract for removing a graph node.
