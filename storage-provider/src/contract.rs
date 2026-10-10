@@ -116,6 +116,13 @@ pub enum ActionOutput {
         /// Predictable node specification; backend-generated facts are absent.
         spec: NodeSpec,
     },
+    /// Runtime block interface made available for dependent actions.
+    BlockInterface {
+        /// Node exposing the interface.
+        node: NodeId,
+        /// Access mode guaranteed after successful verification.
+        access: BlockInterfaceAccess,
+    },
     /// Runtime mount made available in one namespace.
     Mount {
         /// Mounted source.
@@ -127,6 +134,16 @@ pub enum ActionOutput {
     },
     /// Persistent mount configuration made available to the target system.
     PersistentMount(MountEntry),
+}
+
+/// Access mode guaranteed by a projected runtime block interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockInterfaceAccess {
+    /// Consumers may inspect but must not modify the endpoint.
+    ReadOnly,
+    /// Consumers may read and write the endpoint.
+    ReadWrite,
 }
 
 /// One resource touched by an action.
@@ -433,7 +450,9 @@ pub fn describe_action(
         ProviderAction::Btrfs(action) => describe_btrfs(action, context),
         ProviderAction::Mount(action) => describe_mount(action),
     };
-    contract.provided_outputs = outputs_from_effect(&contract.predicted_effect);
+    let mut outputs = outputs_from_effect(&contract.predicted_effect);
+    outputs.append(&mut contract.provided_outputs);
+    contract.provided_outputs = outputs;
     add_output_resources(&mut contract);
     contract
 }
@@ -610,6 +629,7 @@ fn describe_luks(action: &LuksAction, context: ActionDescriptionContext<'_>) -> 
             container,
             planned_node_id,
             mapping_name,
+            read_only,
             ..
         } => {
             let mut result = contract(RestartPolicy::ReprobeThenRetry);
@@ -627,6 +647,14 @@ fn describe_luks(action: &LuksAction, context: ActionDescriptionContext<'_>) -> 
                 kind: DependencyKind::Backs,
             };
             insert_node_with_dependency(&mut result, *planned_node_id, spec, dependency);
+            result.provided_outputs.push(ActionOutput::BlockInterface {
+                node: *planned_node_id,
+                access: if *read_only {
+                    BlockInterfaceAccess::ReadOnly
+                } else {
+                    BlockInterfaceAccess::ReadWrite
+                },
+            });
             invalidate(&mut result, *container, FactKind::Topology);
             result
         }
@@ -763,6 +791,17 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
                 node: *target,
                 active: *active,
             });
+            if *active
+                && context
+                    .graph
+                    .node(target)
+                    .is_some_and(|node| matches!(node.kind.kind, NodeKind::LvmLv(_)))
+            {
+                result.provided_outputs.push(ActionOutput::BlockInterface {
+                    node: *target,
+                    access: BlockInterfaceAccess::ReadWrite,
+                });
+            }
             result
         }
     }
@@ -1337,7 +1376,9 @@ fn add_output_resources(contract: &mut ActionContract) {
         .provided_outputs
         .iter()
         .filter_map(|output| match output {
-            ActionOutput::Node { id, .. } => Some(*id),
+            ActionOutput::Node { id, .. } | ActionOutput::BlockInterface { node: id, .. } => {
+                Some(*id)
+            }
             ActionOutput::Mount { .. } | ActionOutput::PersistentMount(_) => None,
         })
         .collect::<Vec<_>>();
@@ -1354,7 +1395,7 @@ fn add_output_resources(contract: &mut ActionContract) {
 
 #[cfg(test)]
 mod tests {
-    use storage_core::model::{Node, NodeFacts, Presence};
+    use storage_core::model::{LuksVersion, LvmLv, LvmLvKind, Node, NodeFacts, Presence};
 
     use super::*;
 
@@ -1462,5 +1503,78 @@ mod tests {
         let trusted = verify_imported_contract(&action, imported.clone(), context)
             .unwrap_or_else(|error| panic!("verify matching contract: {error}"));
         assert_eq!(trusted, imported);
+    }
+
+    /// LUKS open exposes its requested access mode to dependent actions.
+    #[test]
+    fn luks_open_contract_reports_read_only_interface() {
+        let container = NodeId::new();
+        let mapping = NodeId::new();
+        let mut graph = NodeGraph::new();
+        graph.insert_node(
+            container,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LuksContainer {
+                        version: LuksVersion::Luks2,
+                    },
+                    size: Some(Bytes::new(1_000_000)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let action = ProviderAction::Luks(LuksAction::Open {
+            container,
+            planned_node_id: mapping,
+            mapping_name: "secure".to_owned(),
+            credential: crate::CredentialRef::from_uuid(uuid::Uuid::nil()),
+            read_only: true,
+        });
+
+        let contract = describe_action(&action, ActionDescriptionContext { graph: &graph });
+
+        assert!(
+            contract
+                .provided_outputs
+                .contains(&ActionOutput::BlockInterface {
+                    node: mapping,
+                    access: BlockInterfaceAccess::ReadOnly,
+                })
+        );
+    }
+
+    /// Activating an LV provides a writable interface without changing its spec.
+    #[test]
+    fn lvm_activation_contract_reports_writable_interface() {
+        let lv = NodeId::new();
+        let mut graph = NodeGraph::new();
+        graph.insert_node(
+            lv,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmLv(LvmLv {
+                        name: "data".to_owned(),
+                        kind: LvmLvKind::Linear,
+                    }),
+                    size: Some(Bytes::new(1_000_000)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let action = ProviderAction::Lvm(LvmAction::SetActivation {
+            target: lv,
+            active: true,
+        });
+
+        let contract = describe_action(&action, ActionDescriptionContext { graph: &graph });
+
+        assert!(
+            contract
+                .provided_outputs
+                .contains(&ActionOutput::BlockInterface {
+                    node: lv,
+                    access: BlockInterfaceAccess::ReadWrite,
+                })
+        );
     }
 }

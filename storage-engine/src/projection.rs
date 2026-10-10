@@ -10,8 +10,9 @@ use storage_core::model::{
     NodeKind, ObservedMount,
 };
 use storage_provider::{
-    ActionContract, ActionDescriptionContext, ActionPrerequisite, GraphEffect, MountEffect,
-    NodeKindClass, PredictedEffect, ProviderAction, describe_action,
+    ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite,
+    BlockInterfaceAccess, GraphEffect, MountEffect, NodeKindClass, PredictedEffect, ProviderAction,
+    describe_action,
 };
 use thiserror::Error;
 
@@ -22,6 +23,7 @@ pub struct Projection {
     runtime_mounts: Vec<ObservedMount>,
     persistent_mounts: Vec<MountEntry>,
     activations: HashMap<NodeId, bool>,
+    block_interfaces: HashMap<NodeId, BlockInterfaceAccess>,
     projected_nodes: Vec<NodeId>,
 }
 
@@ -33,6 +35,7 @@ impl Projection {
             runtime_mounts: current.mounts.entries.clone(),
             persistent_mounts: Vec::new(),
             activations: HashMap::new(),
+            block_interfaces: HashMap::new(),
             projected_nodes: Vec::new(),
         }
     }
@@ -58,6 +61,11 @@ impl Projection {
     /// Returns a simulated activation request for a node, when one was applied.
     pub fn activation(&self, node: &NodeId) -> Option<bool> {
         self.activations.get(node).copied()
+    }
+
+    /// Returns a block interface guaranteed by a simulated predecessor.
+    pub fn block_interface(&self, node: &NodeId) -> Option<BlockInterfaceAccess> {
+        self.block_interfaces.get(node).copied()
     }
 
     /// Evaluates action prerequisites against the current read-only projection.
@@ -92,6 +100,7 @@ impl Projection {
             return Err(ActionSimulationError::PrerequisitesViolated { checks });
         }
         self.apply_effect(&contract.predicted_effect)?;
+        self.apply_outputs(&contract.provided_outputs);
         Ok(SimulatedAction { contract, checks })
     }
 
@@ -181,6 +190,17 @@ impl Projection {
                 reason: "referenced node is absent".to_owned(),
             };
         };
+        match self.block_interfaces.get(&node) {
+            Some(BlockInterfaceAccess::ReadWrite) => {
+                return CheckStatus::Satisfied(CheckEvidence::PredictedEffect);
+            }
+            Some(BlockInterfaceAccess::ReadOnly) => {
+                return CheckStatus::Violated {
+                    reason: "projected block interface is read-only".to_owned(),
+                };
+            }
+            None => {}
+        }
         match node_value
             .size
             .block
@@ -233,6 +253,7 @@ impl Projection {
                     }
                     self.projected_nodes.retain(|candidate| candidate != node);
                     self.activations.remove(node);
+                    self.block_interfaces.remove(node);
                 }
                 GraphEffect::SetNodeSize { node, size } => {
                     self.update_node(*node, "set node size", |value| {
@@ -349,6 +370,15 @@ impl Projection {
             }
         }
         Ok(())
+    }
+
+    /// Records runtime guarantees exported by a successfully projected action.
+    fn apply_outputs(&mut self, outputs: &[ActionOutput]) {
+        for output in outputs {
+            if let ActionOutput::BlockInterface { node, access } = output {
+                self.block_interfaces.insert(*node, *access);
+            }
+        }
     }
 
     /// Replaces one node only after a type-specific update succeeds.
@@ -537,8 +567,8 @@ fn matches_kind(kind: &NodeKind, expected: NodeKindClass) -> bool {
 #[cfg(test)]
 mod tests {
     use storage_core::model::{
-        Bytes, Diagnostic, Environment, FilesystemKind, MountSource, MountState, NodeSpec,
-        SystemEnvironment,
+        Bytes, Diagnostic, Environment, FilesystemKind, LvmLv, LvmLvKind, MountSource, MountState,
+        NodeSpec, SystemEnvironment,
     };
     use storage_provider::{FilesystemAction, LvmAction, ProviderAction};
 
@@ -693,5 +723,65 @@ mod tests {
             Err(ActionSimulationError::PrerequisitesViolated { .. })
         ));
         assert_eq!(projection, original);
+    }
+
+    /// A verified activation guarantee satisfies a later writable requirement.
+    #[test]
+    fn activation_provides_projected_writable_evidence() {
+        let (mut current, _) = current_with_disk();
+        let lv = NodeId::new();
+        current.graph.insert_node(
+            lv,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmLv(LvmLv {
+                        name: "data".to_owned(),
+                        kind: LvmLvKind::Linear,
+                    }),
+                    size: Some(Bytes::new(1024)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let action = ProviderAction::Lvm(LvmAction::SetActivation {
+            target: lv,
+            active: true,
+        });
+        let mut projection = Projection::from_current(&current);
+
+        projection
+            .simulate_action(&action)
+            .unwrap_or_else(|error| panic!("simulate LV activation: {error}"));
+        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::Writable(lv)]);
+
+        assert_eq!(
+            checks[0].status,
+            CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
+        );
+        assert_eq!(
+            projection.block_interface(&lv),
+            Some(BlockInterfaceAccess::ReadWrite)
+        );
+    }
+
+    /// A projected read-only interface is a known writable violation.
+    #[test]
+    fn read_only_output_rejects_writable_requirement() {
+        let (current, disk) = current_with_disk();
+        let mut projection = Projection::from_current(&current);
+        projection.apply_outputs(&[ActionOutput::BlockInterface {
+            node: disk,
+            access: BlockInterfaceAccess::ReadOnly,
+        }]);
+
+        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::Writable(disk)]);
+
+        assert!(matches!(
+            checks.as_slice(),
+            [PrerequisiteCheck {
+                status: CheckStatus::Violated { .. },
+                ..
+            }]
+        ));
     }
 }

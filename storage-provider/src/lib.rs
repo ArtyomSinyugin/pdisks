@@ -29,9 +29,9 @@ pub use action::{
 };
 pub use contract::{
     ActionContract, ActionContractMismatch, ActionDescriptionContext, ActionOutput,
-    ActionPrerequisite, ActionResource, FactInvalidation, FactKind, FactScope, GraphEffect,
-    MountEffect, NodeKindClass, Postcondition, PredictedEffect, ResourceAccess, ResourceAccessMode,
-    RestartPolicy, describe_action, verify_imported_contract,
+    ActionPrerequisite, ActionResource, BlockInterfaceAccess, FactInvalidation, FactKind,
+    FactScope, GraphEffect, MountEffect, NodeKindClass, Postcondition, PredictedEffect,
+    ResourceAccess, ResourceAccessMode, RestartPolicy, describe_action, verify_imported_contract,
 };
 pub use logical::{LogicalProvider, ProviderId};
 pub use luks::{
