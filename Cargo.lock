@@ -558,6 +558,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "storage-engine"
+version = "0.1.0"
+dependencies = [
+ "storage-core",
+ "storage-provider",
+ "thiserror",
+]
+
+[[package]]
 name = "storage-probe"
 version = "0.1.0"
 dependencies = [
