@@ -21,6 +21,7 @@ mod contract;
 mod dylib;
 mod logical;
 mod luks;
+mod planning;
 mod transport;
 
 pub use action::{
@@ -36,6 +37,10 @@ pub use logical::{LogicalProvider, ProviderId};
 pub use luks::{
     CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProbeFailure,
     LuksProbeReport, LuksProvider, LuksValidationError,
+};
+pub use planning::{
+    DependencyReason, ExternalRequirement, FragmentAction, FragmentDependency, FragmentOrigin,
+    LocalActionId, PlanFragment,
 };
 pub use transport::{
     PROVIDER_PROTOCOL_VERSION, ProviderBinding, ProviderConnection, ProviderConnectionKind,
