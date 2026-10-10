@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use storage_core::model::{CurrentState, DiagnosticSeverity, MountSource, NodeId};
+use storage_core::model::{
+    CurrentState, DesiredState, DiagnosticSeverity, MountSource, NodeId, OperationIntent,
+};
 use storage_provider::{
     ActionContract, ActionOutput, ActionPrerequisite, ActionResource, BlockInterfaceAccess,
     BtrfsAction, DependencyReason, FilesystemAction, FragmentOrigin, LocalActionId, LuksAction,
@@ -45,6 +47,26 @@ pub fn compose_plan(
     fragments: Vec<PlanFragment>,
 ) -> Result<ExecutionPlan, CompositionError> {
     compose_plan_with_evidence(current, fragments, &[])
+}
+
+/// Builds a plan and proves coverage of every explicit goal intent.
+pub fn compose_plan_for_goal(
+    current: &CurrentState,
+    goal: &DesiredState,
+    fragments: Vec<PlanFragment>,
+) -> Result<ExecutionPlan, CompositionError> {
+    compose_plan_for_goal_with_evidence(current, goal, fragments, &[])
+}
+
+/// Builds a goal-covering plan using provider capacity evidence for the baseline.
+pub fn compose_plan_for_goal_with_evidence(
+    current: &CurrentState,
+    goal: &DesiredState,
+    fragments: Vec<PlanFragment>,
+    capacity_evidence: &[CapacityEvidence],
+) -> Result<ExecutionPlan, CompositionError> {
+    validate_intent_coverage(&goal.intents, &fragments)?;
+    compose_plan_with_evidence(current, fragments, capacity_evidence)
 }
 
 /// Builds one immutable plan using provider capacity evidence for the baseline.
@@ -166,6 +188,93 @@ fn flatten_fragments(fragments: &[PlanFragment]) -> Result<FlattenedFragments, C
         dependencies,
         requirements,
     })
+}
+
+/// Ensures each explicit intent owns actions that implement its typed operation.
+fn validate_intent_coverage(
+    intents: &[OperationIntent],
+    fragments: &[PlanFragment],
+) -> Result<(), CompositionError> {
+    for (fragment_index, fragment) in fragments.iter().enumerate() {
+        if let FragmentOrigin::Intent { index } = fragment.origin
+            && index >= intents.len()
+        {
+            return Err(CompositionError::UnknownIntentOrigin {
+                fragment: FragmentId::new(
+                    u32::try_from(fragment_index).map_err(|_| CompositionError::PlanTooLarge)?,
+                ),
+                index,
+            });
+        }
+    }
+    for (index, intent) in intents.iter().enumerate() {
+        if !intent_is_covered(index, intent, fragments) {
+            return Err(CompositionError::UncoveredIntent { index });
+        }
+    }
+    Ok(())
+}
+
+/// Reports whether matching-origin actions completely implement one supported intent.
+fn intent_is_covered(index: usize, intent: &OperationIntent, fragments: &[PlanFragment]) -> bool {
+    let actions = fragments
+        .iter()
+        .filter(|fragment| fragment.origin == FragmentOrigin::Intent { index })
+        .flat_map(|fragment| fragment.actions.iter().map(|action| &action.operation))
+        .collect::<Vec<_>>();
+    match intent {
+        OperationIntent::Check { target, force } => actions.iter().any(|action| {
+            matches!(
+                action,
+                ProviderAction::Filesystem(FilesystemAction::Check { filesystem, force: action_force })
+                    if filesystem == target && action_force == force
+            )
+        }),
+        OperationIntent::Repair { target, force } => actions.iter().any(|action| {
+            matches!(
+                action,
+                ProviderAction::Filesystem(FilesystemAction::Repair { filesystem, force: action_force })
+                    if filesystem == target && action_force == force
+            )
+        }),
+        OperationIntent::ConvertBtrfsProfiles { filesystem, target } => {
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    ProviderAction::Btrfs(BtrfsAction::ConvertProfiles {
+                        filesystem: action_filesystem,
+                        target: action_target,
+                    }) if action_filesystem == filesystem && action_target == target
+                )
+            })
+        }
+        OperationIntent::SetActivation { target, active } => actions.iter().any(|action| {
+            matches!(
+                action,
+                ProviderAction::Lvm(LvmAction::SetActivation { target: action_target, active: action_active })
+                    if action_target == target && action_active == active
+            )
+        }),
+        OperationIntent::ReplaceMember { group, old, new } => {
+            let removes_old = actions.iter().any(|action| {
+                matches!(
+                    action,
+                    ProviderAction::Btrfs(BtrfsAction::RemoveDevice { filesystem, device })
+                        if filesystem == group && device == old
+                )
+            });
+            let adds_new = actions.iter().any(|action| {
+                matches!(
+                    action,
+                    ProviderAction::Btrfs(BtrfsAction::AddDevice { filesystem, device })
+                        if filesystem == group && device == new
+                )
+            });
+            removes_old && adds_new
+        }
+        // shortcut: reformat needs explicit replacement semantics before Create can prove coverage.
+        OperationIntent::Reformat { .. } => false,
+    }
 }
 
 /// Adds creation-order edges and rejects ambiguous planned identities.
@@ -675,6 +784,20 @@ pub enum CompositionError {
         /// Shared resource that requires serialization.
         resource: ActionResource,
     },
+    /// A fragment claims an intent index absent from the requested goal.
+    #[error("fragment {fragment:?} references unknown intent {index}")]
+    UnknownIntentOrigin {
+        /// Fragment containing the invalid origin.
+        fragment: FragmentId,
+        /// Out-of-range intent index.
+        index: usize,
+    },
+    /// No matching typed actions cover one explicit requested intent.
+    #[error("requested intent {index} is not covered by plan actions")]
+    UncoveredIntent {
+        /// Index in `DesiredState::intents`.
+        index: usize,
+    },
 }
 
 #[cfg(test)]
@@ -682,8 +805,8 @@ mod tests {
     use std::path::PathBuf;
 
     use storage_core::model::{
-        Bytes, Dependency, DependencyKind, Diagnostic, Environment, FilesystemKind, LvmLv,
-        LvmLvKind, MountContext, MountState, Node, NodeFacts, NodeKind, NodeSpec,
+        BootSpec, Bytes, Dependency, DependencyKind, Diagnostic, Environment, FilesystemKind,
+        LvmLv, LvmLvKind, MountContext, MountSpec, MountState, Node, NodeFacts, NodeKind, NodeSpec,
         SystemEnvironment,
     };
     use storage_provider::{
@@ -1111,5 +1234,57 @@ mod tests {
             reason: DependencyReason::ResourceCoordination,
         });
         assert!(compose_plan(&current, vec![fragment]).is_ok());
+    }
+
+    /// Explicit checks remain in the plan despite having no graph effect.
+    #[test]
+    fn explicit_check_intent_requires_and_retains_matching_action() {
+        let (current, _lv, filesystem) = current_with_lv_and_filesystem();
+        let goal = DesiredState {
+            graph: current.graph.clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: vec![OperationIntent::Check {
+                target: filesystem,
+                force: true,
+            }],
+        };
+        assert_eq!(
+            compose_plan_for_goal(&current, &goal, Vec::new()),
+            Err(CompositionError::UncoveredIntent { index: 0 })
+        );
+        let mut fragment = PlanFragment {
+            actions: vec![FragmentAction {
+                id: LocalActionId::new(0),
+                operation: ProviderAction::Filesystem(FilesystemAction::Check {
+                    filesystem,
+                    force: false,
+                }),
+            }],
+            dependencies: Vec::new(),
+            external_requirements: Vec::new(),
+            origin: FragmentOrigin::Intent { index: 0 },
+            diagnostics: Vec::new(),
+        };
+        assert_eq!(
+            compose_plan_for_goal(&current, &goal, vec![fragment.clone()]),
+            Err(CompositionError::UncoveredIntent { index: 0 })
+        );
+        fragment.actions[0].operation = ProviderAction::Filesystem(FilesystemAction::Check {
+            filesystem,
+            force: true,
+        });
+
+        let plan = compose_plan_for_goal(&current, &goal, vec![fragment])
+            .unwrap_or_else(|error| panic!("compose explicit check: {error}"));
+
+        assert_eq!(plan.actions().len(), 1);
+        assert!(
+            plan.actions()[0]
+                .informational_contract
+                .predicted_effect
+                .graph
+                .is_empty()
+        );
     }
 }
