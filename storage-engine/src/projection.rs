@@ -230,6 +230,12 @@ impl Projection {
                 reason: "referenced node is absent".to_owned(),
             };
         };
+        // An explicit deactivation supersedes endpoint observations from the baseline.
+        if self.activations.get(&node) == Some(&false) {
+            return CheckStatus::Violated {
+                reason: "projected block endpoint is inactive".to_owned(),
+            };
+        }
         match self.block_interfaces.get(&node) {
             Some(BlockInterfaceAccess::ReadWrite) => {
                 return CheckStatus::Satisfied(CheckEvidence::PredictedEffect);
@@ -478,6 +484,9 @@ impl Projection {
                         return Err(EffectApplicationError::MissingNode(*node));
                     }
                     self.activations.insert(*node, *active);
+                    if !active {
+                        self.block_interfaces.remove(node);
+                    }
                 }
             }
         }
@@ -986,6 +995,75 @@ mod tests {
             projection.block_interface(&lv),
             Some(BlockInterfaceAccess::ReadWrite)
         );
+    }
+
+    /// Deactivation revokes both predicted and previously observed write access.
+    #[test]
+    fn deactivation_blocks_filesystem_create_until_reactivated() {
+        let (mut current, _) = current_with_disk();
+        let lv = NodeId::new();
+        current.graph.insert_node(
+            lv,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmLv(LvmLv {
+                        name: "data".to_owned(),
+                        kind: LvmLvKind::Linear,
+                    }),
+                    size: Some(Bytes::new(1024)),
+                },
+                size: NodeFacts {
+                    block: Some(storage_core::model::BlockFacts {
+                        paths: vec![PathBuf::from("/dev/mapper/data")],
+                        devno: storage_core::model::DeviceNumber {
+                            major: 253,
+                            minor: 0,
+                        },
+                        geometry: None,
+                        read_only: Some(false),
+                    }),
+                    ..NodeFacts::default()
+                },
+            },
+        );
+        let baseline = current.clone();
+        let mut projection = Projection::from_current(&current);
+        for active in [true, false] {
+            projection
+                .simulate_action(&ProviderAction::Lvm(LvmAction::SetActivation {
+                    target: lv,
+                    active,
+                }))
+                .unwrap_or_else(|error| panic!("simulate LV activation {active}: {error}"));
+        }
+        assert_eq!(projection.activation(&lv), Some(false));
+        assert_eq!(projection.block_interface(&lv), None);
+        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::Writable(lv)]);
+        assert!(matches!(checks[0].status, CheckStatus::Violated { .. }));
+
+        let create = ProviderAction::Filesystem(FilesystemAction::Create {
+            backing: lv,
+            planned_node_id: NodeId::new(),
+            filesystem: FilesystemKind::Ext4,
+            label: None,
+        });
+        let before_create = projection.clone();
+        assert!(matches!(
+            projection.simulate_action(&create),
+            Err(ActionSimulationError::PrerequisitesViolated { .. })
+        ));
+        assert_eq!(projection, before_create);
+
+        projection
+            .simulate_action(&ProviderAction::Lvm(LvmAction::SetActivation {
+                target: lv,
+                active: true,
+            }))
+            .unwrap_or_else(|error| panic!("simulate LV reactivation: {error}"));
+        projection.simulate_action(&create).unwrap_or_else(|error| {
+            panic!("simulate filesystem create after reactivation: {error}")
+        });
+        assert_eq!(current, baseline);
     }
 
     /// A projected read-only interface is a known writable violation.
