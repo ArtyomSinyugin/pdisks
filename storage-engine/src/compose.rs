@@ -1,9 +1,12 @@
 //! Composition of provider fragments into one validated action DAG.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use storage_core::model::{
-    CurrentState, DesiredState, Diagnostic, DiagnosticSeverity, MountSource, NodeId,
+    CurrentState, DesiredState, Diagnostic, DiagnosticSeverity, MountContext, MountSource, NodeId,
     OperationIntent,
 };
 use storage_provider::{
@@ -92,6 +95,7 @@ pub fn compose_plan_with_evidence(
         requirements,
     } = flatten_fragments(&fragments)?;
     bind_planned_nodes(current, &draft, &mut dependencies)?;
+    bind_mount_order(&draft, &mut dependencies)?;
 
     let first_order = topological_order(draft.len(), &dependencies)?;
     let first_contracts = simulate_order(current, capacity_evidence, &draft, &first_order)?;
@@ -332,6 +336,58 @@ fn bind_planned_nodes(
     Ok(())
 }
 
+/// Adds child-removal and parent-preparation edges before the first simulation trace.
+fn bind_mount_order(
+    actions: &[DraftAction],
+    dependencies: &mut Vec<ActionDependency>,
+) -> Result<(), CompositionError> {
+    for parent in actions {
+        let Some((parent_target, parent_context)) = runtime_mount_target(&parent.operation) else {
+            continue;
+        };
+        for child in actions {
+            let Some((child_target, child_context)) = runtime_mount_target(&child.operation) else {
+                continue;
+            };
+            if parent_context != child_context
+                || parent_target == child_target
+                || !child_target.starts_with(parent_target)
+            {
+                continue;
+            }
+            // Explicit recipes can contain repeated mount/unmount phases; replay validates them.
+            if dependency_path(parent.id, child.id, dependencies)
+                || dependency_path(child.id, parent.id, dependencies)
+            {
+                continue;
+            }
+            let (before, after) = if matches!(
+                child.operation,
+                ProviderAction::Mount(MountAction::Unmount { .. })
+            ) {
+                (child.id, parent.id)
+            } else {
+                (parent.id, child.id)
+            };
+            add_dependency(dependencies, before, after, DependencyReason::MountOrder)?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns namespace-qualified targets only for runtime mount changes.
+fn runtime_mount_target(action: &ProviderAction) -> Option<(&Path, &MountContext)> {
+    match action {
+        ProviderAction::Mount(
+            MountAction::Mount {
+                target, context, ..
+            }
+            | MountAction::Unmount { target, context },
+        ) => Some((target, context)),
+        _ => None,
+    }
+}
+
 /// Resolves cross-fragment conditions from baseline evidence or action outputs.
 fn resolve_requirements(
     current: &CurrentState,
@@ -351,6 +407,16 @@ fn resolve_requirements(
                 requirement.action,
             ))?;
         if matches!(baseline_check.status, crate::CheckStatus::Satisfied(_)) {
+            continue;
+        }
+        // Structural mount edges precede the trace; this condition has no unknown outcome.
+        if matches!(
+            requirement.prerequisite,
+            ActionPrerequisite::MountDescendantsAbsent { .. }
+        ) && contracts
+            .get(&requirement.action)
+            .is_some_and(|contract| contract.prerequisites.contains(&requirement.prerequisite))
+        {
             continue;
         }
         if requirement_can_be_checked_live(&requirement.prerequisite, current) {
@@ -694,6 +760,7 @@ fn requirement_can_be_checked_live(
         | ActionPrerequisite::BackingSizeAtLeast { .. }
         | ActionPrerequisite::CapacityAvailable { .. }
         | ActionPrerequisite::MountTargetAvailable { .. } => false,
+        ActionPrerequisite::MountDescendantsAbsent { .. } => false,
         ActionPrerequisite::FilesystemUnmounted(_)
         | ActionPrerequisite::FilesystemCheckPassed(_) => false,
     }
@@ -919,6 +986,260 @@ mod tests {
                 assert_eq!(simulation.steps.len(), 3);
             }
             assert_eq!(current, baseline);
+        }
+    }
+
+    /// Wraps runtime actions with stable local identities for mount-order scenarios.
+    fn mount_fragment(subject: NodeId, operations: Vec<MountAction>) -> PlanFragment {
+        PlanFragment {
+            actions: operations
+                .into_iter()
+                .zip(0_u32..)
+                .map(|(operation, id)| FragmentAction {
+                    id: LocalActionId::new(id),
+                    operation: ProviderAction::Mount(operation),
+                })
+                .collect(),
+            dependencies: Vec::new(),
+            external_requirements: Vec::new(),
+            origin: origin(subject, "runtime mount changes"),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Nested actions are ordered before simulation, including requirements satisfied by removal.
+    #[test]
+    fn composes_nested_mounts_and_unmounts_in_semantic_order() {
+        for unmount in [false, true] {
+            let (mut current, subject) = current_with_vg();
+            if unmount {
+                current.mounts.entries = ["/data", "/data/child"]
+                    .into_iter()
+                    .map(|target| storage_core::model::ObservedMount {
+                        source: MountSource::Tmpfs,
+                        target: PathBuf::from(target),
+                        options: Vec::new(),
+                        context: MountContext::Host,
+                    })
+                    .collect();
+            }
+            let baseline = current.clone();
+            let targets = if unmount {
+                ["/data", "/data/child"]
+            } else {
+                ["/data/child", "/data"]
+            };
+            let mut fragment = mount_fragment(
+                subject,
+                targets
+                    .into_iter()
+                    .map(|target| {
+                        if unmount {
+                            MountAction::Unmount {
+                                target: PathBuf::from(target),
+                                context: MountContext::Host,
+                            }
+                        } else {
+                            MountAction::Mount {
+                                source: MountSource::Tmpfs,
+                                target: PathBuf::from(target),
+                                options: Vec::new(),
+                                context: MountContext::Host,
+                            }
+                        }
+                    })
+                    .collect(),
+            );
+            fragment.external_requirements.push(ExternalRequirement {
+                action: LocalActionId::new(if unmount { 0 } else { 1 }),
+                prerequisite: ActionPrerequisite::MountDescendantsAbsent {
+                    target: PathBuf::from("/data"),
+                    context: MountContext::Host,
+                },
+            });
+            let plan = compose_plan(&current, vec![fragment.clone()])
+                .unwrap_or_else(|error| panic!("compose nested mount changes: {error}"));
+            let ordered = plan
+                .ordered_actions()
+                .iter()
+                .map(|action| action.local_id.get())
+                .collect::<Vec<_>>();
+            assert_eq!(ordered, vec![1, 0]);
+            assert!(
+                plan.dependencies()
+                    .iter()
+                    .any(|dependency| dependency.reason == DependencyReason::MountOrder)
+            );
+            let simulation = crate::simulate_plan(&current, &plan)
+                .unwrap_or_else(|error| panic!("replay nested mount changes: {error}"));
+            assert_eq!(
+                simulation.projection.runtime_mounts().len(),
+                if unmount { 0 } else { 2 }
+            );
+            fragment.dependencies.push(FragmentDependency {
+                before: LocalActionId::new(0),
+                after: LocalActionId::new(1),
+                reason: DependencyReason::RequestedOrder,
+            });
+            assert!(matches!(
+                compose_plan(&current, vec![fragment]),
+                Err(CompositionError::ActionRejected(_))
+            ));
+            assert_eq!(current, baseline);
+        }
+    }
+
+    /// Mixed mount/unmount changes prepare the parent before introducing its new descendants.
+    #[test]
+    fn orders_mixed_parent_and_child_mount_changes() {
+        for mount_parent in [false, true] {
+            let (mut current, subject) = current_with_vg();
+            current
+                .mounts
+                .entries
+                .push(storage_core::model::ObservedMount {
+                    source: MountSource::Tmpfs,
+                    target: PathBuf::from(if mount_parent { "/data/child" } else { "/data" }),
+                    options: Vec::new(),
+                    context: MountContext::Host,
+                });
+            let parent = if mount_parent {
+                MountAction::Mount {
+                    source: MountSource::Tmpfs,
+                    target: PathBuf::from("/data"),
+                    options: Vec::new(),
+                    context: MountContext::Host,
+                }
+            } else {
+                MountAction::Unmount {
+                    target: PathBuf::from("/data"),
+                    context: MountContext::Host,
+                }
+            };
+            let child = if mount_parent {
+                MountAction::Unmount {
+                    target: PathBuf::from("/data/child"),
+                    context: MountContext::Host,
+                }
+            } else {
+                MountAction::Mount {
+                    source: MountSource::Tmpfs,
+                    target: PathBuf::from("/data/child"),
+                    options: Vec::new(),
+                    context: MountContext::Host,
+                }
+            };
+            let plan = compose_plan(&current, vec![mount_fragment(subject, vec![parent, child])])
+                .unwrap_or_else(|error| panic!("compose mixed mount changes: {error}"));
+            let ordered = plan
+                .ordered_actions()
+                .iter()
+                .map(|action| action.local_id.get())
+                .collect::<Vec<_>>();
+            assert_eq!(ordered, if mount_parent { vec![1, 0] } else { vec![0, 1] });
+            let simulation = crate::simulate_plan(&current, &plan)
+                .unwrap_or_else(|error| panic!("replay mixed mount changes: {error}"));
+            assert_eq!(simulation.projection.runtime_mounts().len(), 1);
+        }
+    }
+
+    /// Explicit multi-phase recipes retain their valid order rather than acquiring false cycles.
+    #[test]
+    fn explicit_nested_mount_cycles_remain_valid() {
+        let (current, subject) = current_with_vg();
+        let mut operations = vec![
+            MountAction::Mount {
+                source: MountSource::Tmpfs,
+                target: PathBuf::from("/data"),
+                options: Vec::new(),
+                context: MountContext::Host,
+            },
+            MountAction::Mount {
+                source: MountSource::Tmpfs,
+                target: PathBuf::from("/data/child"),
+                options: Vec::new(),
+                context: MountContext::Host,
+            },
+            MountAction::Unmount {
+                target: PathBuf::from("/data/child"),
+                context: MountContext::Host,
+            },
+            MountAction::Unmount {
+                target: PathBuf::from("/data"),
+                context: MountContext::Host,
+            },
+        ];
+        operations.extend(operations[..2].to_vec());
+        let mut fragment = mount_fragment(subject, operations);
+        fragment.dependencies = (0..5)
+            .map(|before| FragmentDependency {
+                before: LocalActionId::new(before),
+                after: LocalActionId::new(before + 1),
+                reason: DependencyReason::RequestedOrder,
+            })
+            .collect();
+        let plan = compose_plan(&current, vec![fragment])
+            .unwrap_or_else(|error| panic!("compose repeated mount phases: {error}"));
+        let simulation = crate::simulate_plan(&current, &plan)
+            .unwrap_or_else(|error| panic!("replay repeated mount phases: {error}"));
+        assert_eq!(simulation.steps.len(), 6);
+        assert_eq!(simulation.projection.runtime_mounts().len(), 2);
+    }
+
+    /// Lexical siblings and different namespaces do not acquire false parent/child edges.
+    #[test]
+    fn mount_order_respects_path_components_and_contexts() {
+        let (current, subject) = current_with_vg();
+        for (child_path, parent_context, child_context) in [
+            ("/data2/child", MountContext::Host, MountContext::Host),
+            (
+                "/data/child",
+                MountContext::Host,
+                MountContext::Namespace("installer".to_owned()),
+            ),
+            (
+                "/data/child",
+                MountContext::TargetRoot(PathBuf::from("/target-a")),
+                MountContext::TargetRoot(PathBuf::from("/target-b")),
+            ),
+        ] {
+            let mut fragment = mount_fragment(
+                subject,
+                vec![
+                    MountAction::Mount {
+                        source: MountSource::Tmpfs,
+                        target: PathBuf::from(child_path),
+                        options: Vec::new(),
+                        context: child_context,
+                    },
+                    MountAction::Mount {
+                        source: MountSource::Tmpfs,
+                        target: PathBuf::from("/data"),
+                        options: Vec::new(),
+                        context: parent_context,
+                    },
+                ],
+            );
+            // The conservative global mount resource still requires explicit coordination.
+            assert!(matches!(
+                compose_plan(&current, vec![fragment.clone()]),
+                Err(CompositionError::AmbiguousResourceOrder {
+                    resource: ActionResource::RuntimeMountState,
+                    ..
+                })
+            ));
+            fragment.dependencies.push(FragmentDependency {
+                before: LocalActionId::new(0),
+                after: LocalActionId::new(1),
+                reason: DependencyReason::ResourceCoordination,
+            });
+            let plan = compose_plan(&current, vec![fragment])
+                .unwrap_or_else(|error| panic!("compose independent mount targets: {error}"));
+            assert!(
+                plan.dependencies()
+                    .iter()
+                    .all(|dependency| dependency.reason != DependencyReason::MountOrder)
+            );
         }
     }
 

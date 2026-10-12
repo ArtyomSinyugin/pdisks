@@ -69,6 +69,24 @@ Runtime mount changes and offline filesystem actions share the conservative
 unordered DAG. Bind and unsupported mount sources require further live evidence
 to prove that the filesystem is unmounted. Real write dispatch is still disabled.
 
+Nested runtime targets receive `MountOrder` dependencies before the first
+simulation: parents are mounted before new children, and children are unmounted
+before changing their parents. Existing explicit multi-phase recipes retain their
+order and are replayed for safety. `MountDescendantsAbsent` prevents a parent
+change from hiding or detaching a still-mounted child, including in direct effect
+application. Declared descendant requirements may be established by preceding
+unmounts in that trace, rather than requiring absence in the original snapshot.
+
+Ancestry compares path components within the same `MountContext`, so `/data2`
+is not below `/data`, and distinct namespaces or target roots are not merged.
+Mount targets, bind sources, and target roots must be absolute and contain no
+parent traversal or NUL. Persistent entries follow the same path rules but do
+not acquire runtime mount-order edges. This is lexical planning; symbolic links,
+directory existence, and real namespace bindings still require live verification.
+The [mount](https://man7.org/linux/man-pages/man8/mount.8.html) and
+[umount](https://man7.org/linux/man-pages/man8/umount.8.html) manuals describe
+the underlying mount hierarchy and namespace behavior.
+
 Linear LVM allocation uses the owning VG's physical extents. `CreateLv` reserves
 the requested extents, `ResizeLv` reserves or releases the difference from its
 predecessor-state size, and `RemoveLv` releases that predecessor allocation once.

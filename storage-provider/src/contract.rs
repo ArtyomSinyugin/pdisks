@@ -109,6 +109,13 @@ pub enum ActionPrerequisite {
         /// Namespace context containing the path.
         context: MountContext,
     },
+    /// A parent mount change must not hide or detach active child mounts.
+    MountDescendantsAbsent {
+        /// Parent mount target being changed.
+        target: PathBuf,
+        /// Namespace in which descendants must be absent.
+        context: MountContext,
+    },
 }
 
 /// Coarse node-kind requirement used by provider contracts.
@@ -1302,6 +1309,12 @@ fn describe_mount(action: &MountAction) -> ActionContract {
         } => {
             let mut result = contract(RestartPolicy::Idempotent);
             write(&mut result, ActionResource::RuntimeMountState);
+            result
+                .prerequisites
+                .push(ActionPrerequisite::MountDescendantsAbsent {
+                    target: target.clone(),
+                    context: context.clone(),
+                });
             if let Some(node) = mount_source_node(source) {
                 result
                     .prerequisites
@@ -1343,6 +1356,12 @@ fn describe_mount(action: &MountAction) -> ActionContract {
         MountAction::Unmount { target, context } => {
             let mut result = contract(RestartPolicy::Idempotent);
             write(&mut result, ActionResource::RuntimeMountState);
+            result
+                .prerequisites
+                .push(ActionPrerequisite::MountDescendantsAbsent {
+                    target: target.clone(),
+                    context: context.clone(),
+                });
             write(
                 &mut result,
                 ActionResource::MountTarget {
@@ -1807,6 +1826,41 @@ mod tests {
     };
 
     use super::*;
+
+    /// Import cannot remove the serialized condition protecting nested runtime mount state.
+    #[test]
+    fn mount_descendant_safety_survives_serialization_and_import() {
+        let graph = NodeGraph::new();
+        for action in [
+            MountAction::Mount {
+                source: MountSource::Tmpfs,
+                target: "/data".into(),
+                options: Vec::new(),
+                context: MountContext::Host,
+            },
+            MountAction::Unmount {
+                target: "/data".into(),
+                context: MountContext::Host,
+            },
+        ] {
+            let operation = ProviderAction::Mount(action);
+            let context = ActionDescriptionContext { graph: &graph };
+            let contract = describe_action(&operation, context);
+            let json = serde_json::to_string(&contract)
+                .unwrap_or_else(|error| panic!("serialize mount safety contract: {error}"));
+            let mut restored = serde_json::from_str::<ActionContract>(&json)
+                .unwrap_or_else(|error| panic!("deserialize mount safety contract: {error}"));
+            assert_eq!(restored, contract);
+            assert!(restored.prerequisites.iter().any(|condition| matches!(
+                condition,
+                ActionPrerequisite::MountDescendantsAbsent { .. }
+            )));
+            restored.prerequisites.retain(|condition| {
+                !matches!(condition, ActionPrerequisite::MountDescendantsAbsent { .. })
+            });
+            assert!(verify_imported_contract(&operation, restored, context).is_err());
+        }
+    }
 
     /// Shrink safety conditions and clean-check postconditions survive JSON and cannot be removed.
     #[test]

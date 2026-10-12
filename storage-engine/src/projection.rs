@@ -219,11 +219,7 @@ impl Projection {
                 }) {
                     CheckStatus::Unknown { required_evidence: "resolve bind and unsupported mount sources before offline filesystem work".to_owned() }
                 } else {
-                    CheckStatus::Satisfied(if self.projected_runtime_mounts {
-                        CheckEvidence::PredictedEffect
-                    } else {
-                        CheckEvidence::ObservedSnapshot
-                    })
+                    CheckStatus::Satisfied(self.mount_evidence())
                 }
             }
             ActionPrerequisite::FilesystemCheckPassed(filesystem) => {
@@ -273,7 +269,16 @@ impl Projection {
                         reason: "mount target is already occupied".to_owned(),
                     }
                 } else {
-                    CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot)
+                    CheckStatus::Satisfied(self.mount_evidence())
+                }
+            }
+            ActionPrerequisite::MountDescendantsAbsent { target, context } => {
+                if self.has_mounted_descendant(target, context) {
+                    CheckStatus::Violated {
+                        reason: "mount target still contains an active descendant".to_owned(),
+                    }
+                } else {
+                    CheckStatus::Satisfied(self.mount_evidence())
                 }
             }
         }
@@ -565,6 +570,9 @@ impl Projection {
                     if self.mount_at(target, context).is_some() {
                         return Err(EffectApplicationError::OccupiedMountTarget(target.clone()));
                     }
+                    if self.has_mounted_descendant(target, context) {
+                        return Err(EffectApplicationError::MountedDescendant(target.clone()));
+                    }
                     if let MountSource::Filesystem(filesystem) = source {
                         self.checked_filesystems.remove(filesystem);
                     } else if matches!(source, MountSource::Bind(_) | MountSource::Other(_)) {
@@ -579,6 +587,9 @@ impl Projection {
                     });
                 }
                 MountEffect::RemoveRuntime { target, context } => {
+                    if self.has_mounted_descendant(target, context) {
+                        return Err(EffectApplicationError::MountedDescendant(target.clone()));
+                    }
                     self.projected_runtime_mounts = true;
                     self.runtime_mounts
                         .retain(|mount| mount.target != *target || mount.context != *context);
@@ -721,6 +732,22 @@ impl Projection {
             .find(|mount| mount.target == *target && mount.context == *context)
     }
 
+    /// Tests component-wise ancestry within one namespace, excluding the target itself.
+    fn has_mounted_descendant(&self, target: &Path, context: &MountContext) -> bool {
+        self.runtime_mounts.iter().any(|mount| {
+            mount.context == *context && mount.target != target && mount.target.starts_with(target)
+        })
+    }
+
+    /// Identifies whether effective mount evidence includes a projected transition.
+    fn mount_evidence(&self) -> CheckEvidence {
+        if self.projected_runtime_mounts {
+            CheckEvidence::PredictedEffect
+        } else {
+            CheckEvidence::ObservedSnapshot
+        }
+    }
+
     /// Rejects a candidate graph that would publish dangling edges.
     fn validate_edges(&self) -> Result<(), EffectApplicationError> {
         if self.graph.dependencies().any(|dependency| {
@@ -859,6 +886,9 @@ pub enum EffectApplicationError {
     /// A runtime mount effect targets an occupied namespace path.
     #[error("runtime mount target {0:?} is already occupied")]
     OccupiedMountTarget(PathBuf),
+    /// A runtime mount change would hide or detach an active descendant of this target.
+    #[error("runtime mount target {0:?} still contains an active descendant")]
+    MountedDescendant(PathBuf),
     /// A reserve effect exceeds known free capacity.
     #[error("insufficient capacity in allocation domain {0:?}")]
     InsufficientCapacity(AllocationDomain),
@@ -918,6 +948,48 @@ mod tests {
     use storage_provider::{FilesystemAction, LvmAction, ProviderAction};
 
     use super::*;
+
+    /// Parent mount changes cannot hide or detach a still-mounted descendant.
+    #[test]
+    fn parent_mount_changes_reject_active_descendants_atomically() {
+        let (mut current, _) = current_with_disk();
+        current.mounts.entries.push(ObservedMount {
+            source: MountSource::Tmpfs,
+            target: PathBuf::from("/data/child"),
+            options: Vec::new(),
+            context: MountContext::Host,
+        });
+        for action in [
+            storage_provider::MountAction::Mount {
+                source: MountSource::Tmpfs,
+                target: PathBuf::from("/data"),
+                options: Vec::new(),
+                context: MountContext::Host,
+            },
+            storage_provider::MountAction::Unmount {
+                target: PathBuf::from("/data"),
+                context: MountContext::Host,
+            },
+        ] {
+            let mut projection = Projection::from_current(&current);
+            let original = projection.clone();
+            let operation = ProviderAction::Mount(action);
+            assert!(projection.simulate_action(&operation).is_err());
+            assert_eq!(projection, original);
+            let effect = describe_action(
+                &operation,
+                ActionDescriptionContext {
+                    graph: &current.graph,
+                },
+            )
+            .predicted_effect;
+            assert!(matches!(
+                projection.apply_effect(&effect),
+                Err(EffectApplicationError::MountedDescendant(_))
+            ));
+            assert_eq!(projection, original);
+        }
+    }
 
     /// Invalid LUKS names fail before any graph or runtime effect is published.
     #[test]

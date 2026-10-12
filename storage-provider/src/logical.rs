@@ -1,23 +1,28 @@
 //! Contracts owned by logical storage-technology providers.
 
+use std::path::{Component, Path};
+
 use serde::{Deserialize, Serialize};
 use storage_core::model::{
-    DependencyKind, Diagnostic, DiagnosticSeverity, DiagnosticSubject, NodeGraph, NodeId, NodeKind,
+    DependencyKind, Diagnostic, DiagnosticSeverity, DiagnosticSubject, MountContext, MountSource,
+    NodeGraph, NodeId, NodeKind,
 };
 
-use crate::{BackendId, FilesystemAction, LvmAction, PartitionAction, ProviderAction};
+use crate::{BackendId, FilesystemAction, LvmAction, MountAction, PartitionAction, ProviderAction};
 
 /// Runs backend-independent technology checks against the effective graph.
 ///
 /// LUKS shares the same checks with `LogicalProvider::validate_action`.
 /// Partition mutations require an unambiguous table metadata domain.
 /// LVM validates ownership, nonzero size, and exact linear extent alignment.
+/// Mount paths require stable absolute identities without parent traversal.
 /// Other technologies currently rely on their action-contract prerequisites;
 /// their parameter validators belong here as they are implemented.
 pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> Vec<Diagnostic> {
     match action {
         ProviderAction::Luks(action) => crate::luks::validate_action(action, graph),
         ProviderAction::Lvm(action) => validate_lvm_action(action, graph),
+        ProviderAction::Mount(action) => validate_mount_action(action),
         ProviderAction::Filesystem(FilesystemAction::Resize {
             filesystem,
             new_size,
@@ -67,9 +72,55 @@ pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> V
             PartitionAction::CreateTable { .. } | PartitionAction::Create { .. },
         )
         | ProviderAction::Filesystem(_)
-        | ProviderAction::Btrfs(_)
-        | ProviderAction::Mount(_) => Vec::new(),
+        | ProviderAction::Btrfs(_) => Vec::new(),
     }
+}
+
+/// Rejects ambiguous lexical paths without resolving filesystem state or symbolic links.
+fn validate_mount_action(action: &MountAction) -> Vec<Diagnostic> {
+    let (target, context, source) = match action {
+        MountAction::Mount {
+            target,
+            context,
+            source,
+            ..
+        } => (target, context, Some(source)),
+        MountAction::Persist { entry } => (&entry.target, &entry.context, Some(&entry.source)),
+        MountAction::Unmount { target, context }
+        | MountAction::RemovePersistent { target, context } => (target, context, None),
+    };
+    let mut paths = vec![(target.as_path(), "mount.target")];
+    if let MountContext::TargetRoot(root) = context {
+        paths.push((root.as_path(), "mount.context.target_root"));
+    }
+    if let Some(MountSource::Bind(source)) = source {
+        paths.push((source.as_path(), "mount.source.bind"));
+    }
+    paths
+        .into_iter()
+        .filter(|(path, _)| !valid_mount_path(path))
+        .map(|(path, field)| Diagnostic {
+            code: "mount.action.invalid_path".to_owned(),
+            severity: DiagnosticSeverity::Error,
+            subjects: vec![
+                DiagnosticSubject::Mount(path.to_path_buf()),
+                DiagnosticSubject::Field(field.to_owned()),
+            ],
+            message: "mount paths must be absolute and contain neither '..' components nor NUL"
+                .to_owned(),
+            evidence: None,
+            suggested_remedy: None,
+        })
+        .collect()
+}
+
+/// Keeps mount resource identity independent of cwd, parent traversal, and invalid OS paths.
+fn valid_mount_path(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| component == Component::ParentDir)
+        && !path.as_os_str().as_encoded_bytes().contains(&0)
 }
 
 /// Rejects ambiguous allocation domains and sizes that cannot be represented exactly by extents.
@@ -230,6 +281,69 @@ mod tests {
     };
 
     use super::*;
+
+    /// Relative paths, parent traversal, and NUL cannot bypass mount resource identity.
+    #[test]
+    fn mount_paths_are_validated_for_runtime_and_persistent_actions() {
+        for path in [
+            "",
+            "relative",
+            "/data/../child",
+            "/data\0child",
+            "/data//./child",
+        ] {
+            let valid = path == "/data//./child";
+            let target = std::path::PathBuf::from(path);
+            let entry = storage_core::model::MountEntry {
+                source: MountSource::Tmpfs,
+                target: target.clone(),
+                options: Vec::new(),
+                persistent: true,
+                context: MountContext::Host,
+            };
+            for action in [
+                MountAction::Mount {
+                    source: MountSource::Tmpfs,
+                    target: target.clone(),
+                    options: Vec::new(),
+                    context: MountContext::Host,
+                },
+                MountAction::Unmount {
+                    target: target.clone(),
+                    context: MountContext::Host,
+                },
+                MountAction::Persist { entry },
+                MountAction::RemovePersistent {
+                    target: target.clone(),
+                    context: MountContext::Host,
+                },
+            ] {
+                let diagnostics =
+                    validate_provider_action(&ProviderAction::Mount(action), &NodeGraph::new());
+                assert_eq!(diagnostics.is_empty(), valid);
+            }
+        }
+        for action in [
+            MountAction::Mount {
+                source: MountSource::Tmpfs,
+                target: "/data".into(),
+                options: Vec::new(),
+                context: MountContext::TargetRoot("/target/../root".into()),
+            },
+            MountAction::Mount {
+                source: MountSource::Bind("relative".into()),
+                target: "/data".into(),
+                options: Vec::new(),
+                context: MountContext::Host,
+            },
+        ] {
+            let diagnostics =
+                validate_provider_action(&ProviderAction::Mount(action), &NodeGraph::new());
+            assert!(
+                matches!(diagnostics.as_slice(), [diagnostic] if diagnostic.code == "mount.action.invalid_path")
+            );
+        }
+    }
 
     /// LVM sizes are never silently rounded, and mutations cannot choose an arbitrary VG.
     #[test]
