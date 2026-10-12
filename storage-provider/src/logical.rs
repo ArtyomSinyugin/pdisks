@@ -5,7 +5,7 @@ use storage_core::model::{
     DependencyKind, Diagnostic, DiagnosticSeverity, DiagnosticSubject, NodeGraph, NodeId, NodeKind,
 };
 
-use crate::{BackendId, PartitionAction, ProviderAction};
+use crate::{BackendId, FilesystemAction, PartitionAction, ProviderAction};
 
 /// Runs backend-independent technology checks against the effective graph.
 ///
@@ -16,6 +16,32 @@ use crate::{BackendId, PartitionAction, ProviderAction};
 pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> Vec<Diagnostic> {
     match action {
         ProviderAction::Luks(action) => crate::luks::validate_action(action, graph),
+        ProviderAction::Filesystem(FilesystemAction::Resize {
+            filesystem,
+            new_size,
+        }) => {
+            let (code, message) = if new_size.as_u64() == 0 {
+                (
+                    "filesystem.resize.zero_size",
+                    "filesystem capacity must be greater than zero",
+                )
+            } else if !crate::contract::is_ext_filesystem(graph, *filesystem) {
+                (
+                    "filesystem.resize.unsupported",
+                    "filesystem resize currently supports only the ext2/ext3/ext4 recipe",
+                )
+            } else {
+                return Vec::new();
+            };
+            vec![Diagnostic {
+                code: code.to_owned(),
+                severity: DiagnosticSeverity::Error,
+                subjects: vec![DiagnosticSubject::Node(*filesystem)],
+                message: message.to_owned(),
+                evidence: None,
+                suggested_remedy: None,
+            }]
+        }
         ProviderAction::Partition(
             PartitionAction::Resize { partition, .. }
             | PartitionAction::Delete { partition }

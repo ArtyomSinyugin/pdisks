@@ -685,6 +685,7 @@ fn requirement_can_be_checked_live(
         ActionPrerequisite::DestructiveApproval(_) | ActionPrerequisite::ExtentAvailable { .. } => {
             true
         }
+        ActionPrerequisite::FilesystemMinimumSize { .. } => true,
         ActionPrerequisite::NodeExists(_)
         | ActionPrerequisite::NodeKind { .. }
         | ActionPrerequisite::NoUnexpectedConsumers(_)
@@ -693,6 +694,8 @@ fn requirement_can_be_checked_live(
         | ActionPrerequisite::BackingSizeAtLeast { .. }
         | ActionPrerequisite::CapacityAvailable { .. }
         | ActionPrerequisite::MountTargetAvailable { .. } => false,
+        ActionPrerequisite::FilesystemUnmounted(_)
+        | ActionPrerequisite::FilesystemCheckPassed(_) => false,
     }
 }
 
@@ -1004,6 +1007,7 @@ mod tests {
 
     /// Builds a resize fragment with the requested semantic order.
     fn resize_fragment(lv: NodeId, filesystem: NodeId, filesystem_first: bool) -> PlanFragment {
+        let check = LocalActionId::new(0);
         let resize_lv = LocalActionId::new(1);
         let resize_filesystem = LocalActionId::new(2);
         let (before, after) = if filesystem_first {
@@ -1013,6 +1017,13 @@ mod tests {
         };
         PlanFragment {
             actions: vec![
+                FragmentAction {
+                    id: check,
+                    operation: ProviderAction::Filesystem(FilesystemAction::Check {
+                        filesystem,
+                        force: true,
+                    }),
+                },
                 FragmentAction {
                     id: resize_lv,
                     operation: ProviderAction::Lvm(LvmAction::ResizeLv {
@@ -1028,11 +1039,18 @@ mod tests {
                     }),
                 },
             ],
-            dependencies: vec![FragmentDependency {
-                before,
-                after,
-                reason: DependencyReason::ResizeSafety,
-            }],
+            dependencies: vec![
+                FragmentDependency {
+                    before: check,
+                    after: before,
+                    reason: DependencyReason::RequestedOrder,
+                },
+                FragmentDependency {
+                    before,
+                    after,
+                    reason: DependencyReason::ResizeSafety,
+                },
+            ],
             external_requirements: Vec::new(),
             origin: origin(lv, "shrink filesystem and LV"),
             diagnostics: Vec::new(),
@@ -1254,12 +1272,145 @@ mod tests {
 
         assert!(matches!(
             ordered[0].operation,
-            ProviderAction::Filesystem(FilesystemAction::Resize { .. })
+            ProviderAction::Filesystem(FilesystemAction::Check { .. })
         ));
         assert!(matches!(
             ordered[1].operation,
+            ProviderAction::Filesystem(FilesystemAction::Resize { .. })
+        ));
+        assert!(matches!(
+            ordered[2].operation,
             ProviderAction::Lvm(LvmAction::ResizeLv { .. })
         ));
+    }
+
+    /// A mounted filesystem can be shrunk only through an explicitly ordered offline recipe.
+    #[test]
+    fn composes_unmount_check_shrink_and_remount() {
+        let (mut current, lv, filesystem) = current_with_lv_and_filesystem();
+        current
+            .mounts
+            .entries
+            .push(storage_core::model::ObservedMount {
+                source: MountSource::Filesystem(filesystem),
+                target: PathBuf::from("/data"),
+                options: vec!["rw".to_owned()],
+                context: MountContext::Host,
+            });
+        let baseline = current.clone();
+        let mut fragment = resize_fragment(lv, filesystem, true);
+        fragment.actions.extend([
+            FragmentAction {
+                id: LocalActionId::new(3),
+                operation: ProviderAction::Mount(MountAction::Unmount {
+                    target: PathBuf::from("/data"),
+                    context: MountContext::Host,
+                }),
+            },
+            FragmentAction {
+                id: LocalActionId::new(4),
+                operation: ProviderAction::Mount(MountAction::Mount {
+                    source: MountSource::Filesystem(filesystem),
+                    target: PathBuf::from("/data"),
+                    options: vec!["rw".to_owned()],
+                    context: MountContext::Host,
+                }),
+            },
+        ]);
+        fragment.dependencies.extend([
+            FragmentDependency {
+                before: LocalActionId::new(3),
+                after: LocalActionId::new(0),
+                reason: DependencyReason::RequestedOrder,
+            },
+            FragmentDependency {
+                before: LocalActionId::new(1),
+                after: LocalActionId::new(4),
+                reason: DependencyReason::RequestedOrder,
+            },
+        ]);
+        let plan = compose_plan(&current, vec![fragment])
+            .unwrap_or_else(|error| panic!("compose mounted ext4 shrink: {error}"));
+        let ids = plan
+            .ordered_actions()
+            .iter()
+            .map(|action| action.local_id.get())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![3, 0, 2, 1, 4]);
+        let simulation = crate::simulate_plan(&current, &plan)
+            .unwrap_or_else(|error| panic!("replay mounted ext4 shrink: {error}"));
+        assert_eq!(
+            simulation.projection.runtime_mounts(),
+            current.mounts.entries
+        );
+        assert_eq!(
+            simulation
+                .projection
+                .graph()
+                .node(&filesystem)
+                .map(|node| node.kind.size),
+            Some(Some(Bytes::new(60)))
+        );
+        assert_eq!(current, baseline);
+    }
+
+    /// A sequential replay must not allow reordering checks with mount or backing changes.
+    #[test]
+    fn rejects_unordered_mount_and_filesystem_check() {
+        let (current, lv, filesystem) = current_with_lv_and_filesystem();
+        let mut fragment = PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Filesystem(FilesystemAction::Check {
+                        filesystem,
+                        force: true,
+                    }),
+                },
+                FragmentAction {
+                    id: LocalActionId::new(1),
+                    operation: ProviderAction::Mount(MountAction::Mount {
+                        source: MountSource::Filesystem(filesystem),
+                        target: PathBuf::from("/data"),
+                        options: vec!["rw".to_owned()],
+                        context: MountContext::Host,
+                    }),
+                },
+            ],
+            dependencies: Vec::new(),
+            external_requirements: Vec::new(),
+            origin: origin(filesystem, "check then mount"),
+            diagnostics: Vec::new(),
+        };
+        assert!(matches!(
+            compose_plan(&current, vec![fragment.clone()]),
+            Err(CompositionError::AmbiguousResourceOrder {
+                resource: ActionResource::RuntimeMountState,
+                ..
+            })
+        ));
+        fragment.dependencies.push(FragmentDependency {
+            before: LocalActionId::new(0),
+            after: LocalActionId::new(1),
+            reason: DependencyReason::RequestedOrder,
+        });
+        compose_plan(&current, vec![fragment.clone()])
+            .unwrap_or_else(|error| panic!("compose ordered check and mount: {error}"));
+        fragment.actions[1].operation = ProviderAction::Lvm(LvmAction::ResizeLv {
+            lv,
+            new_size: Bytes::new(200),
+        });
+        fragment.dependencies.clear();
+        assert!(matches!(compose_plan(&current, vec![fragment.clone()]),
+            Err(CompositionError::AmbiguousResourceOrder { resource: ActionResource::Node(node), .. }) if node == lv
+        ));
+        fragment.dependencies.push(FragmentDependency {
+            before: LocalActionId::new(0),
+            after: LocalActionId::new(1),
+            reason: DependencyReason::RequestedOrder,
+        });
+        compose_plan(&current, vec![fragment])
+            .unwrap_or_else(|error| panic!("compose ordered check and backing resize: {error}"));
     }
 
     /// Cumulative reservations reject two locally valid allocations over capacity.

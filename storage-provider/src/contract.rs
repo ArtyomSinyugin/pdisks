@@ -57,6 +57,17 @@ pub enum ActionPrerequisite {
     NoUnexpectedConsumers(NodeId),
     /// The backing endpoint must not be observed read-only.
     Writable(NodeId),
+    /// The filesystem must be unmounted in every observed namespace.
+    FilesystemUnmounted(NodeId),
+    /// A preceding forced read-only check must verify the filesystem is clean.
+    FilesystemCheckPassed(NodeId),
+    /// The requested shrink target must fit the provider's safe minimum size.
+    FilesystemMinimumSize {
+        /// Filesystem whose content must fit.
+        filesystem: NodeId,
+        /// Requested resulting capacity.
+        target: Bytes,
+    },
     /// Destructive use of the named node requires explicit approval.
     DestructiveApproval(NodeId),
     /// A partition-table extent must be free and correctly aligned.
@@ -155,6 +166,8 @@ pub enum ActionOutput {
     },
     /// Persistent mount configuration made available to the target system.
     PersistentMount(MountEntry),
+    /// A forced read-only check found no errors after its postcondition was verified.
+    FilesystemCheckPassed(NodeId),
 }
 
 /// Access mode guaranteed by a projected runtime block interface.
@@ -206,6 +219,9 @@ pub struct ResourceAccess {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionResource {
+    /// Runtime mounts across namespaces, shared by mount changes and offline filesystem work.
+    /// This conservative domain prevents reordering until finer mount ownership is available.
+    RuntimeMountState,
     /// Canonical storage node.
     Node(NodeId),
     /// Partition-table metadata domain keyed by the canonical table node, never a partition.
@@ -406,6 +422,9 @@ pub enum FactKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Postcondition {
+    /// A forced read-only filesystem check completed and found no errors.
+    /// Finding errors fails this postcondition even if the checker finished normally.
+    FilesystemCheckPassed(NodeId),
     /// A node must exist with the predictable requested specification.
     NodeMatches {
         /// Expected node identity.
@@ -969,21 +988,77 @@ fn describe_filesystem(
         FilesystemAction::Resize {
             filesystem,
             new_size,
-        } => resize_contract(
-            context,
-            *filesystem,
-            *new_size,
-            NodeKindClass::Filesystem,
-            ResizeSafety::BACKING,
-        ),
-        FilesystemAction::Check { filesystem, .. } => inspection_contract(*filesystem),
+        } => {
+            let mut result = resize_contract(
+                context,
+                *filesystem,
+                *new_size,
+                NodeKindClass::Filesystem,
+                ResizeSafety::BACKING,
+            );
+            let may_shrink =
+                known_size(context.graph, *filesystem).is_none_or(|current| current > *new_size);
+            let is_ext2 = context.graph.node(filesystem).is_some_and(|node| {
+                matches!(
+                    node.kind.kind,
+                    NodeKind::Filesystem {
+                        kind: FilesystemKind::Ext2,
+                        ..
+                    }
+                )
+            });
+            if may_shrink || is_ext2 {
+                result
+                    .prerequisites
+                    .push(ActionPrerequisite::FilesystemUnmounted(*filesystem));
+                read(&mut result, ActionResource::RuntimeMountState);
+            }
+            if may_shrink {
+                result.prerequisites.extend([
+                    ActionPrerequisite::FilesystemCheckPassed(*filesystem),
+                    ActionPrerequisite::FilesystemMinimumSize {
+                        filesystem: *filesystem,
+                        target: *new_size,
+                    },
+                ]);
+            }
+            access_filesystem_backing(
+                &mut result,
+                context.graph,
+                *filesystem,
+                ResourceAccessMode::Write,
+            );
+            result
+        }
+        FilesystemAction::Check { filesystem, force } => {
+            let mut result = inspection_contract(context.graph, *filesystem);
+            if *force && is_ext_filesystem(context.graph, *filesystem) {
+                result
+                    .provided_outputs
+                    .push(ActionOutput::FilesystemCheckPassed(*filesystem));
+                result
+                    .postconditions
+                    .push(Postcondition::FilesystemCheckPassed(*filesystem));
+            }
+            result
+        }
         FilesystemAction::Repair { filesystem, .. } => {
             let mut result = contract(RestartPolicy::ManualRecovery);
             require_kind(&mut result, *filesystem, NodeKindClass::Filesystem);
             result
                 .prerequisites
+                .push(ActionPrerequisite::FilesystemUnmounted(*filesystem));
+            read(&mut result, ActionResource::RuntimeMountState);
+            result
+                .prerequisites
                 .push(ActionPrerequisite::NoUnexpectedConsumers(*filesystem));
             write(&mut result, ActionResource::Node(*filesystem));
+            access_filesystem_backing(
+                &mut result,
+                context.graph,
+                *filesystem,
+                ResourceAccessMode::Write,
+            );
             invalidate(&mut result, *filesystem, FactKind::Content);
             result
                 .postconditions
@@ -1164,6 +1239,7 @@ fn describe_mount(action: &MountAction) -> ActionContract {
             context,
         } => {
             let mut result = contract(RestartPolicy::Idempotent);
+            write(&mut result, ActionResource::RuntimeMountState);
             if let Some(node) = mount_source_node(source) {
                 result
                     .prerequisites
@@ -1204,6 +1280,7 @@ fn describe_mount(action: &MountAction) -> ActionContract {
         }
         MountAction::Unmount { target, context } => {
             let mut result = contract(RestartPolicy::Idempotent);
+            write(&mut result, ActionResource::RuntimeMountState);
             write(
                 &mut result,
                 ActionResource::MountTarget {
@@ -1393,15 +1470,42 @@ fn remove_node_contract(
 }
 
 /// Builds a read-only filesystem inspection contract.
-fn inspection_contract(node: NodeId) -> ActionContract {
+fn inspection_contract(graph: &NodeGraph, node: NodeId) -> ActionContract {
     let mut result = contract(RestartPolicy::Idempotent);
     require_kind(&mut result, node, NodeKindClass::Filesystem);
+    result
+        .prerequisites
+        .push(ActionPrerequisite::FilesystemUnmounted(node));
+    read(&mut result, ActionResource::RuntimeMountState);
     read(&mut result, ActionResource::Node(node));
+    access_filesystem_backing(&mut result, graph, node, ResourceAccessMode::Read);
     invalidate(&mut result, node, FactKind::Content);
     result
         .postconditions
         .push(Postcondition::NodeReprobed(node));
     result
+}
+
+/// Locks the direct backing endpoint and requires write access for filesystem mutations.
+fn access_filesystem_backing(
+    result: &mut ActionContract,
+    graph: &NodeGraph,
+    filesystem: NodeId,
+    mode: ResourceAccessMode,
+) {
+    for dependency in graph.dependencies().filter(|dependency| {
+        dependency.to == filesystem && matches!(dependency.kind, DependencyKind::Backs)
+    }) {
+        result.affected_resources.push(ResourceAccess {
+            resource: ActionResource::Node(dependency.from),
+            mode,
+        });
+        if mode == ResourceAccessMode::Write {
+            result
+                .prerequisites
+                .push(ActionPrerequisite::Writable(dependency.from));
+        }
+    }
 }
 
 /// Builds common Btrfs membership prerequisites and resource locks.
@@ -1503,6 +1607,19 @@ fn known_size(graph: &NodeGraph, node: NodeId) -> Option<Bytes> {
     graph.node(&node).and_then(|node| node.kind.size)
 }
 
+/// Identifies the filesystem family covered by the current resize and check recipe.
+pub(crate) fn is_ext_filesystem(graph: &NodeGraph, node: NodeId) -> bool {
+    graph.node(&node).is_some_and(|node| {
+        matches!(
+            node.kind.kind,
+            NodeKind::Filesystem {
+                kind: FilesystemKind::Ext2 | FilesystemKind::Ext3 | FilesystemKind::Ext4,
+                ..
+            }
+        )
+    })
+}
+
 /// Calculates linear-LV allocation in VG extents when the extent size is known.
 fn lvm_create_allocation(
     graph: &NodeGraph,
@@ -1588,7 +1705,9 @@ fn add_output_resources(contract: &mut ActionContract) {
             ActionOutput::Node { id, .. } | ActionOutput::BlockInterface { node: id, .. } => {
                 Some(*id)
             }
-            ActionOutput::Mount { .. } | ActionOutput::PersistentMount(_) => None,
+            ActionOutput::Mount { .. }
+            | ActionOutput::PersistentMount(_)
+            | ActionOutput::FilesystemCheckPassed(_) => None,
         })
         .collect::<Vec<_>>();
     for node in output_nodes {
@@ -1609,6 +1728,71 @@ mod tests {
     };
 
     use super::*;
+
+    /// Shrink safety conditions and clean-check postconditions survive JSON and cannot be removed.
+    #[test]
+    fn filesystem_shrink_contract_preserves_preparation_requirements() {
+        let filesystem = NodeId::new();
+        let mut graph = NodeGraph::new();
+        graph.insert_node(
+            filesystem,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Filesystem {
+                        kind: FilesystemKind::Ext4,
+                        label: None,
+                    },
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let context = ActionDescriptionContext { graph: &graph };
+        let shrink = ProviderAction::Filesystem(FilesystemAction::Resize {
+            filesystem,
+            new_size: Bytes::new(60),
+        });
+        let contract = describe_action(&shrink, context);
+        for prerequisite in [
+            ActionPrerequisite::FilesystemUnmounted(filesystem),
+            ActionPrerequisite::FilesystemCheckPassed(filesystem),
+            ActionPrerequisite::FilesystemMinimumSize {
+                filesystem,
+                target: Bytes::new(60),
+            },
+        ] {
+            assert!(contract.prerequisites.contains(&prerequisite));
+            let mut weakened = contract.clone();
+            weakened
+                .prerequisites
+                .retain(|candidate| candidate != &prerequisite);
+            assert!(verify_imported_contract(&shrink, weakened, context).is_err());
+        }
+        let check = describe_action(
+            &ProviderAction::Filesystem(FilesystemAction::Check {
+                filesystem,
+                force: true,
+            }),
+            context,
+        );
+        assert!(
+            check
+                .provided_outputs
+                .contains(&ActionOutput::FilesystemCheckPassed(filesystem))
+        );
+        assert!(
+            check
+                .postconditions
+                .contains(&Postcondition::FilesystemCheckPassed(filesystem))
+        );
+        for value in [contract, check] {
+            let json = serde_json::to_string(&value)
+                .unwrap_or_else(|error| panic!("serialize shrink preparation contract: {error}"));
+            let restored = serde_json::from_str::<ActionContract>(&json)
+                .unwrap_or_else(|error| panic!("deserialize shrink preparation contract: {error}"));
+            assert_eq!(restored, value);
+        }
+    }
 
     /// Creates a graph containing one predictable block node.
     fn block_graph() -> (NodeGraph, NodeId) {

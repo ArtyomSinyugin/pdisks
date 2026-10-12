@@ -40,14 +40,34 @@ postcondition probing.
 `describe_action` derives one `ActionContract` from the typed action and the
 trusted graph context. It contains prerequisites, provided outputs, resource
 access, the shared predicted effect, invalidated facts, postconditions, and a
-restart policy. Future simulation must consume this `predicted_effect` instead
-of maintaining a second implementation of action semantics.
+restart policy. `storage-engine` validates actions through `validate_provider_action`
+and interprets this `predicted_effect` against the preceding projected state.
 
 The JSON contract is informational. After importing a plan,
 `verify_imported_contract` recalculates the complete contract and compares it
 with the imported representation. On success it returns the recalculated
 instance. Editing JSON therefore cannot remove `NoUnexpectedConsumers`, reduce
 resource locks, or weaken postcondition verification.
+
+The current filesystem resize recipe supports ext2/ext3/ext4. Shrink requires
+unmounting the filesystem in every observed namespace, then a forced read-only
+`Check` whose `FilesystemCheckPassed` postcondition verifies no errors were found.
+`NodeReprobed` alone does not establish that result. The simulator projects this
+check output conditionally on successful verification; it never reports an actual
+checker result. A non-forced check or `Repair` does not supply the guarantee.
+Mounting, repairing, resizing, or changing backing geometry revokes it.
+
+The shrink target also requires provider evidence of a safe minimum size;
+simulation retains that condition as `Unknown`. Unknown current size requires
+the conservative shrink preparation. Other filesystem resize recipes are rejected
+until their constraints are implemented. ext2 growth also requires unmounting.
+These constraints follow the upstream [resize2fs documentation](https://github.com/tytso/e2fsprogs/blob/master/resize/resize2fs.8.in)
+and the [e2fsck read-only and mounted-state rules](https://github.com/tytso/e2fsprogs/blob/master/e2fsck/e2fsck.8.in).
+
+Runtime mount changes and offline filesystem actions share the conservative
+`RuntimeMountState` resource, so a safe sequential preview cannot authorize an
+unordered DAG. Bind and unsupported mount sources require further live evidence
+to prove that the filesystem is unmounted. Real write dispatch is still disabled.
 
 ## Backend manifests
 

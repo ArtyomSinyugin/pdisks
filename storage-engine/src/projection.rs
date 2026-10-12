@@ -7,12 +7,13 @@ use std::{
 
 use storage_core::model::{
     CurrentState, DependencyKind, Diagnostic, DiagnosticSeverity, FilesystemKind, MountContext,
-    MountEntry, Node, NodeFacts, NodeGraph, NodeId, NodeKind, ObservedMount,
+    MountEntry, MountSource, Node, NodeFacts, NodeGraph, NodeId, NodeKind, ObservedMount,
 };
 use storage_provider::{
     ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite, AllocationDomain,
-    AllocationEffect, AllocationQuantity, BlockInterfaceAccess, GraphEffect, MountEffect,
-    NodeKindClass, PredictedEffect, ProviderAction, describe_action, validate_provider_action,
+    AllocationEffect, AllocationQuantity, BlockInterfaceAccess, FactInvalidation, FactKind,
+    FactScope, GraphEffect, MountEffect, NodeKindClass, PredictedEffect, ProviderAction,
+    describe_action, validate_provider_action,
 };
 use thiserror::Error;
 
@@ -28,6 +29,10 @@ pub struct Projection {
     available_capacity: HashMap<AllocationDomain, AllocationQuantity>,
     projected_allocations: HashSet<AllocationDomain>,
     projected_graph_nodes: Vec<NodeId>,
+    /// Conditional clean-check guarantees supplied by preceding forced checks.
+    checked_filesystems: HashSet<NodeId>,
+    /// Whether runtime mount evidence includes effects rather than only the snapshot.
+    projected_runtime_mounts: bool,
 }
 
 impl Projection {
@@ -43,6 +48,8 @@ impl Projection {
             available_capacity: HashMap::new(),
             projected_allocations: HashSet::new(),
             projected_graph_nodes: Vec::new(),
+            checked_filesystems: HashSet::new(),
+            projected_runtime_mounts: false,
         }
     }
 
@@ -137,6 +144,7 @@ impl Projection {
             return Err(ActionSimulationError::PrerequisitesViolated { checks });
         }
         self.apply_effect(&contract.predicted_effect)?;
+        self.invalidate_filesystem_checks(&contract.invalidated_facts);
         self.apply_outputs(&contract.provided_outputs);
         Ok(SimulatedAction { contract, checks })
     }
@@ -193,6 +201,47 @@ impl Projection {
                 }
             }
             ActionPrerequisite::Writable(node) => self.evaluate_writable(*node),
+            ActionPrerequisite::FilesystemUnmounted(filesystem) => {
+                if self.graph.node(filesystem).is_none() {
+                    CheckStatus::Violated {
+                        reason: "referenced filesystem is absent".to_owned(),
+                    }
+                } else if self
+                    .runtime_mounts
+                    .iter()
+                    .any(|mount| mount.source == MountSource::Filesystem(*filesystem))
+                {
+                    CheckStatus::Violated {
+                        reason: "filesystem is still mounted in an observed namespace".to_owned(),
+                    }
+                } else if self.runtime_mounts.iter().any(|mount| {
+                    matches!(mount.source, MountSource::Bind(_) | MountSource::Other(_))
+                }) {
+                    CheckStatus::Unknown { required_evidence: "resolve bind and unsupported mount sources before offline filesystem work".to_owned() }
+                } else {
+                    CheckStatus::Satisfied(if self.projected_runtime_mounts {
+                        CheckEvidence::PredictedEffect
+                    } else {
+                        CheckEvidence::ObservedSnapshot
+                    })
+                }
+            }
+            ActionPrerequisite::FilesystemCheckPassed(filesystem) => {
+                if self.checked_filesystems.contains(filesystem) {
+                    CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
+                } else {
+                    CheckStatus::Violated {
+                        reason:
+                            "filesystem shrink requires a preceding fresh forced read-only check"
+                                .to_owned(),
+                    }
+                }
+            }
+            ActionPrerequisite::FilesystemMinimumSize { .. } => CheckStatus::Unknown {
+                required_evidence:
+                    "provider evidence that filesystem content fits the requested shrink target"
+                        .to_owned(),
+            },
             ActionPrerequisite::DestructiveApproval(_) => CheckStatus::Unknown {
                 required_evidence: "explicit destructive-scope approval".to_owned(),
             },
@@ -516,6 +565,12 @@ impl Projection {
                     if self.mount_at(target, context).is_some() {
                         return Err(EffectApplicationError::OccupiedMountTarget(target.clone()));
                     }
+                    if let MountSource::Filesystem(filesystem) = source {
+                        self.checked_filesystems.remove(filesystem);
+                    } else if matches!(source, MountSource::Bind(_) | MountSource::Other(_)) {
+                        self.checked_filesystems.clear();
+                    }
+                    self.projected_runtime_mounts = true;
                     self.runtime_mounts.push(ObservedMount {
                         source: source.clone(),
                         target: target.clone(),
@@ -524,6 +579,7 @@ impl Projection {
                     });
                 }
                 MountEffect::RemoveRuntime { target, context } => {
+                    self.projected_runtime_mounts = true;
                     self.runtime_mounts
                         .retain(|mount| mount.target != *target || mount.context != *context);
                 }
@@ -555,9 +611,50 @@ impl Projection {
     /// Records runtime guarantees exported by a successfully projected action.
     fn apply_outputs(&mut self, outputs: &[ActionOutput]) {
         for output in outputs {
-            if let ActionOutput::BlockInterface { node, access } = output {
-                self.block_interfaces.insert(*node, *access);
+            match output {
+                ActionOutput::BlockInterface { node, access } => {
+                    self.block_interfaces.insert(*node, *access);
+                }
+                ActionOutput::FilesystemCheckPassed(filesystem) => {
+                    self.checked_filesystems.insert(*filesystem);
+                }
+                _ => {}
             }
+        }
+    }
+
+    /// Revokes clean-check guarantees when content or backing geometry changes.
+    fn invalidate_filesystem_checks(&mut self, invalidations: &[FactInvalidation]) {
+        let mut affected = invalidations
+            .iter()
+            .filter_map(
+                |invalidation| match (&invalidation.scope, invalidation.kind) {
+                    (
+                        FactScope::Node(node),
+                        FactKind::Content | FactKind::Geometry | FactKind::Presence,
+                    ) => Some(*node),
+                    _ => None,
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut visited = HashSet::new();
+        while let Some(node) = affected.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            self.checked_filesystems.remove(&node);
+            affected.extend(
+                self.graph
+                    .dependencies()
+                    .filter(|dependency| {
+                        dependency.from == node
+                            && matches!(
+                                dependency.kind,
+                                DependencyKind::Backs | DependencyKind::Contains { .. }
+                            )
+                    })
+                    .map(|dependency| dependency.to),
+            );
         }
     }
 
@@ -858,6 +955,225 @@ mod tests {
             );
             assert_eq!(projection, original);
         }
+    }
+
+    /// Builds an unmounted filesystem with one known backing device.
+    fn current_with_filesystem(kind: FilesystemKind) -> (CurrentState, NodeId, NodeId) {
+        let (mut current, disk) = current_with_disk();
+        let filesystem = NodeId::new();
+        current.graph.insert_node(
+            filesystem,
+            Node {
+                kind: storage_core::model::NodeSpec {
+                    kind: NodeKind::Filesystem { kind, label: None },
+                    size: Some(storage_core::model::Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        current
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: disk,
+                to: filesystem,
+                kind: DependencyKind::Backs,
+            });
+        (current, disk, filesystem)
+    }
+
+    /// Mounted ext4 shrink is rejected before publishing a smaller filesystem.
+    #[test]
+    fn mounted_filesystem_shrink_leaves_projection_unchanged() {
+        let (mut current, _, filesystem) = current_with_filesystem(FilesystemKind::Ext4);
+        current.mounts.entries.push(ObservedMount {
+            source: storage_core::model::MountSource::Filesystem(filesystem),
+            target: PathBuf::from("/data"),
+            options: vec!["rw".to_owned()],
+            context: MountContext::Host,
+        });
+        let mut projection = Projection::from_current(&current);
+        let original = projection.clone();
+        let result =
+            projection.simulate_action(&ProviderAction::Filesystem(FilesystemAction::Resize {
+                filesystem,
+                new_size: storage_core::model::Bytes::new(60),
+            }));
+        assert!(result.is_err());
+        assert_eq!(projection, original);
+    }
+
+    /// Offline preparation is required in all namespaces and remains a conditional forecast.
+    #[test]
+    fn shrink_requires_all_unmounts_and_a_forced_clean_check() {
+        let (mut current, _, filesystem) = current_with_filesystem(FilesystemKind::Ext4);
+        let contexts = [
+            MountContext::Host,
+            MountContext::Namespace("installer".to_owned()),
+        ];
+        for context in &contexts {
+            current.mounts.entries.push(ObservedMount {
+                source: MountSource::Filesystem(filesystem),
+                target: PathBuf::from("/data"),
+                options: vec!["rw".to_owned()],
+                context: context.clone(),
+            });
+        }
+        let baseline = current.clone();
+        let mut projection = Projection::from_current(&current);
+        let forced_check = ProviderAction::Filesystem(FilesystemAction::Check {
+            filesystem,
+            force: true,
+        });
+        let repair = ProviderAction::Filesystem(FilesystemAction::Repair {
+            filesystem,
+            force: false,
+        });
+        let resize = ProviderAction::Filesystem(FilesystemAction::Resize {
+            filesystem,
+            new_size: Bytes::new(60),
+        });
+        assert!(projection.simulate_action(&forced_check).is_err());
+        assert!(projection.simulate_action(&repair).is_err());
+        for (index, context) in contexts.into_iter().enumerate() {
+            projection
+                .simulate_action(&ProviderAction::Mount(
+                    storage_provider::MountAction::Unmount {
+                        target: PathBuf::from("/data"),
+                        context,
+                    },
+                ))
+                .unwrap_or_else(|error| panic!("simulate unmount: {error}"));
+            if index == 0 {
+                assert!(projection.simulate_action(&resize).is_err());
+                assert!(projection.simulate_action(&forced_check).is_err());
+            }
+        }
+        assert!(projection.simulate_action(&resize).is_err());
+        projection
+            .simulate_action(&ProviderAction::Filesystem(FilesystemAction::Check {
+                filesystem,
+                force: false,
+            }))
+            .unwrap_or_else(|error| panic!("simulate non-forced check: {error}"));
+        assert!(projection.simulate_action(&resize).is_err());
+        let checked = projection
+            .simulate_action(&forced_check)
+            .unwrap_or_else(|error| panic!("simulate forced check: {error}"));
+        assert!(checked.contract.predicted_effect.graph.is_empty());
+        assert!(checked.contract.postconditions.contains(
+            &storage_provider::Postcondition::FilesystemCheckPassed(filesystem)
+        ));
+        let resized = projection
+            .simulate_action(&resize)
+            .unwrap_or_else(|error| panic!("simulate prepared shrink: {error}"));
+        assert!(resized.is_conditional());
+        assert!(resized.checks.iter().any(|check| matches!(check,
+            PrerequisiteCheck { prerequisite: ActionPrerequisite::FilesystemCheckPassed(id), status: CheckStatus::Satisfied(CheckEvidence::PredictedEffect) }
+                if *id == filesystem
+        )));
+        assert!(resized.checks.iter().any(|check| matches!(
+            check,
+            PrerequisiteCheck {
+                prerequisite: ActionPrerequisite::FilesystemMinimumSize { .. },
+                status: CheckStatus::Unknown { .. }
+            }
+        )));
+        assert_eq!(current, baseline);
+    }
+
+    /// Writes, remounts, and backing geometry changes revoke an earlier clean-check guarantee.
+    #[test]
+    fn filesystem_check_guarantees_expire_after_changes() {
+        let (mut current, disk, filesystem) = current_with_filesystem(FilesystemKind::Ext4);
+        let mut backing = current
+            .graph
+            .node(&disk)
+            .cloned()
+            .unwrap_or_else(|| panic!("filesystem backing is absent"));
+        backing.kind.kind = NodeKind::LvmLv(LvmLv {
+            name: "data".to_owned(),
+            kind: LvmLvKind::Linear,
+        });
+        current.graph.insert_node(disk, backing);
+        let forced_check = ProviderAction::Filesystem(FilesystemAction::Check {
+            filesystem,
+            force: true,
+        });
+        let mut checked = Projection::from_current(&current);
+        checked
+            .simulate_action(&forced_check)
+            .unwrap_or_else(|error| panic!("simulate forced check: {error}"));
+        for action in [
+            ProviderAction::Lvm(LvmAction::ResizeLv {
+                lv: disk,
+                new_size: Bytes::new(2048),
+            }),
+            ProviderAction::Filesystem(FilesystemAction::Repair {
+                filesystem,
+                force: false,
+            }),
+            ProviderAction::Filesystem(FilesystemAction::Resize {
+                filesystem,
+                new_size: Bytes::new(60),
+            }),
+            ProviderAction::Mount(storage_provider::MountAction::Mount {
+                source: MountSource::Filesystem(filesystem),
+                target: PathBuf::from("/data"),
+                options: vec!["rw".to_owned()],
+                context: MountContext::Host,
+            }),
+        ] {
+            let mut projection = checked.clone();
+            projection
+                .simulate_action(&action)
+                .unwrap_or_else(|error| panic!("simulate check invalidation: {error}"));
+            let checks = projection
+                .evaluate_prerequisites(&[ActionPrerequisite::FilesystemCheckPassed(filesystem)]);
+            assert!(matches!(checks[0].status, CheckStatus::Violated { .. }));
+        }
+    }
+
+    /// Unsupported recipes and zero capacity are rejected; unknown direction stays conservative.
+    #[test]
+    fn filesystem_resize_rejects_unsupported_and_unknown_shrink_without_preparation() {
+        for kind in [
+            FilesystemKind::Xfs,
+            FilesystemKind::Other("custom".to_owned()),
+        ] {
+            let (current, _, filesystem) = current_with_filesystem(kind);
+            let mut projection = Projection::from_current(&current);
+            assert!(
+                matches!(projection.simulate_action(&ProviderAction::Filesystem(FilesystemAction::Resize {
+                    filesystem, new_size: Bytes::new(60),
+                })), Err(ActionSimulationError::Validation { diagnostics })
+                    if diagnostics.iter().any(|diagnostic| diagnostic.code == "filesystem.resize.unsupported")
+                )
+            );
+        }
+        let (mut current, _, filesystem) = current_with_filesystem(FilesystemKind::Ext4);
+        let mut projection = Projection::from_current(&current);
+        assert!(
+            matches!(projection.simulate_action(&ProviderAction::Filesystem(FilesystemAction::Resize {
+                filesystem, new_size: Bytes::new(0),
+            })), Err(ActionSimulationError::Validation { diagnostics })
+                if diagnostics.iter().any(|diagnostic| diagnostic.code == "filesystem.resize.zero_size")
+            )
+        );
+        let mut node = current
+            .graph
+            .node(&filesystem)
+            .cloned()
+            .unwrap_or_else(|| panic!("filesystem is absent"));
+        node.kind.size = None;
+        current.graph.insert_node(filesystem, node);
+        assert!(
+            Projection::from_current(&current)
+                .simulate_action(&ProviderAction::Filesystem(FilesystemAction::Resize {
+                    filesystem,
+                    new_size: Bytes::new(60),
+                }))
+                .is_err()
+        );
     }
 
     /// Builds a current state containing one backing disk.

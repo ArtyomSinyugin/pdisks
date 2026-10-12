@@ -158,11 +158,11 @@ pub enum FilesystemAction {
         /// Requested exact capacity.
         new_size: Bytes,
     },
-    /// Performs a read-only or provider-default filesystem check.
+    /// Performs a strictly read-only filesystem check; repairs require a separate action.
     Check {
         /// Existing filesystem node.
         filesystem: NodeId,
-        /// Whether the provider may bypass its normal clean-state shortcut.
+        /// Whether the provider must bypass its normal clean-state shortcut.
         force: bool,
     },
     /// Repairs an existing filesystem.
