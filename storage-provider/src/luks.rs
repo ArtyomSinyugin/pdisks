@@ -244,7 +244,7 @@ fn translate_header(header: CryptsetupEntry) -> Result<LuksObservation, LuksVali
 }
 
 /// Checks one LUKS action against the canonical graph.
-fn validate_action(action: &LuksAction, graph: &NodeGraph) -> Vec<Diagnostic> {
+pub(crate) fn validate_action(action: &LuksAction, graph: &NodeGraph) -> Vec<Diagnostic> {
     match action {
         LuksAction::Format { target, .. } => validate_kind(
             graph,

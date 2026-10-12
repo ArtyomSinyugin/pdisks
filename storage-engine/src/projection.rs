@@ -6,13 +6,13 @@ use std::{
 };
 
 use storage_core::model::{
-    CurrentState, DependencyKind, FilesystemKind, MountContext, MountEntry, Node, NodeFacts,
-    NodeGraph, NodeId, NodeKind, ObservedMount,
+    CurrentState, DependencyKind, Diagnostic, DiagnosticSeverity, FilesystemKind, MountContext,
+    MountEntry, Node, NodeFacts, NodeGraph, NodeId, NodeKind, ObservedMount,
 };
 use storage_provider::{
     ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite, AllocationDomain,
     AllocationEffect, AllocationQuantity, BlockInterfaceAccess, GraphEffect, MountEffect,
-    NodeKindClass, PredictedEffect, ProviderAction, describe_action,
+    NodeKindClass, PredictedEffect, ProviderAction, describe_action, validate_provider_action,
 };
 use thiserror::Error;
 
@@ -121,6 +121,13 @@ impl Projection {
         &mut self,
         action: &ProviderAction,
     ) -> Result<SimulatedAction, ActionSimulationError> {
+        let diagnostics = validate_provider_action(action, &self.graph);
+        if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        {
+            return Err(ActionSimulationError::Validation { diagnostics });
+        }
         let contract = describe_action(action, ActionDescriptionContext { graph: &self.graph });
         let checks = self.evaluate_prerequisites(&contract.prerequisites);
         if checks
@@ -702,6 +709,12 @@ impl SimulatedAction {
 /// Failure to simulate one typed provider action.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ActionSimulationError {
+    /// Technology-specific validation rejected the action before effect application.
+    #[error("action failed technology-specific validation")]
+    Validation {
+        /// Provider diagnostics describing the invalid parameters or context.
+        diagnostics: Vec<Diagnostic>,
+    },
     /// At least one trusted contract prerequisite is known to be false.
     #[error("action has violated prerequisites")]
     PrerequisitesViolated {
@@ -804,6 +817,48 @@ mod tests {
     use storage_provider::{FilesystemAction, LvmAction, ProviderAction};
 
     use super::*;
+
+    /// Invalid LUKS names fail before any graph or runtime effect is published.
+    #[test]
+    fn invalid_luks_mapping_names_leave_projection_unchanged() {
+        let (mut current, _) = current_with_disk();
+        let container = NodeId::new();
+        current.graph.insert_node(
+            container,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LuksContainer {
+                        version: storage_core::model::LuksVersion::Luks2,
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        for name in ["", "bad/name", "bad\0name"] {
+            let mut projection = Projection::from_current(&current);
+            let original = projection.clone();
+            let result = projection.simulate_action(&ProviderAction::Luks(
+                storage_provider::LuksAction::Open {
+                    container,
+                    planned_node_id: NodeId::new(),
+                    mapping_name: name.to_owned(),
+                    credential: storage_provider::CredentialRef::from_uuid(container.as_uuid()),
+                    read_only: false,
+                },
+            ));
+            assert!(
+                matches!(
+                    result,
+                    Err(ActionSimulationError::Validation { diagnostics })
+                        if diagnostics.iter().any(|diagnostic|
+                            diagnostic.code == "luks.open.invalid_mapping_name")
+                ),
+                "invalid mapping name accepted: {name:?}"
+            );
+            assert_eq!(projection, original);
+        }
+    }
 
     /// Builds a current state containing one backing disk.
     fn current_with_disk() -> (CurrentState, NodeId) {

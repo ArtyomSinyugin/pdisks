@@ -3,7 +3,23 @@
 use serde::{Deserialize, Serialize};
 use storage_core::model::{Diagnostic, NodeGraph};
 
-use crate::BackendId;
+use crate::{BackendId, ProviderAction};
+
+/// Runs backend-independent technology checks against the effective graph.
+///
+/// LUKS shares the same checks with `LogicalProvider::validate_action`.
+/// Other technologies currently rely on their action-contract prerequisites;
+/// their parameter validators belong here as they are implemented.
+pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> Vec<Diagnostic> {
+    match action {
+        ProviderAction::Luks(action) => crate::luks::validate_action(action, graph),
+        ProviderAction::Partition(_)
+        | ProviderAction::Lvm(_)
+        | ProviderAction::Filesystem(_)
+        | ProviderAction::Btrfs(_)
+        | ProviderAction::Mount(_) => Vec::new(),
+    }
+}
 
 /// Stable identity of a logical provider such as `luks` or `lvm`.
 #[repr(transparent)]

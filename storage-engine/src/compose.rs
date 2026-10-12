@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use storage_core::model::{
-    CurrentState, DesiredState, DiagnosticSeverity, MountSource, NodeId, OperationIntent,
+    CurrentState, DesiredState, Diagnostic, DiagnosticSeverity, MountSource, NodeId,
+    OperationIntent,
 };
 use storage_provider::{
     ActionContract, ActionOutput, ActionPrerequisite, ActionResource, BlockInterfaceAccess,
@@ -484,6 +485,12 @@ fn simulate_order(
             Ok(result) => {
                 contracts.insert(*id, result.contract);
             }
+            Err(ActionSimulationError::Validation { diagnostics }) => {
+                return Err(CompositionError::ActionValidation {
+                    action: *id,
+                    diagnostics,
+                });
+            }
             Err(ActionSimulationError::PrerequisitesViolated { .. }) => {
                 return Err(CompositionError::ActionRejected(*id));
             }
@@ -692,6 +699,14 @@ fn requirement_can_be_checked_live(
 /// Failure to compose provider fragments into a safe global DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CompositionError {
+    /// A provider rejected action parameters or its intermediate graph context.
+    #[error("action {action:?} failed technology-specific validation")]
+    ActionValidation {
+        /// Global identity of the rejected action.
+        action: ActionId,
+        /// Provider diagnostics retained for review and caller reporting.
+        diagnostics: Vec<Diagnostic>,
+    },
     /// The number of fragments or actions exceeds the supported identity range.
     #[error("plan contains too many fragments or actions")]
     PlanTooLarge,
@@ -831,6 +846,78 @@ mod tests {
     };
 
     use super::*;
+
+    /// Technology validation sees predecessor outputs and preserves rejection diagnostics.
+    #[test]
+    fn validates_luks_resize_against_the_intermediate_graph() {
+        let (mut current, _) = current_with_vg();
+        let disk = NodeId::new();
+        current.graph.insert_node(
+            disk,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Disk,
+                    size: Some(Bytes::new(1024)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let baseline = current.clone();
+        let container = NodeId::new();
+        let mapping = NodeId::new();
+        let credential = storage_provider::CredentialRef::from_uuid(disk.as_uuid());
+        for size in [0, 16] {
+            let operations = vec![
+                LuksAction::Format {
+                    target: disk,
+                    planned_node_id: container,
+                    version: storage_core::model::LuksVersion::Luks2,
+                    credential,
+                },
+                LuksAction::Open {
+                    container,
+                    planned_node_id: mapping,
+                    mapping_name: "data".to_owned(),
+                    credential,
+                    read_only: false,
+                },
+                LuksAction::Resize {
+                    mapping,
+                    new_size: Some(Bytes::new(size)),
+                },
+            ];
+            let fragment = PlanFragment {
+                actions: operations
+                    .into_iter()
+                    .zip(0_u32..)
+                    .map(|(operation, id)| FragmentAction {
+                        id: LocalActionId::new(id),
+                        operation: ProviderAction::Luks(operation),
+                    })
+                    .collect(),
+                dependencies: Vec::new(),
+                external_requirements: Vec::new(),
+                origin: origin(mapping, "format, open, and resize LUKS"),
+                diagnostics: Vec::new(),
+            };
+            let result = compose_plan(&current, vec![fragment]);
+            if size == 0 {
+                assert!(matches!(
+                    result,
+                    Err(CompositionError::ActionValidation { action, diagnostics })
+                        if action == ActionId::new(2)
+                            && diagnostics.iter().any(|diagnostic|
+                                diagnostic.code == "luks.resize.zero_size")
+                ));
+            } else {
+                let plan = result.unwrap_or_else(|error| panic!("compose LUKS plan: {error}"));
+                let simulation = crate::simulate_plan(&current, &plan)
+                    .unwrap_or_else(|error| panic!("replay LUKS plan: {error}"));
+                assert_eq!(simulation.steps.len(), 3);
+            }
+            assert_eq!(current, baseline);
+        }
+    }
 
     /// Builds a baseline containing one existing volume group.
     fn current_with_vg() -> (CurrentState, NodeId) {

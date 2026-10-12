@@ -34,7 +34,7 @@ pub use contract::{
     NodeKindClass, Postcondition, PredictedEffect, ResourceAccess, ResourceAccessMode,
     RestartPolicy, describe_action, verify_imported_contract,
 };
-pub use logical::{LogicalProvider, ProviderId};
+pub use logical::{LogicalProvider, ProviderId, validate_provider_action};
 pub use luks::{
     CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProbeFailure,
     LuksProbeReport, LuksProvider, LuksValidationError,
