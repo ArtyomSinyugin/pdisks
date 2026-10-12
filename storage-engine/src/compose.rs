@@ -1339,6 +1339,121 @@ mod tests {
         assert!(compose_plan(&current, vec![fragment]).is_ok());
     }
 
+    /// Partition mutations conflict with creation in their shared metadata domain.
+    #[test]
+    fn partition_mutations_require_order_with_creation_in_the_same_table() {
+        let (mut current, _) = current_with_vg();
+        let table = NodeId::new();
+        let partition = NodeId::new();
+        current.graph.insert_node(
+            table,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::PartitionTable(storage_core::model::PartitionTable::Gpt),
+                    size: Some(Bytes::new(1024)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let attributes = storage_core::model::PartitionAttributes::default();
+        let number = std::num::NonZeroU32::new(1)
+            .unwrap_or_else(|| panic!("partition number must be nonzero"));
+        current.graph.insert_node(
+            partition,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Partition {
+                        number,
+                        offset: Bytes::new(0),
+                        role: None,
+                        attributes,
+                    },
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        current.graph.insert_dependency(Dependency {
+            from: table,
+            to: partition,
+            kind: DependencyKind::Contains {
+                offset: Bytes::new(0),
+            },
+        });
+        let baseline = current.clone();
+        for operation in [
+            PartitionAction::Delete { partition },
+            PartitionAction::Resize {
+                partition,
+                new_size: Bytes::new(60),
+            },
+            PartitionAction::SetAttributes {
+                partition,
+                attributes,
+            },
+        ] {
+            let mut fragment = PlanFragment {
+                actions: vec![
+                    FragmentAction {
+                        id: LocalActionId::new(0),
+                        operation: ProviderAction::Partition(operation),
+                    },
+                    FragmentAction {
+                        id: LocalActionId::new(1),
+                        operation: ProviderAction::Partition(PartitionAction::Create {
+                            table,
+                            planned_node_id: NodeId::new(),
+                            number: std::num::NonZeroU32::new(2)
+                                .unwrap_or_else(|| panic!("partition number must be nonzero")),
+                            offset: Bytes::new(200),
+                            size: Bytes::new(100),
+                            role: None,
+                            attributes,
+                        }),
+                    },
+                ],
+                dependencies: Vec::new(),
+                external_requirements: Vec::new(),
+                origin: origin(table, "mutate and create partitions"),
+                diagnostics: Vec::new(),
+            };
+            assert!(matches!(
+                compose_plan(&current, vec![fragment.clone()]),
+                Err(CompositionError::AmbiguousResourceOrder {
+                    resource: ActionResource::PartitionTable(id), ..
+                }) if id == table
+            ));
+            let mut independent_current = current.clone();
+            let other_table = NodeId::new();
+            independent_current.graph.insert_node(
+                other_table,
+                current
+                    .graph
+                    .node(&table)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("existing partition table is absent")),
+            );
+            let mut independent_fragment = fragment.clone();
+            if let ProviderAction::Partition(PartitionAction::Create { table, .. }) =
+                &mut independent_fragment.actions[1].operation
+            {
+                *table = other_table;
+            }
+            compose_plan(&independent_current, vec![independent_fragment])
+                .unwrap_or_else(|error| panic!("compose changes in different tables: {error}"));
+            fragment.dependencies.push(FragmentDependency {
+                before: LocalActionId::new(0),
+                after: LocalActionId::new(1),
+                reason: DependencyReason::ResourceCoordination,
+            });
+            let plan = compose_plan(&current, vec![fragment])
+                .unwrap_or_else(|error| panic!("compose ordered partition changes: {error}"));
+            crate::simulate_plan(&current, &plan)
+                .unwrap_or_else(|error| panic!("replay ordered partition changes: {error}"));
+            assert_eq!(current, baseline);
+        }
+    }
+
     /// Explicit checks remain in the plan despite having no graph effect.
     #[test]
     fn explicit_check_intent_requires_and_retains_matching_action() {

@@ -208,7 +208,7 @@ pub struct ResourceAccess {
 pub enum ActionResource {
     /// Canonical storage node.
     Node(NodeId),
-    /// Partition-table metadata domain.
+    /// Partition-table metadata domain keyed by the canonical table node, never a partition.
     PartitionTable(NodeId),
     /// LVM volume-group metadata domain.
     LvmMetadata(NodeId),
@@ -565,13 +565,17 @@ fn describe_partition(
     action: &PartitionAction,
     context: ActionDescriptionContext<'_>,
 ) -> ActionContract {
-    match action {
+    let mut result = match action {
         PartitionAction::CreateTable {
             disk,
             planned_node_id,
             table,
         } => {
             let mut result = destructive_contract(*disk, RestartPolicy::ManualRecovery);
+            write(
+                &mut result,
+                ActionResource::PartitionTable(*planned_node_id),
+            );
             let spec = NodeSpec {
                 kind: NodeKind::PartitionTable(*table),
                 size: known_size(context.graph, *disk),
@@ -674,7 +678,20 @@ fn describe_partition(
                 });
             result
         }
+    };
+    match action {
+        PartitionAction::Resize { partition, .. }
+        | PartitionAction::Delete { partition }
+        | PartitionAction::SetAttributes { partition, .. } => {
+            // Technology validation rejects missing or ambiguous ownership before simulation.
+            if let Some(table) = crate::logical::partition_table(context.graph, *partition) {
+                write(&mut result, ActionResource::PartitionTable(table));
+                invalidate(&mut result, table, FactKind::Topology);
+            }
+        }
+        PartitionAction::CreateTable { .. } | PartitionAction::Create { .. } => {}
     }
+    result
 }
 
 /// Describes LUKS actions.
