@@ -1413,6 +1413,333 @@ mod tests {
             .unwrap_or_else(|error| panic!("compose ordered check and backing resize: {error}"));
     }
 
+    /// Builds a linear LV without consumers for allocation-transition tests.
+    fn current_with_linear_lv() -> (CurrentState, NodeId, NodeId) {
+        let (mut current, vg) = current_with_vg();
+        let lv = NodeId::new();
+        current.graph.insert_node(
+            lv,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmLv(LvmLv {
+                        name: "old".to_owned(),
+                        kind: LvmLvKind::Linear,
+                    }),
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        current.graph.insert_dependency(Dependency {
+            from: vg,
+            to: lv,
+            kind: DependencyKind::Provides,
+        });
+        (current, vg, lv)
+    }
+
+    /// Growing an existing LV and creating another share the remaining free extents.
+    #[test]
+    fn rejects_growth_and_creation_over_the_shared_capacity() {
+        let (current, vg, lv) = current_with_linear_lv();
+        let fragment = PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Lvm(LvmAction::ResizeLv {
+                        lv,
+                        new_size: Bytes::new(160),
+                    }),
+                },
+                FragmentAction {
+                    id: LocalActionId::new(1),
+                    operation: ProviderAction::Lvm(LvmAction::CreateLv {
+                        vg,
+                        planned_node_id: NodeId::new(),
+                        name: "new".to_owned(),
+                        size: Bytes::new(60),
+                        layout: LvmLvKind::Linear,
+                    }),
+                },
+            ],
+            dependencies: vec![FragmentDependency {
+                before: LocalActionId::new(0),
+                after: LocalActionId::new(1),
+                reason: DependencyReason::ResourceCoordination,
+            }],
+            external_requirements: Vec::new(),
+            origin: origin(vg, "grow and create LV"),
+            diagnostics: Vec::new(),
+        };
+        for (free, succeeds) in [(40, false), (100, false), (120, true)] {
+            let evidence = [CapacityEvidence {
+                domain: AllocationDomain::LvmVolumeGroup(vg),
+                available: AllocationQuantity::new(free),
+            }];
+            let result = compose_plan_with_evidence(&current, vec![fragment.clone()], &evidence);
+            if succeeds {
+                let plan = result
+                    .unwrap_or_else(|error| panic!("compose balanced grow and create: {error}"));
+                crate::simulate_plan_with_evidence(&current, &plan, &evidence)
+                    .unwrap_or_else(|error| panic!("replay balanced grow and create: {error}"));
+            } else {
+                assert!(matches!(result, Err(CompositionError::ActionRejected(_))));
+            }
+        }
+    }
+
+    /// Capacity returned by shrink or removal is usable only after that action.
+    #[test]
+    fn shrink_and_removal_release_capacity_for_later_creation() {
+        let (current, vg, lv) = current_with_linear_lv();
+        let baseline = current.clone();
+        let evidence = [CapacityEvidence {
+            domain: AllocationDomain::LvmVolumeGroup(vg),
+            available: AllocationQuantity::new(0),
+        }];
+        for (operation, released) in [
+            (
+                LvmAction::ResizeLv {
+                    lv,
+                    new_size: Bytes::new(40),
+                },
+                60,
+            ),
+            (LvmAction::RemoveLv { lv }, 100),
+        ] {
+            let mut fragment = PlanFragment {
+                actions: vec![
+                    FragmentAction {
+                        id: LocalActionId::new(0),
+                        operation: ProviderAction::Lvm(operation),
+                    },
+                    FragmentAction {
+                        id: LocalActionId::new(1),
+                        operation: ProviderAction::Lvm(LvmAction::CreateLv {
+                            vg,
+                            planned_node_id: NodeId::new(),
+                            name: "new".to_owned(),
+                            size: Bytes::new(released),
+                            layout: LvmLvKind::Linear,
+                        }),
+                    },
+                ],
+                dependencies: vec![FragmentDependency {
+                    before: LocalActionId::new(0),
+                    after: LocalActionId::new(1),
+                    reason: DependencyReason::ResourceCoordination,
+                }],
+                external_requirements: Vec::new(),
+                origin: origin(vg, "release then allocate extents"),
+                diagnostics: Vec::new(),
+            };
+            let plan = compose_plan_with_evidence(&current, vec![fragment.clone()], &evidence)
+                .unwrap_or_else(|error| panic!("compose released capacity reuse: {error}"));
+            let simulation = crate::simulate_plan_with_evidence(&current, &plan, &evidence)
+                .unwrap_or_else(|error| panic!("replay released capacity reuse: {error}"));
+            let checks = simulation.projection.evaluate_prerequisites(&[
+                ActionPrerequisite::CapacityAvailable {
+                    domain: AllocationDomain::LvmVolumeGroup(vg),
+                    amount: Some(AllocationQuantity::new(1)),
+                },
+            ]);
+            assert!(matches!(
+                checks[0].status,
+                crate::CheckStatus::Violated { .. }
+            ));
+            fragment.dependencies[0].before = LocalActionId::new(1);
+            fragment.dependencies[0].after = LocalActionId::new(0);
+            assert!(matches!(
+                compose_plan_with_evidence(&current, vec![fragment], &evidence),
+                Err(CompositionError::ActionRejected(_))
+            ));
+            assert_eq!(current, baseline);
+        }
+    }
+
+    /// A created LV is accounted from the predecessor projection, without double credit on removal.
+    #[test]
+    fn creation_resize_and_removal_restore_capacity_exactly_once() {
+        let (current, vg) = current_with_vg();
+        let lv = NodeId::new();
+        let operations = [
+            LvmAction::CreateLv {
+                vg,
+                planned_node_id: lv,
+                name: "temporary".to_owned(),
+                size: Bytes::new(100),
+                layout: LvmLvKind::Linear,
+            },
+            LvmAction::ResizeLv {
+                lv,
+                new_size: Bytes::new(40),
+            },
+            LvmAction::RemoveLv { lv },
+        ];
+        let fragment = PlanFragment {
+            actions: operations
+                .into_iter()
+                .zip(0_u32..)
+                .map(|(operation, id)| FragmentAction {
+                    id: LocalActionId::new(id),
+                    operation: ProviderAction::Lvm(operation),
+                })
+                .collect(),
+            dependencies: vec![FragmentDependency {
+                before: LocalActionId::new(1),
+                after: LocalActionId::new(2),
+                reason: DependencyReason::ResourceCoordination,
+            }],
+            external_requirements: Vec::new(),
+            origin: origin(vg, "temporary LV lifecycle"),
+            diagnostics: Vec::new(),
+        };
+        let evidence = [CapacityEvidence {
+            domain: AllocationDomain::LvmVolumeGroup(vg),
+            available: AllocationQuantity::new(100),
+        }];
+        let plan = compose_plan_with_evidence(&current, vec![fragment], &evidence)
+            .unwrap_or_else(|error| panic!("compose temporary LV: {error}"));
+        let simulation = crate::simulate_plan_with_evidence(&current, &plan, &evidence)
+            .unwrap_or_else(|error| panic!("replay temporary LV: {error}"));
+        assert!(simulation.projection.graph().node(&lv).is_none());
+        let checks = simulation.projection.evaluate_prerequisites(&[
+            ActionPrerequisite::CapacityAvailable {
+                domain: AllocationDomain::LvmVolumeGroup(vg),
+                amount: Some(AllocationQuantity::new(100)),
+            },
+            ActionPrerequisite::CapacityAvailable {
+                domain: AllocationDomain::LvmVolumeGroup(vg),
+                amount: Some(AllocationQuantity::new(101)),
+            },
+        ]);
+        assert!(matches!(
+            checks[0].status,
+            crate::CheckStatus::Satisfied(crate::CheckEvidence::PredictedEffect)
+        ));
+        assert!(matches!(
+            checks[1].status,
+            crate::CheckStatus::Violated { .. }
+        ));
+    }
+
+    /// Unmodelled layouts and missing geometry cannot leave stale free-capacity evidence usable.
+    #[test]
+    fn unknown_lvm_allocation_invalidates_the_capacity_forecast() {
+        let (current, vg, lv) = current_with_linear_lv();
+        for (layout, size, extent) in [
+            (LvmLvKind::Thin, Some(Bytes::new(100)), Some(Bytes::new(1))),
+            (LvmLvKind::Linear, None, Some(Bytes::new(1))),
+            (LvmLvKind::Linear, Some(Bytes::new(100)), None),
+            (
+                LvmLvKind::Linear,
+                Some(Bytes::new(101)),
+                Some(Bytes::new(4)),
+            ),
+        ] {
+            let mut baseline = current.clone();
+            baseline.graph.insert_node(
+                lv,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmLv(LvmLv {
+                            name: "old".to_owned(),
+                            kind: layout.clone(),
+                        }),
+                        size,
+                    },
+                    size: NodeFacts::default(),
+                },
+            );
+            baseline.graph.insert_node(
+                vg,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmVg {
+                            name: "vg0".to_owned(),
+                            extent_size: extent,
+                        },
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
+                },
+            );
+            let domain = AllocationDomain::LvmVolumeGroup(vg);
+            let mut operations = vec![
+                LvmAction::ResizeLv {
+                    lv,
+                    new_size: Bytes::new(160),
+                },
+                LvmAction::RemoveLv { lv },
+            ];
+            if layout != LvmLvKind::Linear || extent.is_none() {
+                operations.push(LvmAction::CreateLv {
+                    vg,
+                    planned_node_id: NodeId::new(),
+                    name: "unknown".to_owned(),
+                    size: Bytes::new(4),
+                    layout,
+                });
+            }
+            for operation in operations {
+                let mut projection = Projection::from_current(&baseline)
+                    .with_capacity_evidence(&[CapacityEvidence {
+                        domain: domain.clone(),
+                        available: AllocationQuantity::new(100),
+                    }])
+                    .unwrap_or_else(|error| panic!("initialize allocation evidence: {error}"));
+                projection
+                    .simulate_action(&ProviderAction::Lvm(operation))
+                    .unwrap_or_else(|error| panic!("simulate unknown allocation: {error}"));
+                let later = projection
+                    .simulate_action(&ProviderAction::Lvm(LvmAction::CreateLv {
+                        vg,
+                        planned_node_id: NodeId::new(),
+                        name: "later".to_owned(),
+                        size: Bytes::new(4),
+                        layout: LvmLvKind::Linear,
+                    }))
+                    .unwrap_or_else(|error| {
+                        panic!("simulate allocation after unknown mutation: {error}")
+                    });
+                assert!(later.checks.iter().any(|check| matches!(
+                    check,
+                    crate::PrerequisiteCheck {
+                        prerequisite: ActionPrerequisite::CapacityAvailable { .. },
+                        status: crate::CheckStatus::Unknown { .. }
+                    }
+                )));
+            }
+        }
+    }
+
+    /// Overflow in returned capacity rejects the whole effect, including node deletion.
+    #[test]
+    fn overflowing_capacity_release_leaves_the_projection_unchanged() {
+        let (mut current, vg, lv) = current_with_linear_lv();
+        let mut node = current
+            .graph
+            .node(&lv)
+            .cloned()
+            .unwrap_or_else(|| panic!("LV is absent"));
+        node.kind.size = Some(Bytes::new(u64::MAX));
+        current.graph.insert_node(lv, node);
+        let mut projection = Projection::from_current(&current)
+            .with_capacity_evidence(&[CapacityEvidence {
+                domain: AllocationDomain::LvmVolumeGroup(vg),
+                available: AllocationQuantity::new(1),
+            }])
+            .unwrap_or_else(|error| panic!("initialize overflow evidence: {error}"));
+        let before = projection.clone();
+        assert!(matches!(
+            projection.simulate_action(&ProviderAction::Lvm(LvmAction::RemoveLv { lv })),
+            Err(ActionSimulationError::Effect(
+                crate::EffectApplicationError::CapacityOverflow(_)
+            ))
+        ));
+        assert_eq!(projection, before);
+    }
+
     /// Cumulative reservations reject two locally valid allocations over capacity.
     #[test]
     fn rejects_cumulative_volume_group_overallocation() {

@@ -265,6 +265,11 @@ pub struct PredictedEffect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocationEffect {
+    /// Discards free-capacity evidence after a mutation with unknown physical allocation.
+    Invalidate {
+        /// Domain that needs fresh provider allocation evidence.
+        domain: AllocationDomain,
+    },
     /// Consumes capacity from a provider-owned allocation domain.
     Reserve {
         /// Domain whose free capacity decreases.
@@ -866,7 +871,7 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
             let mut result = contract(RestartPolicy::ReprobeThenRetry);
             require_kind(&mut result, *vg, NodeKindClass::LvmVg);
             let allocation_domain = AllocationDomain::LvmVolumeGroup(*vg);
-            let allocation = lvm_create_allocation(context.graph, *vg, *size, layout);
+            let allocation = lvm_allocation(context.graph, *vg, *size, layout);
             result
                 .prerequisites
                 .push(ActionPrerequisite::CapacityAvailable {
@@ -895,13 +900,19 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
                         domain: allocation_domain,
                         amount,
                     });
+            } else {
+                result
+                    .predicted_effect
+                    .allocations
+                    .push(AllocationEffect::Invalidate {
+                        domain: allocation_domain,
+                    });
             }
             invalidate(&mut result, *vg, FactKind::Geometry);
             invalidate(&mut result, *vg, FactKind::Topology);
             result
         }
         LvmAction::ResizeLv { lv, new_size } => {
-            // shortcut: allocation accounting covers CreateLv first, extend it when existing LVM allocation evidence is modelled.
             let mut result = resize_contract(
                 context,
                 *lv,
@@ -911,6 +922,48 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
             );
             if let Some(vg) = lvm_volume_group(context.graph, *lv) {
                 write(&mut result, ActionResource::LvmMetadata(vg));
+                let domain = AllocationDomain::LvmVolumeGroup(vg);
+                let old = known_size(context.graph, *lv)
+                    .and_then(|size| lvm_lv_allocation(context.graph, vg, *lv, size));
+                let new = lvm_lv_allocation(context.graph, vg, *lv, *new_size);
+                match (old, new) {
+                    (Some(old), Some(new)) if new > old => {
+                        let amount = AllocationQuantity::new(new.get() - old.get());
+                        result
+                            .prerequisites
+                            .push(ActionPrerequisite::CapacityAvailable {
+                                domain: domain.clone(),
+                                amount: Some(amount),
+                            });
+                        result
+                            .predicted_effect
+                            .allocations
+                            .push(AllocationEffect::Reserve { domain, amount });
+                    }
+                    (Some(old), Some(new)) if new < old => {
+                        result
+                            .predicted_effect
+                            .allocations
+                            .push(AllocationEffect::Release {
+                                domain,
+                                amount: AllocationQuantity::new(old.get() - new.get()),
+                            });
+                    }
+                    (Some(_), Some(_)) => {}
+                    _ => {
+                        result
+                            .prerequisites
+                            .push(ActionPrerequisite::CapacityAvailable {
+                                domain: domain.clone(),
+                                amount: None,
+                            });
+                        result
+                            .predicted_effect
+                            .allocations
+                            .push(AllocationEffect::Invalidate { domain });
+                    }
+                }
+                invalidate(&mut result, vg, FactKind::Geometry);
             }
             result
         }
@@ -918,6 +971,15 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
             let mut result = remove_node_contract(context, *lv, NodeKindClass::LvmLv, true);
             if let Some(vg) = lvm_volume_group(context.graph, *lv) {
                 write(&mut result, ActionResource::LvmMetadata(vg));
+                let domain = AllocationDomain::LvmVolumeGroup(vg);
+                let allocation = known_size(context.graph, *lv)
+                    .and_then(|size| lvm_lv_allocation(context.graph, vg, *lv, size));
+                result.predicted_effect.allocations.push(match allocation {
+                    Some(amount) => AllocationEffect::Release { domain, amount },
+                    None => AllocationEffect::Invalidate { domain },
+                });
+                invalidate(&mut result, vg, FactKind::Geometry);
+                invalidate(&mut result, vg, FactKind::Topology);
             }
             result
         }
@@ -1620,8 +1682,8 @@ pub(crate) fn is_ext_filesystem(graph: &NodeGraph, node: NodeId) -> bool {
     })
 }
 
-/// Calculates linear-LV allocation in VG extents when the extent size is known.
-fn lvm_create_allocation(
+/// Calculates exact linear-LV allocation only for known, extent-aligned capacity.
+fn lvm_allocation(
     graph: &NodeGraph,
     vg: NodeId,
     size: Bytes,
@@ -1638,19 +1700,36 @@ fn lvm_create_allocation(
         } if extent_size.as_u64() > 0 => extent_size.as_u64(),
         _ => return None,
     };
-    Some(AllocationQuantity::new(size.as_u64().div_ceil(extent_size)))
+    if size.as_u64() == 0 || !size.as_u64().is_multiple_of(extent_size) {
+        return None;
+    }
+    Some(AllocationQuantity::new(size.as_u64() / extent_size))
 }
 
-/// Returns the volume-group metadata domain that owns one logical volume.
-fn lvm_volume_group(graph: &NodeGraph, lv: NodeId) -> Option<NodeId> {
-    graph.dependencies().find_map(|dependency| {
-        (dependency.to == lv
-            && dependency.kind == DependencyKind::Provides
-            && graph
-                .node(&dependency.from)
-                .is_some_and(|node| matches!(node.kind.kind, NodeKind::LvmVg { .. })))
-        .then_some(dependency.from)
-    })
+/// Calculates allocation for the layout of an existing or previously created LV.
+fn lvm_lv_allocation(
+    graph: &NodeGraph,
+    vg: NodeId,
+    lv: NodeId,
+    size: Bytes,
+) -> Option<AllocationQuantity> {
+    let NodeKind::LvmLv(value) = &graph.node(&lv)?.kind.kind else {
+        return None;
+    };
+    lvm_allocation(graph, vg, size, &value.kind)
+}
+
+/// Returns exactly one owning VG metadata domain, rejecting missing or ambiguous ownership.
+pub(crate) fn lvm_volume_group(graph: &NodeGraph, lv: NodeId) -> Option<NodeId> {
+    let mut owners = graph
+        .dependencies()
+        .filter(|dependency| dependency.to == lv && dependency.kind == DependencyKind::Provides);
+    let owner = owners.next()?;
+    (owners.next().is_none()
+        && graph
+            .node(&owner.from)
+            .is_some_and(|node| matches!(node.kind.kind, NodeKind::LvmVg { .. })))
+    .then_some(owner.from)
 }
 
 /// Returns the graph node referenced by a mount source, when one exists.
@@ -2062,12 +2141,41 @@ mod tests {
             kind: DependencyKind::Provides,
         });
 
-        for action in [
-            LvmAction::ResizeLv {
-                lv,
-                new_size: Bytes::new(80),
-            },
-            LvmAction::RemoveLv { lv },
+        for (action, expected) in [
+            (
+                LvmAction::ResizeLv {
+                    lv,
+                    new_size: Bytes::new(80),
+                },
+                vec![AllocationEffect::Reserve {
+                    domain: AllocationDomain::LvmVolumeGroup(vg),
+                    amount: AllocationQuantity::new(5),
+                }],
+            ),
+            (
+                LvmAction::ResizeLv {
+                    lv,
+                    new_size: Bytes::new(40),
+                },
+                vec![AllocationEffect::Release {
+                    domain: AllocationDomain::LvmVolumeGroup(vg),
+                    amount: AllocationQuantity::new(5),
+                }],
+            ),
+            (
+                LvmAction::ResizeLv {
+                    lv,
+                    new_size: Bytes::new(60),
+                },
+                Vec::new(),
+            ),
+            (
+                LvmAction::RemoveLv { lv },
+                vec![AllocationEffect::Release {
+                    domain: AllocationDomain::LvmVolumeGroup(vg),
+                    amount: AllocationQuantity::new(15),
+                }],
+            ),
         ] {
             let contract = describe_action(
                 &ProviderAction::Lvm(action),
@@ -2084,6 +2192,33 @@ mod tests {
                     .iter()
                     .any(|access| { access.resource == ActionResource::LvmMetadata(lv) })
             );
+            assert_eq!(contract.predicted_effect.allocations, expected);
+            let json = serde_json::to_string(&contract)
+                .unwrap_or_else(|error| panic!("serialize LVM allocation contract: {error}"));
+            let restored = serde_json::from_str::<ActionContract>(&json)
+                .unwrap_or_else(|error| panic!("deserialize LVM allocation contract: {error}"));
+            assert_eq!(restored, contract);
         }
+        let mut node = graph
+            .node(&lv)
+            .cloned()
+            .unwrap_or_else(|| panic!("LV is absent"));
+        node.kind.size = None;
+        graph.insert_node(lv, node);
+        let contract = describe_action(
+            &ProviderAction::Lvm(LvmAction::RemoveLv { lv }),
+            ActionDescriptionContext { graph: &graph },
+        );
+        assert_eq!(
+            contract.predicted_effect.allocations,
+            vec![AllocationEffect::Invalidate {
+                domain: AllocationDomain::LvmVolumeGroup(vg)
+            }]
+        );
+        let json = serde_json::to_string(&contract)
+            .unwrap_or_else(|error| panic!("serialize unknown LVM allocation: {error}"));
+        let restored = serde_json::from_str::<ActionContract>(&json)
+            .unwrap_or_else(|error| panic!("deserialize unknown LVM allocation: {error}"));
+        assert_eq!(restored, contract);
     }
 }

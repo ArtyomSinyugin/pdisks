@@ -69,6 +69,22 @@ Runtime mount changes and offline filesystem actions share the conservative
 unordered DAG. Bind and unsupported mount sources require further live evidence
 to prove that the filesystem is unmounted. Real write dispatch is still disabled.
 
+Linear LVM allocation uses the owning VG's physical extents. `CreateLv` reserves
+the requested extents, `ResizeLv` reserves or releases the difference from its
+predecessor-state size, and `RemoveLv` releases that predecessor allocation once.
+Known free capacity is supplied as baseline `CapacityEvidence`; it is never
+inferred by subtracting logical node sizes from VG size. Allocation effects
+remain atomic with graph changes, including overflow checks on returned extents.
+
+Known linear sizes must be exact multiples of a nonzero extent size; requests
+are rejected instead of silently rounded. Missing or ambiguous VG ownership is
+also rejected. Missing sizes or extent geometry and non-linear layouts require
+provider allocation calculation. Their `AllocationEffect::Invalidate` discards
+the domain's old free-capacity forecast, so later allocations remain conditional
+until fresh provider evidence is available. Logical thin or RAID sizes are not
+treated as physical allocation. The [LVM creation manual](https://man7.org/linux/man-pages/man8/lvcreate.8.html)
+describes physical extent allocation and virtual sizes.
+
 ## Backend manifests
 
 Backend manifests belong to pdisks. Third-party packages such as `libzfs`,

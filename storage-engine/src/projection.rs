@@ -665,6 +665,10 @@ impl Projection {
     ) -> Result<(), EffectApplicationError> {
         for effect in effects {
             match effect {
+                AllocationEffect::Invalidate { domain } => {
+                    self.available_capacity.remove(domain);
+                    self.projected_allocations.insert(domain.clone());
+                }
                 AllocationEffect::Reserve { domain, amount } => {
                     let Some(available) = self.available_capacity.get_mut(domain) else {
                         continue;
@@ -1095,6 +1099,27 @@ mod tests {
             kind: LvmLvKind::Linear,
         });
         current.graph.insert_node(disk, backing);
+        let vg = NodeId::new();
+        current.graph.insert_node(
+            vg,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmVg {
+                        name: "vg0".to_owned(),
+                        extent_size: Some(Bytes::new(1)),
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        current
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: vg,
+                to: disk,
+                kind: DependencyKind::Provides,
+            });
         let forced_check = ProviderAction::Filesystem(FilesystemAction::Check {
             filesystem,
             force: true,

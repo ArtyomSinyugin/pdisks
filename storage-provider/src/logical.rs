@@ -5,17 +5,19 @@ use storage_core::model::{
     DependencyKind, Diagnostic, DiagnosticSeverity, DiagnosticSubject, NodeGraph, NodeId, NodeKind,
 };
 
-use crate::{BackendId, FilesystemAction, PartitionAction, ProviderAction};
+use crate::{BackendId, FilesystemAction, LvmAction, PartitionAction, ProviderAction};
 
 /// Runs backend-independent technology checks against the effective graph.
 ///
 /// LUKS shares the same checks with `LogicalProvider::validate_action`.
 /// Partition mutations require an unambiguous table metadata domain.
+/// LVM validates ownership, nonzero size, and exact linear extent alignment.
 /// Other technologies currently rely on their action-contract prerequisites;
 /// their parameter validators belong here as they are implemented.
 pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> Vec<Diagnostic> {
     match action {
         ProviderAction::Luks(action) => crate::luks::validate_action(action, graph),
+        ProviderAction::Lvm(action) => validate_lvm_action(action, graph),
         ProviderAction::Filesystem(FilesystemAction::Resize {
             filesystem,
             new_size,
@@ -64,10 +66,92 @@ pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> V
         ProviderAction::Partition(
             PartitionAction::CreateTable { .. } | PartitionAction::Create { .. },
         )
-        | ProviderAction::Lvm(_)
         | ProviderAction::Filesystem(_)
         | ProviderAction::Btrfs(_)
         | ProviderAction::Mount(_) => Vec::new(),
+    }
+}
+
+/// Rejects ambiguous allocation domains and sizes that cannot be represented exactly by extents.
+fn validate_lvm_action(action: &LvmAction, graph: &NodeGraph) -> Vec<Diagnostic> {
+    let (subject, vg, size, linear) =
+        match action {
+            LvmAction::CreateLv {
+                vg, size, layout, ..
+            } => (
+                *vg,
+                *vg,
+                *size,
+                matches!(layout, storage_core::model::LvmLvKind::Linear),
+            ),
+            LvmAction::ResizeLv { lv, new_size } => {
+                let Some(vg) = crate::contract::lvm_volume_group(graph, *lv) else {
+                    return vec![lvm_action_diagnostic(
+                        *lv,
+                        "lvm.action.invalid_vg_ownership",
+                        "LV mutation requires exactly one owning volume group",
+                    )];
+                };
+                let linear = graph.node(lv).is_some_and(|node| matches!(&node.kind.kind,
+                NodeKind::LvmLv(value) if value.kind == storage_core::model::LvmLvKind::Linear
+            ));
+                (*lv, vg, *new_size, linear)
+            }
+            LvmAction::RemoveLv { lv } => {
+                return if crate::contract::lvm_volume_group(graph, *lv).is_some() {
+                    Vec::new()
+                } else {
+                    vec![lvm_action_diagnostic(
+                        *lv,
+                        "lvm.action.invalid_vg_ownership",
+                        "LV mutation requires exactly one owning volume group",
+                    )]
+                };
+            }
+            LvmAction::CreatePv { .. }
+            | LvmAction::CreateVg { .. }
+            | LvmAction::SetActivation { .. } => return Vec::new(),
+        };
+    if size.as_u64() == 0 {
+        return vec![lvm_action_diagnostic(
+            subject,
+            "lvm.action.zero_size",
+            "LV capacity must be greater than zero",
+        )];
+    }
+    if let Some(node) = graph.node(&vg)
+        && let NodeKind::LvmVg {
+            extent_size: Some(extent),
+            ..
+        } = node.kind.kind
+    {
+        if extent.as_u64() == 0 {
+            return vec![lvm_action_diagnostic(
+                subject,
+                "lvm.action.invalid_extent_size",
+                "VG extent size must be greater than zero",
+            )];
+        }
+        if linear && !size.as_u64().is_multiple_of(extent.as_u64()) {
+            return vec![lvm_action_diagnostic(
+                subject,
+                "lvm.action.unaligned_size",
+                "requested linear LV capacity must be an exact multiple of the VG extent size",
+            )];
+        }
+    }
+    Vec::new()
+}
+
+/// Builds a stable node-scoped LVM parameter or ownership diagnostic.
+fn lvm_action_diagnostic(node: NodeId, code: &str, message: &str) -> Diagnostic {
+    Diagnostic {
+        code: code.to_owned(),
+        severity: DiagnosticSeverity::Error,
+        subjects: vec![DiagnosticSubject::Node(node)],
+        message: message.to_owned(),
+        evidence: None,
+        suggested_remedy: None,
     }
 }
 
@@ -146,6 +230,137 @@ mod tests {
     };
 
     use super::*;
+
+    /// LVM sizes are never silently rounded, and mutations cannot choose an arbitrary VG.
+    #[test]
+    fn lvm_sizes_and_allocation_domains_are_validated() {
+        let vg = NodeId::new();
+        let lv = NodeId::new();
+        let mut graph = NodeGraph::new();
+        graph.insert_node(
+            vg,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmVg {
+                        name: "vg0".to_owned(),
+                        extent_size: Some(Bytes::new(4)),
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        graph.insert_node(
+            lv,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmLv(storage_core::model::LvmLv {
+                        name: "data".to_owned(),
+                        kind: storage_core::model::LvmLvKind::Linear,
+                    }),
+                    size: Some(Bytes::new(60)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let ownership = Dependency {
+            from: vg,
+            to: lv,
+            kind: DependencyKind::Provides,
+        };
+        graph.insert_dependency(ownership.clone());
+        for (size, code) in [
+            (0, Some("lvm.action.zero_size")),
+            (62, Some("lvm.action.unaligned_size")),
+            (64, None),
+        ] {
+            for action in [
+                LvmAction::CreateLv {
+                    vg,
+                    planned_node_id: NodeId::new(),
+                    name: "new".to_owned(),
+                    size: Bytes::new(size),
+                    layout: storage_core::model::LvmLvKind::Linear,
+                },
+                LvmAction::ResizeLv {
+                    lv,
+                    new_size: Bytes::new(size),
+                },
+            ] {
+                let diagnostics = validate_provider_action(&ProviderAction::Lvm(action), &graph);
+                if let Some(code) = code {
+                    assert!(
+                        matches!(diagnostics.as_slice(), [diagnostic] if diagnostic.code == code)
+                    );
+                } else {
+                    assert!(diagnostics.is_empty());
+                }
+            }
+        }
+        let mut invalid_extent = graph.clone();
+        invalid_extent.insert_node(
+            vg,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmVg {
+                        name: "vg0".to_owned(),
+                        extent_size: Some(Bytes::new(0)),
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let diagnostics = validate_provider_action(
+            &ProviderAction::Lvm(LvmAction::ResizeLv {
+                lv,
+                new_size: Bytes::new(64),
+            }),
+            &invalid_extent,
+        );
+        assert!(
+            matches!(diagnostics.as_slice(), [diagnostic] if diagnostic.code == "lvm.action.invalid_extent_size")
+        );
+        let other_vg = NodeId::new();
+        graph.insert_node(
+            other_vg,
+            graph
+                .node(&vg)
+                .cloned()
+                .unwrap_or_else(|| panic!("VG is absent")),
+        );
+        for owner_count in [0, 1, 2] {
+            graph.remove_dependency(&ownership);
+            let competing = Dependency {
+                from: other_vg,
+                to: lv,
+                kind: DependencyKind::Provides,
+            };
+            graph.remove_dependency(&competing);
+            if owner_count >= 1 {
+                graph.insert_dependency(ownership.clone());
+            }
+            if owner_count == 2 {
+                graph.insert_dependency(competing);
+            }
+            for action in [
+                LvmAction::ResizeLv {
+                    lv,
+                    new_size: Bytes::new(64),
+                },
+                LvmAction::RemoveLv { lv },
+            ] {
+                let diagnostics = validate_provider_action(&ProviderAction::Lvm(action), &graph);
+                if owner_count == 1 {
+                    assert!(diagnostics.is_empty());
+                } else {
+                    assert!(
+                        matches!(diagnostics.as_slice(), [diagnostic] if diagnostic.code == "lvm.action.invalid_vg_ownership")
+                    );
+                }
+            }
+        }
+    }
 
     /// Unknown, invalid, or competing ownership cannot bypass partition metadata locking.
     #[test]
