@@ -133,21 +133,17 @@ pub fn compose_plan_with_evidence(
     } = flatten_fragments(&fragments)?;
     bind_planned_nodes(current, &draft, &mut dependencies)?;
     bind_mount_order(&draft, &mut dependencies)?;
-    bind_baseline_outputs(
+    let first_contracts = simulate_order(
         current,
         capacity_evidence,
         &draft,
         &requirements,
         &mut dependencies,
     )?;
-
-    let first_order = topological_order(draft.len(), &dependencies)?;
-    let first_contracts = simulate_order(current, capacity_evidence, &draft, &first_order)?;
     resolve_requirements(&requirements, &first_contracts, &mut dependencies)?;
 
-    let final_order = topological_order(draft.len(), &dependencies)?;
     let final_contracts =
-        simulate_order(current, capacity_evidence, &draft, &final_order)?.contracts;
+        simulate_order(current, capacity_evidence, &draft, &[], &mut dependencies)?.contracts;
     validate_declared_requirements(&requirements, &final_contracts)?;
     validate_resource_order(&final_contracts, &dependencies)?;
 
@@ -432,48 +428,53 @@ fn runtime_mount_target(action: &ProviderAction) -> Option<(&Path, &MountContext
     }
 }
 
-/// Binds outputs describable from the baseline before a consumer can fail first replay.
-/// Planned-node-dependent outputs are resolved from the subsequent trusted trace.
-fn bind_baseline_outputs(
-    current: &CurrentState,
-    capacity_evidence: &[CapacityEvidence],
+/// Binds a missing declared output in the consumer's current predecessor context.
+/// Already replayed actions cannot supply a revoked guarantee by being retried implicitly.
+fn bind_contextual_outputs(
+    projection: &Projection,
+    action: &DraftAction,
     actions: &[DraftAction],
+    emitted: &HashMap<ActionId, ActionContract>,
     requirements: &[PendingRequirement],
     dependencies: &mut Vec<ActionDependency>,
-) -> Result<(), CompositionError> {
-    let baseline = Projection::from_current(current)
-        .with_capacity_evidence(capacity_evidence)
-        .map_err(CompositionError::CapacityEvidence)?;
-    let contracts = actions
+) -> Result<bool, CompositionError> {
+    let owned = requirements
         .iter()
-        .map(|action| {
-            (
-                action.id,
-                describe_action(
-                    &action.operation,
-                    ActionDescriptionContext {
-                        graph: &current.graph,
-                    },
-                ),
-            )
-        })
+        .filter(|requirement| requirement.action == action.id)
+        .collect::<Vec<_>>();
+    if owned.is_empty() {
+        return Ok(false);
+    }
+    let context = ActionDescriptionContext {
+        graph: projection.graph(),
+    };
+    let contract = describe_action(&action.operation, context);
+    let providers = actions
+        .iter()
+        .filter(|candidate| !emitted.contains_key(&candidate.id))
+        .map(|candidate| (candidate.id, describe_action(&candidate.operation, context)))
         .collect();
-    for requirement in requirements {
+    for requirement in owned {
+        if !contract.prerequisites.contains(&requirement.prerequisite) {
+            return Err(CompositionError::RequirementNotInContract { action: action.id });
+        }
         let check =
-            baseline.evaluate_prerequisites(std::slice::from_ref(&requirement.prerequisite));
+            projection.evaluate_prerequisites(std::slice::from_ref(&requirement.prerequisite));
         if matches!(check[0].status, crate::CheckStatus::Satisfied(_)) {
             continue;
         }
-        if let Some(provider) = requirement_provider(requirement, &contracts, dependencies)? {
+        if let Some(provider) = requirement_provider(requirement, &providers, dependencies)? {
+            // An unexecuted provider cannot already precede this action in the current topological order.
             add_dependency(
                 dependencies,
                 provider,
-                requirement.action,
+                action.id,
                 DependencyReason::InterfacePreparation,
             )?;
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Selects one output provider, honoring explicit phases and rejecting unordered alternatives.
@@ -640,40 +641,59 @@ fn dependency_path(before: ActionId, after: ActionId, dependencies: &[ActionDepe
     false
 }
 
-/// Simulates all actions in one candidate topological order.
+/// Replays a candidate order, restarting from C0 whenever a contextual output adds an edge.
+/// Every restart adds a new dependency; final replay passes no requirements and cannot alter the DAG.
 fn simulate_order(
     current: &CurrentState,
     capacity_evidence: &[CapacityEvidence],
     actions: &[DraftAction],
-    order: &[ActionId],
+    requirements: &[PendingRequirement],
+    dependencies: &mut Vec<ActionDependency>,
 ) -> Result<AnalysedOrder, CompositionError> {
-    let mut projection = Projection::from_current(current)
-        .with_capacity_evidence(capacity_evidence)
-        .map_err(CompositionError::CapacityEvidence)?;
-    let mut contracts = HashMap::new();
-    let mut checks = HashMap::new();
-    for id in order {
-        let action = &actions[id.get() as usize];
-        match projection.simulate_action(&action.operation) {
-            Ok(result) => {
-                contracts.insert(*id, result.contract);
-                checks.insert(*id, result.checks);
+    loop {
+        let order = topological_order(actions.len(), dependencies)?;
+        let mut projection = Projection::from_current(current)
+            .with_capacity_evidence(capacity_evidence)
+            .map_err(CompositionError::CapacityEvidence)?;
+        let mut contracts = HashMap::new();
+        let mut checks = HashMap::new();
+        let mut rebound = false;
+        for id in order {
+            let action = &actions[id.get() as usize];
+            if bind_contextual_outputs(
+                &projection,
+                action,
+                actions,
+                &contracts,
+                requirements,
+                dependencies,
+            )? {
+                rebound = true;
+                break;
             }
-            Err(ActionSimulationError::Validation { diagnostics }) => {
-                return Err(CompositionError::ActionValidation {
-                    action: *id,
-                    diagnostics,
-                });
-            }
-            Err(ActionSimulationError::PrerequisitesViolated { .. }) => {
-                return Err(CompositionError::ActionRejected(*id));
-            }
-            Err(ActionSimulationError::Effect(error)) => {
-                return Err(CompositionError::Effect { action: *id, error });
+            match projection.simulate_action(&action.operation) {
+                Ok(result) => {
+                    contracts.insert(id, result.contract);
+                    checks.insert(id, result.checks);
+                }
+                Err(ActionSimulationError::Validation { diagnostics }) => {
+                    return Err(CompositionError::ActionValidation {
+                        action: id,
+                        diagnostics,
+                    });
+                }
+                Err(ActionSimulationError::PrerequisitesViolated { .. }) => {
+                    return Err(CompositionError::ActionRejected(id));
+                }
+                Err(ActionSimulationError::Effect(error)) => {
+                    return Err(CompositionError::Effect { action: id, error });
+                }
             }
         }
+        if !rebound {
+            return Ok(AnalysedOrder { contracts, checks });
+        }
     }
-    Ok(AnalysedOrder { contracts, checks })
 }
 
 /// Calculates a stable topological order or reports a cycle.
@@ -3133,5 +3153,99 @@ mod tests {
                 ))
             );
         }
+    }
+    /// A new filesystem's clean-check output requires its creator's intermediate graph context.
+    #[test]
+    fn binds_contextual_outputs_for_a_new_filesystem_before_first_consumer_replay() {
+        let (current, _vg, lv) = current_with_linear_lv();
+        let baseline = current.clone();
+        let filesystem = NodeId::new();
+        let mut fragment = PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Filesystem(FilesystemAction::Resize {
+                        filesystem,
+                        new_size: Bytes::new(60),
+                    }),
+                },
+                FragmentAction {
+                    id: LocalActionId::new(1),
+                    operation: ProviderAction::Filesystem(FilesystemAction::Create {
+                        backing: lv,
+                        planned_node_id: filesystem,
+                        filesystem: FilesystemKind::Ext4,
+                        label: None,
+                    }),
+                },
+                FragmentAction {
+                    id: LocalActionId::new(2),
+                    operation: ProviderAction::Filesystem(FilesystemAction::Check {
+                        filesystem,
+                        force: true,
+                    }),
+                },
+            ],
+            dependencies: Vec::new(),
+            external_requirements: vec![ExternalRequirement {
+                action: LocalActionId::new(0),
+                prerequisite: ActionPrerequisite::FilesystemCheckPassed(filesystem),
+            }],
+            origin: origin(filesystem, "create, check, and resize filesystem"),
+            diagnostics: Vec::new(),
+        };
+        let plan = compose_plan(&current, vec![fragment.clone()])
+            .unwrap_or_else(|error| panic!("bind check in created filesystem context: {error}"));
+        assert_eq!(
+            plan.ordered_actions()
+                .iter()
+                .map(|action| action.local_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        let simulation = crate::simulate_plan(&current, &plan)
+            .unwrap_or_else(|error| panic!("replay new filesystem check and resize: {error}"));
+        assert!(
+            simulation.steps[2]
+                .checks
+                .iter()
+                .any(|check| check.prerequisite
+                    == ActionPrerequisite::FilesystemCheckPassed(filesystem)
+                    && check.status
+                        == crate::CheckStatus::Satisfied(crate::CheckEvidence::PredictedEffect))
+        );
+        assert!(simulation.steps[2].checks.iter().any(|check| matches!(&check.prerequisite, ActionPrerequisite::FilesystemMinimumSize { filesystem: checked, .. } if *checked == filesystem)
+            && matches!(check.status, crate::CheckStatus::Unknown { .. })));
+        assert_eq!(current, baseline);
+        let mut stale = fragment.clone();
+        stale.actions.push(FragmentAction {
+            id: LocalActionId::new(3),
+            operation: ProviderAction::Filesystem(FilesystemAction::Resize {
+                filesystem,
+                new_size: Bytes::new(50),
+            }),
+        });
+        stale.external_requirements.push(ExternalRequirement {
+            action: LocalActionId::new(3),
+            prerequisite: ActionPrerequisite::FilesystemCheckPassed(filesystem),
+        });
+        stale.dependencies.push(FragmentDependency {
+            before: LocalActionId::new(0),
+            after: LocalActionId::new(3),
+            reason: DependencyReason::RequestedOrder,
+        });
+        assert_eq!(
+            compose_plan(&current, vec![stale]),
+            Err(CompositionError::ActionRejected(ActionId::new(3)))
+        );
+        fragment.dependencies.push(FragmentDependency {
+            before: LocalActionId::new(0),
+            after: LocalActionId::new(2),
+            reason: DependencyReason::RequestedOrder,
+        });
+        assert!(matches!(
+            compose_plan(&current, vec![fragment]),
+            Err(CompositionError::ActionRejected(_))
+        ));
     }
 }

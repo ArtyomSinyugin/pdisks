@@ -171,11 +171,13 @@ trace. A preceding unmount, filesystem shrink, or capacity release can establish
 a condition absent from the original snapshot. Trusted unknown conditions remain
 live obligations; declaring them externally neither proves them nor discards them.
 
-Named outputs describable from the baseline are bound before the first replay,
-including writable activation and a forced clean filesystem check. Contextual
-outputs for planned nodes are bound from the intermediate trace. An explicit
-multi-phase recipe uses its latest ordered output provider; unordered alternatives
-remain ambiguous. Outputs after a consumer cannot satisfy its requirement.
+Named outputs are bound in the consumer's intermediate predecessor context,
+including writable activation and forced clean checks of newly created filesystems.
+Adding a dependency restarts the pure trace from C0, so creating actions and allocation
+are not applied twice to an existing projection. Already replayed actions cannot
+be retried implicitly to restore a revoked guarantee. An explicit multi-phase
+recipe uses its latest ordered output provider; unordered alternatives remain
+ambiguous. Outputs explicitly ordered after a consumer cannot satisfy its requirement.
 Every declaration must occur in the trusted action contract. Final replay and
 shared-resource checks still reject unsafe transitions and incidental ordering;
 effects without named outputs require an explicit transition recipe.
