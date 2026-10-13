@@ -83,6 +83,20 @@ Runtime mount changes and offline filesystem actions share the conservative
 unordered DAG. Bind and unsupported mount sources require further live evidence
 to prove that the filesystem is unmounted. Real write dispatch is still disabled.
 
+External requirements are checked against the consumer's trusted predecessor
+trace. A preceding unmount, filesystem shrink, or capacity release can establish
+a condition absent from the original snapshot. Trusted unknown conditions remain
+live obligations; declaring them externally neither proves them nor discards them.
+
+Named outputs describable from the baseline are bound before the first replay,
+including writable activation and a forced clean filesystem check. Contextual
+outputs for planned nodes are bound from the intermediate trace. An explicit
+multi-phase recipe uses its latest ordered output provider; unordered alternatives
+remain ambiguous. Outputs after a consumer cannot satisfy its requirement.
+Every declaration must occur in the trusted action contract. Final replay and
+shared-resource checks still reject unsafe transitions and incidental ordering;
+effects without named outputs require an explicit transition recipe.
+
 Nested runtime targets receive `MountOrder` dependencies before the first
 simulation: parents are mounted before new children, and children are unmounted
 before changing their parents. Existing explicit multi-phase recipes retain their

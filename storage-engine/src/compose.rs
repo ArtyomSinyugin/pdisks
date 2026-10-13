@@ -10,16 +10,17 @@ use storage_core::model::{
     OperationIntent,
 };
 use storage_provider::{
-    ActionContract, ActionOutput, ActionPrerequisite, ActionResource, BlockInterfaceAccess,
-    BtrfsAction, DependencyReason, FilesystemAction, FragmentOrigin, LocalActionId, LuksAction,
-    LvmAction, MountAction, PartitionAction, PlanFragment, ProviderAction, ResourceAccessMode,
+    ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite, ActionResource,
+    BlockInterfaceAccess, BtrfsAction, DependencyReason, FilesystemAction, FragmentOrigin,
+    LocalActionId, LuksAction, LvmAction, MountAction, PartitionAction, PlanFragment,
+    ProviderAction, ResourceAccessMode, describe_action,
 };
 use thiserror::Error;
 
 use crate::{
     ActionDependency, ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError,
     ExecutionPlan, FragmentId, GoalAspect, GoalStatus, PlanSimulationError, PlannedAction,
-    Projection, simulate_plan_for_goal_with_evidence,
+    PrerequisiteCheck, Projection, simulate_plan_for_goal_with_evidence,
 };
 
 /// Mutable action retained only while a plan is being composed.
@@ -44,6 +45,14 @@ struct FlattenedFragments {
     actions: Vec<DraftAction>,
     dependencies: Vec<ActionDependency>,
     requirements: Vec<PendingRequirement>,
+}
+
+/// Trusted contracts and their checks in one candidate predecessor trace.
+struct AnalysedOrder {
+    /// Recalculated contracts indexed by global action identity.
+    contracts: HashMap<ActionId, ActionContract>,
+    /// Conditions evaluated immediately before each action.
+    checks: HashMap<ActionId, Vec<PrerequisiteCheck>>,
 }
 
 /// Builds one immutable plan from provider-owned fragments.
@@ -99,19 +108,21 @@ pub fn compose_plan_with_evidence(
     } = flatten_fragments(&fragments)?;
     bind_planned_nodes(current, &draft, &mut dependencies)?;
     bind_mount_order(&draft, &mut dependencies)?;
-
-    let first_order = topological_order(draft.len(), &dependencies)?;
-    let first_contracts = simulate_order(current, capacity_evidence, &draft, &first_order)?;
-    resolve_requirements(
+    bind_baseline_outputs(
         current,
         capacity_evidence,
+        &draft,
         &requirements,
-        &first_contracts,
         &mut dependencies,
     )?;
 
+    let first_order = topological_order(draft.len(), &dependencies)?;
+    let first_contracts = simulate_order(current, capacity_evidence, &draft, &first_order)?;
+    resolve_requirements(&requirements, &first_contracts, &mut dependencies)?;
+
     let final_order = topological_order(draft.len(), &dependencies)?;
-    let final_contracts = simulate_order(current, capacity_evidence, &draft, &final_order)?;
+    let final_contracts =
+        simulate_order(current, capacity_evidence, &draft, &final_order)?.contracts;
     validate_declared_requirements(&requirements, &final_contracts)?;
     validate_resource_order(&final_contracts, &dependencies)?;
 
@@ -396,67 +407,129 @@ fn runtime_mount_target(action: &ProviderAction) -> Option<(&Path, &MountContext
     }
 }
 
-/// Resolves cross-fragment conditions from baseline evidence or action outputs.
-fn resolve_requirements(
+/// Binds outputs describable from the baseline before a consumer can fail first replay.
+/// Planned-node-dependent outputs are resolved from the subsequent trusted trace.
+fn bind_baseline_outputs(
     current: &CurrentState,
     capacity_evidence: &[CapacityEvidence],
+    actions: &[DraftAction],
     requirements: &[PendingRequirement],
-    contracts: &HashMap<ActionId, ActionContract>,
     dependencies: &mut Vec<ActionDependency>,
 ) -> Result<(), CompositionError> {
     let baseline = Projection::from_current(current)
         .with_capacity_evidence(capacity_evidence)
         .map_err(CompositionError::CapacityEvidence)?;
+    let contracts = actions
+        .iter()
+        .map(|action| {
+            (
+                action.id,
+                describe_action(
+                    &action.operation,
+                    ActionDescriptionContext {
+                        graph: &current.graph,
+                    },
+                ),
+            )
+        })
+        .collect();
     for requirement in requirements {
-        let baseline_check = baseline
-            .evaluate_prerequisites(std::slice::from_ref(&requirement.prerequisite))
-            .pop()
+        let check =
+            baseline.evaluate_prerequisites(std::slice::from_ref(&requirement.prerequisite));
+        if matches!(check[0].status, crate::CheckStatus::Satisfied(_)) {
+            continue;
+        }
+        if let Some(provider) = requirement_provider(requirement, &contracts, dependencies)? {
+            add_dependency(
+                dependencies,
+                provider,
+                requirement.action,
+                DependencyReason::InterfacePreparation,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Selects one output provider, honoring explicit phases and rejecting unordered alternatives.
+fn requirement_provider(
+    requirement: &PendingRequirement,
+    contracts: &HashMap<ActionId, ActionContract>,
+    dependencies: &[ActionDependency],
+) -> Result<Option<ActionId>, CompositionError> {
+    let providers = contracts
+        .iter()
+        .filter_map(|(action, contract)| {
+            (*action != requirement.action
+                && !dependency_path(requirement.action, *action, dependencies)
+                && contract
+                    .provided_outputs
+                    .iter()
+                    .any(|output| output_satisfies(output, &requirement.prerequisite)))
+            .then_some(*action)
+        })
+        .collect::<Vec<_>>();
+    // A unique latest explicitly ordered predecessor supplies a multi-phase recipe.
+    let predecessors = providers
+        .iter()
+        .copied()
+        .filter(|provider| dependency_path(*provider, requirement.action, dependencies))
+        .collect::<Vec<_>>();
+    if let Some(latest) = predecessors.iter().copied().find(|candidate| {
+        predecessors
+            .iter()
+            .all(|other| other == candidate || dependency_path(*other, *candidate, dependencies))
+    }) {
+        return Ok(Some(latest));
+    }
+    match providers.as_slice() {
+        [] => Ok(None),
+        [provider] => Ok(Some(*provider)),
+        _ => Err(CompositionError::AmbiguousRequirement {
+            action: requirement.action,
+        }),
+    }
+}
+
+/// Resolves requirements from the consumer's predecessor checks, never its final state.
+fn resolve_requirements(
+    requirements: &[PendingRequirement],
+    trace: &AnalysedOrder,
+    dependencies: &mut Vec<ActionDependency>,
+) -> Result<(), CompositionError> {
+    validate_declared_requirements(requirements, &trace.contracts)?;
+    for requirement in requirements {
+        let check = trace
+            .checks
+            .get(&requirement.action)
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .find(|check| check.prerequisite == requirement.prerequisite)
+            })
             .ok_or(CompositionError::MissingRequirementCheck(
                 requirement.action,
             ))?;
-        if matches!(baseline_check.status, crate::CheckStatus::Satisfied(_)) {
-            continue;
-        }
-        // Structural mount edges precede the trace; this condition has no unknown outcome.
         if matches!(
-            requirement.prerequisite,
-            ActionPrerequisite::MountDescendantsAbsent { .. }
-        ) && contracts
-            .get(&requirement.action)
-            .is_some_and(|contract| contract.prerequisites.contains(&requirement.prerequisite))
-        {
+            check.status,
+            crate::CheckStatus::Satisfied(crate::CheckEvidence::ObservedSnapshot)
+        ) {
             continue;
         }
-        if requirement_can_be_checked_live(&requirement.prerequisite, current) {
-            continue;
-        }
-        let mut providers = contracts
-            .iter()
-            .filter_map(|(action, contract)| {
-                contract
-                    .provided_outputs
-                    .iter()
-                    .any(|output| output_satisfies(output, &requirement.prerequisite))
-                    .then_some(*action)
-            })
-            .collect::<Vec<_>>();
-        providers.sort_unstable();
-        let Some(provider) = providers.first().copied() else {
+        if let Some(provider) = requirement_provider(requirement, &trace.contracts, dependencies)? {
+            add_dependency(
+                dependencies,
+                provider,
+                requirement.action,
+                DependencyReason::InterfacePreparation,
+            )?;
+        } else if matches!(check.status, crate::CheckStatus::Violated { .. }) {
             return Err(CompositionError::UnresolvedRequirement {
                 action: requirement.action,
             });
-        };
-        if providers.len() > 1 {
-            return Err(CompositionError::AmbiguousRequirement {
-                action: requirement.action,
-            });
         }
-        add_dependency(
-            dependencies,
-            provider,
-            requirement.action,
-            DependencyReason::InterfacePreparation,
-        )?;
+        // Satisfied effects without named outputs still require resource ordering below.
+        // Unknown trusted conditions remain explicit live obligations in the simulation report.
     }
     Ok(())
 }
@@ -548,16 +621,18 @@ fn simulate_order(
     capacity_evidence: &[CapacityEvidence],
     actions: &[DraftAction],
     order: &[ActionId],
-) -> Result<HashMap<ActionId, ActionContract>, CompositionError> {
+) -> Result<AnalysedOrder, CompositionError> {
     let mut projection = Projection::from_current(current)
         .with_capacity_evidence(capacity_evidence)
         .map_err(CompositionError::CapacityEvidence)?;
     let mut contracts = HashMap::new();
+    let mut checks = HashMap::new();
     for id in order {
         let action = &actions[id.get() as usize];
         match projection.simulate_action(&action.operation) {
             Ok(result) => {
                 contracts.insert(*id, result.contract);
+                checks.insert(*id, result.checks);
             }
             Err(ActionSimulationError::Validation { diagnostics }) => {
                 return Err(CompositionError::ActionValidation {
@@ -573,7 +648,7 @@ fn simulate_order(
             }
         }
     }
-    Ok(contracts)
+    Ok(AnalysedOrder { contracts, checks })
 }
 
 /// Calculates a stable topological order or reports a cycle.
@@ -736,8 +811,14 @@ fn mount_source_node(source: &MountSource) -> Option<NodeId> {
 /// Reports whether an action output establishes an external condition.
 fn output_satisfies(output: &ActionOutput, prerequisite: &ActionPrerequisite) -> bool {
     match (output, prerequisite) {
-        (ActionOutput::Node { id, .. }, ActionPrerequisite::NodeExists(node))
-        | (ActionOutput::Node { id, .. }, ActionPrerequisite::NodeKind { node, .. }) => id == node,
+        (ActionOutput::Node { id, .. }, ActionPrerequisite::NodeExists(node)) => id == node,
+        (ActionOutput::Node { id, spec }, ActionPrerequisite::NodeKind { node, expected }) => {
+            id == node && crate::projection::matches_kind(&spec.kind, *expected)
+        }
+        (
+            ActionOutput::FilesystemCheckPassed(filesystem),
+            ActionPrerequisite::FilesystemCheckPassed(required),
+        ) => filesystem == required,
         (
             ActionOutput::BlockInterface {
                 node,
@@ -746,31 +827,6 @@ fn output_satisfies(output: &ActionOutput, prerequisite: &ActionPrerequisite) ->
             ActionPrerequisite::Writable(required),
         ) => node == required,
         _ => false,
-    }
-}
-
-/// Reports conditions intentionally deferred to a live check for baseline nodes.
-fn requirement_can_be_checked_live(
-    prerequisite: &ActionPrerequisite,
-    current: &CurrentState,
-) -> bool {
-    match prerequisite {
-        ActionPrerequisite::Writable(node) => current.graph.node(node).is_some(),
-        ActionPrerequisite::DestructiveApproval(_) | ActionPrerequisite::ExtentAvailable { .. } => {
-            true
-        }
-        ActionPrerequisite::FilesystemMinimumSize { .. } => true,
-        ActionPrerequisite::NodeExists(_)
-        | ActionPrerequisite::NodeKind { .. }
-        | ActionPrerequisite::NoUnexpectedConsumers(_)
-        | ActionPrerequisite::DistinctNodes(_)
-        | ActionPrerequisite::DependentsFitWithin { .. }
-        | ActionPrerequisite::BackingSizeAtLeast { .. }
-        | ActionPrerequisite::CapacityAvailable { .. }
-        | ActionPrerequisite::MountTargetAvailable { .. } => false,
-        ActionPrerequisite::MountDescendantsAbsent { .. } => false,
-        ActionPrerequisite::FilesystemUnmounted(_)
-        | ActionPrerequisite::FilesystemCheckPassed(_) => false,
     }
 }
 
@@ -1751,6 +1807,30 @@ mod tests {
                 reason: DependencyReason::RequestedOrder,
             },
         ]);
+        fragment.external_requirements.extend([
+            ExternalRequirement {
+                action: LocalActionId::new(0),
+                prerequisite: ActionPrerequisite::FilesystemUnmounted(filesystem),
+            },
+            ExternalRequirement {
+                action: LocalActionId::new(2),
+                prerequisite: ActionPrerequisite::FilesystemCheckPassed(filesystem),
+            },
+            ExternalRequirement {
+                action: LocalActionId::new(2),
+                prerequisite: ActionPrerequisite::FilesystemMinimumSize {
+                    filesystem,
+                    target: Bytes::new(60),
+                },
+            },
+            ExternalRequirement {
+                action: LocalActionId::new(1),
+                prerequisite: ActionPrerequisite::DependentsFitWithin {
+                    node: lv,
+                    size: Bytes::new(60),
+                },
+            },
+        ]);
         let plan = compose_plan(&current, vec![fragment])
             .unwrap_or_else(|error| panic!("compose mounted ext4 shrink: {error}"));
         let ids = plan
@@ -1955,6 +2035,13 @@ mod tests {
                 origin: origin(vg, "release then allocate extents"),
                 diagnostics: Vec::new(),
             };
+            fragment.external_requirements.push(ExternalRequirement {
+                action: LocalActionId::new(1),
+                prerequisite: ActionPrerequisite::CapacityAvailable {
+                    domain: AllocationDomain::LvmVolumeGroup(vg),
+                    amount: Some(AllocationQuantity::new(released)),
+                },
+            });
             let plan = compose_plan_with_evidence(&current, vec![fragment.clone()], &evidence)
                 .unwrap_or_else(|error| panic!("compose released capacity reuse: {error}"));
             let simulation = crate::simulate_plan_with_evidence(&current, &plan, &evidence)
@@ -2464,6 +2551,231 @@ mod tests {
         assert_eq!(
             compose_plan_for_goal(&current, &goal, Vec::new()),
             Err(CompositionError::GoalNotReached(GoalAspect::Graph))
+        );
+    }
+    /// Named clean-check outputs must be bound before a shrink consumer is simulated.
+    #[test]
+    fn binds_check_outputs_before_first_replay_and_preserves_explicit_phases() {
+        let (current, _lv, filesystem) = current_with_lv_and_filesystem();
+        let baseline = current.clone();
+        let mut fragment = PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Filesystem(FilesystemAction::Resize {
+                        filesystem,
+                        new_size: Bytes::new(60),
+                    }),
+                },
+                FragmentAction {
+                    id: LocalActionId::new(1),
+                    operation: ProviderAction::Filesystem(FilesystemAction::Check {
+                        filesystem,
+                        force: true,
+                    }),
+                },
+            ],
+            dependencies: Vec::new(),
+            external_requirements: vec![ExternalRequirement {
+                action: LocalActionId::new(0),
+                prerequisite: ActionPrerequisite::FilesystemCheckPassed(filesystem),
+            }],
+            origin: origin(filesystem, "check before shrink"),
+            diagnostics: Vec::new(),
+        };
+        let plan = compose_plan(&current, vec![fragment.clone()])
+            .unwrap_or_else(|error| panic!("bind earlier clean check: {error}"));
+        assert_eq!(
+            plan.ordered_actions()
+                .iter()
+                .map(|action| action.local_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert!(
+            plan.dependencies()
+                .iter()
+                .any(|dependency| dependency.before == ActionId::new(1)
+                    && dependency.after == ActionId::new(0)
+                    && dependency.reason == DependencyReason::InterfacePreparation)
+        );
+        crate::simulate_plan(&current, &plan)
+            .unwrap_or_else(|error| panic!("replay bound check: {error}"));
+        fragment.actions[1].operation = ProviderAction::Filesystem(FilesystemAction::Check {
+            filesystem,
+            force: false,
+        });
+        assert!(matches!(
+            compose_plan(&current, vec![fragment.clone()]),
+            Err(CompositionError::ActionRejected(_))
+        ));
+        fragment.actions[1].operation = ProviderAction::Filesystem(FilesystemAction::Check {
+            filesystem,
+            force: true,
+        });
+        fragment.dependencies.push(FragmentDependency {
+            before: LocalActionId::new(0),
+            after: LocalActionId::new(1),
+            reason: DependencyReason::RequestedOrder,
+        });
+        assert!(matches!(
+            compose_plan(&current, vec![fragment.clone()]),
+            Err(CompositionError::ActionRejected(_))
+        ));
+        fragment.dependencies.clear();
+        fragment.actions.push(FragmentAction {
+            id: LocalActionId::new(2),
+            operation: ProviderAction::Filesystem(FilesystemAction::Check {
+                filesystem,
+                force: true,
+            }),
+        });
+        assert_eq!(
+            compose_plan(&current, vec![fragment.clone()]),
+            Err(CompositionError::AmbiguousRequirement {
+                action: ActionId::new(0)
+            })
+        );
+        fragment.dependencies.extend([
+            FragmentDependency {
+                before: LocalActionId::new(1),
+                after: LocalActionId::new(2),
+                reason: DependencyReason::RequestedOrder,
+            },
+            FragmentDependency {
+                before: LocalActionId::new(2),
+                after: LocalActionId::new(0),
+                reason: DependencyReason::RequestedOrder,
+            },
+        ]);
+        compose_plan(&current, vec![fragment])
+            .unwrap_or_else(|error| panic!("bind latest explicitly ordered check: {error}"));
+        assert_eq!(current, baseline);
+    }
+
+    /// Read-only observations cannot force rejection before a declared activation provider runs.
+    #[test]
+    fn binds_writable_outputs_before_read_only_consumer() {
+        let (mut current, _vg, lv) = current_with_linear_lv();
+        let mut node = current
+            .graph
+            .node(&lv)
+            .cloned()
+            .unwrap_or_else(|| panic!("LV fixture"));
+        node.size.block = Some(storage_core::model::BlockFacts {
+            paths: vec![PathBuf::from("/dev/mapper/old")],
+            devno: storage_core::model::DeviceNumber {
+                major: 253,
+                minor: 0,
+            },
+            geometry: None,
+            read_only: Some(true),
+        });
+        current.graph.insert_node(lv, node);
+        let baseline = current.clone();
+        let fragment = PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Filesystem(FilesystemAction::Create {
+                        backing: lv,
+                        planned_node_id: NodeId::new(),
+                        filesystem: FilesystemKind::Ext4,
+                        label: None,
+                    }),
+                },
+                FragmentAction {
+                    id: LocalActionId::new(1),
+                    operation: ProviderAction::Lvm(LvmAction::SetActivation {
+                        target: lv,
+                        active: true,
+                    }),
+                },
+            ],
+            dependencies: Vec::new(),
+            external_requirements: vec![ExternalRequirement {
+                action: LocalActionId::new(0),
+                prerequisite: ActionPrerequisite::Writable(lv),
+            }],
+            origin: origin(lv, "activate before mkfs"),
+            diagnostics: Vec::new(),
+        };
+        let plan = compose_plan(&current, vec![fragment])
+            .unwrap_or_else(|error| panic!("bind activation before writable check: {error}"));
+        let simulation = crate::simulate_plan(&current, &plan)
+            .unwrap_or_else(|error| panic!("replay bound activation: {error}"));
+        assert_eq!(simulation.steps[0].action, ActionId::new(1));
+        assert!(
+            simulation.steps[1]
+                .checks
+                .iter()
+                .any(
+                    |check| check.prerequisite == ActionPrerequisite::Writable(lv)
+                        && check.status
+                            == crate::CheckStatus::Satisfied(crate::CheckEvidence::PredictedEffect)
+                )
+        );
+        assert_eq!(current, baseline);
+    }
+
+    /// Missing backing geometry remains an explicit obligation even when declared externally.
+    #[test]
+    fn unknown_external_geometry_is_retained_in_the_report() {
+        let (mut current, lv, filesystem) = current_with_lv_and_filesystem();
+        let mut node = current
+            .graph
+            .node(&lv)
+            .cloned()
+            .unwrap_or_else(|| panic!("LV fixture"));
+        node.kind.size = None;
+        current.graph.insert_node(lv, node);
+        let condition = ActionPrerequisite::BackingSizeAtLeast {
+            node: filesystem,
+            size: Bytes::new(200),
+        };
+        let mut fragment = PlanFragment {
+            actions: vec![FragmentAction {
+                id: LocalActionId::new(0),
+                operation: ProviderAction::Filesystem(FilesystemAction::Resize {
+                    filesystem,
+                    new_size: Bytes::new(200),
+                }),
+            }],
+            dependencies: Vec::new(),
+            external_requirements: vec![ExternalRequirement {
+                action: LocalActionId::new(0),
+                prerequisite: condition.clone(),
+            }],
+            origin: origin(filesystem, "grow with unknown backing geometry"),
+            diagnostics: Vec::new(),
+        };
+        let plan = compose_plan(&current, vec![fragment.clone()])
+            .unwrap_or_else(|error| panic!("compose conditional geometry: {error}"));
+        let mut goal = DesiredState {
+            graph: current.graph.clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+        let mut node = goal
+            .graph
+            .node(&filesystem)
+            .cloned()
+            .unwrap_or_else(|| panic!("FS fixture"));
+        node.kind.size = Some(Bytes::new(200));
+        goal.graph.insert_node(filesystem, node);
+        let report = crate::simulate_plan_for_goal(&current, &plan, &goal)
+            .unwrap_or_else(|error| panic!("report unknown geometry: {error}"));
+        assert!(report.unresolved_obligations.iter().any(|obligation| matches!(obligation,
+            crate::SimulationObligation::Prerequisite { action, prerequisite, .. } if *action == ActionId::new(0) && *prerequisite == condition)));
+        assert!(!report.is_complete());
+        fragment.external_requirements[0].prerequisite =
+            ActionPrerequisite::FilesystemCheckPassed(filesystem);
+        assert_eq!(
+            compose_plan(&current, vec![fragment]),
+            Err(CompositionError::RequirementNotInContract {
+                action: ActionId::new(0)
+            })
         );
     }
 }

@@ -996,7 +996,7 @@ pub enum EffectApplicationError {
 }
 
 /// Reports whether a node kind satisfies a coarse provider contract class.
-fn matches_kind(kind: &NodeKind, expected: NodeKindClass) -> bool {
+pub(crate) fn matches_kind(kind: &NodeKind, expected: NodeKindClass) -> bool {
     match expected {
         NodeKindClass::Block => matches!(
             kind,
