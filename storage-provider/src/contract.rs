@@ -1209,6 +1209,12 @@ fn describe_filesystem(
             let mut result = contract(RestartPolicy::ReprobeThenRetry);
             require_kind(&mut result, *filesystem, NodeKindClass::Filesystem);
             write(&mut result, ActionResource::Node(*filesystem));
+            access_filesystem_backing(
+                &mut result,
+                context.graph,
+                *filesystem,
+                ResourceAccessMode::Write,
+            );
             result
                 .predicted_effect
                 .graph

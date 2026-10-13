@@ -1550,6 +1550,60 @@ mod tests {
         assert!(matches!(status(&current), CheckStatus::Violated { .. }));
     }
 
+    /// Relabeling rejects read-only backing atomically and preserves its checks across JSON.
+    #[test]
+    fn filesystem_label_requires_writable_backing() {
+        let (mut current, backing, filesystem) = current_with_observed_mapping();
+        let mut endpoint = current
+            .graph
+            .node(&backing)
+            .cloned()
+            .unwrap_or_else(|| panic!("backing node missing"));
+        endpoint
+            .size
+            .block
+            .as_mut()
+            .unwrap_or_else(|| panic!("block facts missing"))
+            .read_only = Some(true);
+        current.graph.insert_node(backing, endpoint);
+        let action = ProviderAction::Filesystem(FilesystemAction::SetLabel {
+            filesystem,
+            label: Some("new-label".to_owned()),
+        });
+        let mut projection = Projection::from_current(&current);
+        let original = projection.clone();
+        assert!(matches!(
+            projection.simulate_action(&action),
+            Err(ActionSimulationError::PrerequisitesViolated { .. })
+        ));
+        assert_eq!(projection, original);
+        let context = ActionDescriptionContext {
+            graph: &current.graph,
+        };
+        let trusted = describe_action(&action, context);
+        assert!(
+            trusted
+                .affected_resources
+                .iter()
+                .any(
+                    |access| access.resource == storage_provider::ActionResource::Node(backing)
+                        && access.mode == storage_provider::ResourceAccessMode::Write
+                )
+        );
+        let json = serde_json::to_string(&trusted)
+            .unwrap_or_else(|error| panic!("serialize label contract: {error}"));
+        let mut imported: ActionContract = serde_json::from_str(&json)
+            .unwrap_or_else(|error| panic!("deserialize label contract: {error}"));
+        assert_eq!(
+            storage_provider::verify_imported_contract(&action, imported.clone(), context),
+            Ok(trusted)
+        );
+        imported
+            .prerequisites
+            .retain(|condition| condition != &ActionPrerequisite::Writable(backing));
+        assert!(storage_provider::verify_imported_contract(&action, imported, context).is_err());
+    }
+
     /// Serialized mount contracts retain backing checks and reject weakened imports.
     #[test]
     fn mount_backing_contract_survives_serialization_and_rejects_tampering() {

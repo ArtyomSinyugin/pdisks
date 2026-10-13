@@ -1802,61 +1802,69 @@ mod tests {
         );
     }
 
-    /// Mounting a filesystem must not reuse an explicitly deactivated backing LV.
+    /// Mounting or relabeling must not reuse an explicitly deactivated backing LV.
     #[test]
-    fn rejects_mount_after_backing_deactivation() {
+    fn rejects_mount_and_label_after_backing_deactivation() {
         let (current, lv, filesystem) = current_with_lv_and_filesystem();
-        let mut fragment = PlanFragment {
-            actions: vec![
-                FragmentAction {
-                    id: LocalActionId::new(0),
-                    operation: ProviderAction::Lvm(LvmAction::SetActivation {
-                        target: lv,
-                        active: false,
-                    }),
-                },
-                FragmentAction {
-                    id: LocalActionId::new(1),
-                    operation: ProviderAction::Mount(MountAction::Mount {
-                        source: MountSource::Filesystem(filesystem),
-                        target: PathBuf::from("/data"),
-                        options: vec!["ro".to_owned()],
-                        context: MountContext::Host,
-                    }),
-                },
-            ],
-            dependencies: vec![FragmentDependency {
+        for operation in [
+            ProviderAction::Mount(MountAction::Mount {
+                source: MountSource::Filesystem(filesystem),
+                target: PathBuf::from("/data"),
+                options: vec!["ro".to_owned()],
+                context: MountContext::Host,
+            }),
+            ProviderAction::Filesystem(FilesystemAction::SetLabel {
+                filesystem,
+                label: Some("new-label".to_owned()),
+            }),
+        ] {
+            let mut fragment = PlanFragment {
+                actions: vec![
+                    FragmentAction {
+                        id: LocalActionId::new(0),
+                        operation: ProviderAction::Lvm(LvmAction::SetActivation {
+                            target: lv,
+                            active: false,
+                        }),
+                    },
+                    FragmentAction {
+                        id: LocalActionId::new(1),
+                        operation,
+                    },
+                ],
+                dependencies: vec![FragmentDependency {
+                    before: LocalActionId::new(0),
+                    after: LocalActionId::new(1),
+                    reason: DependencyReason::RequestedOrder,
+                }],
+                external_requirements: Vec::new(),
+                origin: origin(filesystem, "endpoint consumer"),
+                diagnostics: Vec::new(),
+            };
+            assert!(matches!(
+                compose_plan(&current, vec![fragment.clone()]),
+                Err(CompositionError::ActionRejected(_))
+            ));
+            fragment.actions[0].operation = ProviderAction::Lvm(LvmAction::SetActivation {
+                target: lv,
+                active: true,
+            });
+            fragment.dependencies.clear();
+            assert!(matches!(
+                compose_plan(&current, vec![fragment.clone()]),
+                Err(CompositionError::AmbiguousResourceOrder {
+                    resource: ActionResource::Node(node), ..
+                }) if node == lv
+            ));
+            fragment.dependencies.push(FragmentDependency {
                 before: LocalActionId::new(0),
                 after: LocalActionId::new(1),
                 reason: DependencyReason::RequestedOrder,
-            }],
-            external_requirements: Vec::new(),
-            origin: origin(filesystem, "deactivate then mount"),
-            diagnostics: Vec::new(),
-        };
-        assert!(matches!(
-            compose_plan(&current, vec![fragment.clone()]),
-            Err(CompositionError::ActionRejected(_))
-        ));
-        fragment.actions[0].operation = ProviderAction::Lvm(LvmAction::SetActivation {
-            target: lv,
-            active: true,
-        });
-        fragment.dependencies.clear();
-        assert!(matches!(
-            compose_plan(&current, vec![fragment.clone()]),
-            Err(CompositionError::AmbiguousResourceOrder {
-                resource: ActionResource::Node(node), ..
-            }) if node == lv
-        ));
-        fragment.dependencies.push(FragmentDependency {
-            before: LocalActionId::new(0),
-            after: LocalActionId::new(1),
-            reason: DependencyReason::RequestedOrder,
-        });
-        let plan = compose_plan(&current, vec![fragment])
-            .unwrap_or_else(|error| panic!("activate before mount: {error}"));
-        assert_eq!(plan.ordered_actions().len(), 2);
+            });
+            let plan = compose_plan(&current, vec![fragment])
+                .unwrap_or_else(|error| panic!("activate before endpoint consumer: {error}"));
+            assert_eq!(plan.ordered_actions().len(), 2);
+        }
     }
 
     /// Shrinking the lower LV before its filesystem is rejected.
@@ -2962,7 +2970,19 @@ mod tests {
                 .iter()
                 .all(|check| check.status == GoalStatus::Satisfied)
         );
-        assert_eq!(report.protection_violations.len(), 2);
+        assert_eq!(report.protection_violations.len(), 4);
+        for action in [ActionId::new(0), ActionId::new(1)] {
+            for node in [filesystem, lv] {
+                assert!(
+                    report
+                        .protection_violations
+                        .contains(&crate::ProtectionViolation {
+                            action,
+                            aspect: ProtectedAspect::Node(node),
+                        })
+                );
+            }
+        }
         assert!(!report.is_complete());
         assert_eq!(
             compose_plan_for_goal_with_policy(
