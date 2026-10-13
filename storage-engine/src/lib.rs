@@ -3,6 +3,7 @@
 //! Planning, validation, and simulation over trusted provider contracts.
 
 mod compose;
+mod execution;
 mod plan;
 mod projection;
 mod simulate;
@@ -29,4 +30,11 @@ pub use validate::{ProtectedAspect, ProtectedMount, ProtectedScope, ProtectionVi
 
 pub use wire::{
     HistoricalAnalysis, HistoricalBaseline, PLAN_SCHEMA_VERSION, PlanDocument, PlanDocumentError,
+};
+
+pub use execution::{
+    ActionRunState, AdmissionReport, BackendCompletion, BackendOutcome, ExecutionContext,
+    ExecutionRun, ExecutionRunError, GoalVerificationReport, LiveCheck, LiveCheckStatus,
+    LiveExecutionChecks, LiveObservation, ObservationReference, RunEvent, RunEventKind,
+    VerificationReport,
 };

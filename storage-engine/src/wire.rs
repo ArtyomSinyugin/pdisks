@@ -346,7 +346,7 @@ fn sort_json_array(value: &mut Value, deduplicate: bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use storage_core::model::{
@@ -367,7 +367,7 @@ mod tests {
     use super::*;
 
     /// Builds a cross-provider document whose later actions consume newly created objects.
-    fn document_fixture() -> PlanDocument {
+    pub(crate) fn document_fixture() -> PlanDocument {
         let disk = NodeId::new();
         let pv = NodeId::new();
         let vg = NodeId::new();

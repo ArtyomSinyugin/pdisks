@@ -116,6 +116,36 @@ Fresh identity correlation, per-action admission, and actual postcondition
 verification remain separate execution work. JSON rejects non-UTF-8 paths while
 identical in-process contracts can still be verified without JSON encoding.
 
+`ExecutionRun` freezes the historically validated plan and assigns a separate
+run UUID. Its serial lifecycle is `Waiting → Checking → Running → Verifying →
+Verified`; failure or unknown outcome blocks ordinary continuation. `Running`
+records an admitted invocation attempt, not a verified model effect. There is no
+automatic retry, skip-by-final-shape shortcut, or deserializer that can inject
+runtime states. Recovery must observe actual state and enforce the frozen
+`RestartPolicy` through a separate trusted policy.
+
+`LiveExecutionChecks` is the future runtime host contract. Admission must attest
+fresh identity/scope/capability applicability, every frozen prerequisite, and
+all required resource leases. Verification must cover every frozen postcondition
+against the retained post-backend publication. A generic successful checker or
+`NodeReprobed` cannot replace `FilesystemCheckPassed`. Missing, duplicate, stale,
+or cross-run reports are rejected. A known violation stops the action; unknown
+admission stays in `Checking`, and unknown postconditions stop in `OutcomeUnknown`.
+
+Actual publications carry a probe-instance UUID and monotonic `ProbeEpoch`.
+Admission, completion, and final verification require newer publications from
+the same instance; action verification references its exact retained completion
+snapshot. Failed or partial backend outcomes retain the supplied actual snapshot.
+If a post-backend probe is unavailable, `mark_outcome_unknown` stops the attempt
+while retaining the last actual snapshot. No predicted effect is applied to it.
+
+Final actual-goal and protected-area verification remains separate even after
+all actions reach `Verified`. Run events carry the run UUID and a monotonically
+increasing sequence for progress and reconnect replay; progress never verifies
+an effect. Reports are attestations from a trusted host, not authorization tokens
+or a substitute for real probing. Native implementations, actual lease ownership,
+identity binding adjacent to native calls, and write dispatch remain disabled.
+
 The current filesystem resize recipe supports ext2/ext3/ext4. Shrink requires
 unmounting the filesystem in every observed namespace, then a forced read-only
 `Check` whose `FilesystemCheckPassed` postcondition verifies no errors were found.
@@ -345,5 +375,6 @@ The target contract in `docs/storage-backend-spec.md` contains
 `validate`, create/destroy/modify planning, `execute`, and `rollback`.
 
 At present this crate implements native availability checks and read-only probe
-adapters plus the `libbd_fs`/Btrfs capability queries described above. Planning,
-execution, and rollback are project TODOs, not implied by a loaded library.
+adapters plus the `libbd_fs`/Btrfs capability queries described above. Automatic native planning, execution, and rollback remain TODOs; pure fragment
+composition and simulation live in `storage-engine`. None is implied by loading
+a native library.
