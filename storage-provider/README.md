@@ -57,6 +57,29 @@ incomplete; goal-aware composition still rejects them. Completion concerns
 planning evidence only. Every action still requires live admission and verified
 postconditions before execution can be considered successful.
 
+Goal comparison keeps node kinds, their properties, and all graph relationships
+exact. Capacity has one explicit rule: requested `NodeSpec.size == None` leaves
+that field unmanaged. An explicit requested size with unknown projected capacity
+produces `Unknown`; a known wrong capacity produces `Violated`. Unknown size
+never conceals a different kind, relationship, or another node's known mismatch.
+Other optional fields retain their existing exact semantics.
+
+`compose_plan_for_goal_with_policy` and `simulate_plan_for_goal_with_policy`
+accept an explicit `ProtectedScope`. They examine each trusted step, so restoring
+a label later cannot conceal an earlier write. Protected nodes include incident
+topology, metadata resource writes, and mutation-related invalidations propagated
+from parent activation. Read-only checks may refresh evidence. Runtime targets
+protect ancestors and descendants in the same context; persistent protection
+conservatively covers configuration writes anywhere in that context because the
+current contract writes a whole configuration resource. Paths follow the same
+absolute, non-traversing lexical rules as mount actions; live path resolution is
+still required. Runtime and persistent protection remain separate.
+
+Reports retain every action/aspect conflict and become incomplete. Policy-aware
+composition rejects a conflict. Existing APIs use an empty protection policy;
+callers must supply objects to preserve explicitly. The policy concerns proposed
+mutations and does not replace destructive approval or live identity checks.
+
 The JSON contract is informational. After importing a plan,
 `verify_imported_contract` recalculates the complete contract and compares it
 with the imported representation. On success it returns the recalculated

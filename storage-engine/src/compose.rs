@@ -20,7 +20,8 @@ use thiserror::Error;
 use crate::{
     ActionDependency, ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError,
     ExecutionPlan, FragmentId, GoalAspect, GoalStatus, PlanSimulationError, PlannedAction,
-    PrerequisiteCheck, Projection, simulate_plan_for_goal_with_evidence,
+    PrerequisiteCheck, Projection, ProtectedAspect, ProtectedScope,
+    simulate_plan_for_goal_with_policy,
 };
 
 /// Mutable action retained only while a plan is being composed.
@@ -81,10 +82,34 @@ pub fn compose_plan_for_goal_with_evidence(
     fragments: Vec<PlanFragment>,
     capacity_evidence: &[CapacityEvidence],
 ) -> Result<ExecutionPlan, CompositionError> {
+    compose_plan_for_goal_with_policy(
+        current,
+        goal,
+        fragments,
+        capacity_evidence,
+        &ProtectedScope::default(),
+    )
+}
+
+/// Builds a goal-covering plan while rejecting changes to explicitly protected objects.
+pub fn compose_plan_for_goal_with_policy(
+    current: &CurrentState,
+    goal: &DesiredState,
+    fragments: Vec<PlanFragment>,
+    capacity_evidence: &[CapacityEvidence],
+    protected: &ProtectedScope,
+) -> Result<ExecutionPlan, CompositionError> {
     validate_intent_coverage(&goal.intents, &fragments)?;
     let plan = compose_plan_with_evidence(current, fragments, capacity_evidence)?;
-    let report = simulate_plan_for_goal_with_evidence(current, &plan, goal, capacity_evidence)
-        .map_err(CompositionError::FinalSimulation)?;
+    let report =
+        simulate_plan_for_goal_with_policy(current, &plan, goal, capacity_evidence, protected)
+            .map_err(CompositionError::FinalSimulation)?;
+    if let Some(violation) = report.protection_violations.into_iter().next() {
+        return Err(CompositionError::ProtectedScopeViolation {
+            action: violation.action,
+            aspect: violation.aspect,
+        });
+    }
     if let Some(check) = report
         .goal_checks
         .into_iter()
@@ -833,6 +858,14 @@ fn output_satisfies(output: &ActionOutput, prerequisite: &ActionPrerequisite) ->
 /// Failure to compose provider fragments into a safe global DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CompositionError {
+    /// A planned mutation intersects the caller's explicit protected area.
+    #[error("action {action:?} modifies protected aspect {aspect:?}")]
+    ProtectedScopeViolation {
+        /// Action attempting the protected change.
+        action: ActionId,
+        /// Protected node or mount target affected by that action.
+        aspect: ProtectedAspect,
+    },
     /// A provider rejected action parameters or its intermediate graph context.
     #[error("action {action:?} failed technology-specific validation")]
     ActionValidation {
@@ -1602,6 +1635,29 @@ mod tests {
             .collect();
         assert!(!expected.is_empty());
         assert_eq!(report.unresolved_obligations, expected);
+        let protected_report = crate::simulate_plan_for_goal_with_policy(
+            &current,
+            &plan,
+            &goal,
+            &[],
+            &ProtectedScope {
+                nodes: vec![vg, filesystem],
+                ..ProtectedScope::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("report protected metadata and planned node: {error}"));
+        assert!(
+            protected_report
+                .protection_violations
+                .iter()
+                .any(|violation| violation.aspect == ProtectedAspect::Node(vg))
+        );
+        assert!(
+            protected_report
+                .protection_violations
+                .iter()
+                .any(|violation| violation.aspect == ProtectedAspect::Node(filesystem))
+        );
         assert!(
             report
                 .unresolved_obligations
@@ -2777,5 +2833,305 @@ mod tests {
                 action: ActionId::new(0)
             })
         );
+    }
+    /// Restoring a label or activation cannot conceal intermediate protected mutations.
+    #[test]
+    fn protected_nodes_reject_transient_changes_but_allow_read_only_checks() {
+        let (current, lv, filesystem) = current_with_lv_and_filesystem();
+        let goal = DesiredState {
+            graph: current.graph.clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+        let protected = ProtectedScope {
+            nodes: vec![filesystem, lv, filesystem],
+            ..ProtectedScope::default()
+        };
+        let mut fragment = PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Filesystem(FilesystemAction::SetLabel {
+                        filesystem,
+                        label: Some("temporary".to_owned()),
+                    }),
+                },
+                FragmentAction {
+                    id: LocalActionId::new(1),
+                    operation: ProviderAction::Filesystem(FilesystemAction::SetLabel {
+                        filesystem,
+                        label: Some("data".to_owned()),
+                    }),
+                },
+            ],
+            dependencies: vec![FragmentDependency {
+                before: LocalActionId::new(0),
+                after: LocalActionId::new(1),
+                reason: DependencyReason::RequestedOrder,
+            }],
+            external_requirements: Vec::new(),
+            origin: origin(filesystem, "temporary label"),
+            diagnostics: Vec::new(),
+        };
+        let plan = compose_plan_for_goal(&current, &goal, vec![fragment.clone()])
+            .unwrap_or_else(|error| panic!("compose restored label: {error}"));
+        let report =
+            crate::simulate_plan_for_goal_with_policy(&current, &plan, &goal, &[], &protected)
+                .unwrap_or_else(|error| panic!("report protected labels: {error}"));
+        assert!(
+            report
+                .goal_checks
+                .iter()
+                .all(|check| check.status == GoalStatus::Satisfied)
+        );
+        assert_eq!(report.protection_violations.len(), 2);
+        assert!(!report.is_complete());
+        assert_eq!(
+            compose_plan_for_goal_with_policy(
+                &current,
+                &goal,
+                vec![fragment.clone()],
+                &[],
+                &protected
+            ),
+            Err(CompositionError::ProtectedScopeViolation {
+                action: ActionId::new(0),
+                aspect: ProtectedAspect::Node(filesystem)
+            })
+        );
+        fragment.actions = vec![FragmentAction {
+            id: LocalActionId::new(0),
+            operation: ProviderAction::Filesystem(FilesystemAction::Repair {
+                filesystem,
+                force: true,
+            }),
+        }];
+        fragment.dependencies.clear();
+        assert!(matches!(
+            compose_plan_for_goal_with_policy(
+                &current,
+                &goal,
+                vec![fragment.clone()],
+                &[],
+                &protected
+            ),
+            Err(CompositionError::ProtectedScopeViolation { .. })
+        ));
+        fragment.actions[0].operation = ProviderAction::Filesystem(FilesystemAction::Check {
+            filesystem,
+            force: true,
+        });
+        compose_plan_for_goal_with_policy(&current, &goal, vec![fragment], &[], &protected)
+            .unwrap_or_else(|error| panic!("read-only check of protected nodes: {error}"));
+        let (current, vg, lv) = current_with_linear_lv();
+        let goal = DesiredState {
+            graph: current.graph.clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+        let fragment = PlanFragment {
+            actions: vec![FragmentAction {
+                id: LocalActionId::new(0),
+                operation: ProviderAction::Lvm(LvmAction::SetActivation {
+                    target: vg,
+                    active: false,
+                }),
+            }],
+            dependencies: Vec::new(),
+            external_requirements: Vec::new(),
+            origin: origin(vg, "deactivate group"),
+            diagnostics: Vec::new(),
+        };
+        let protected = ProtectedScope {
+            nodes: vec![lv],
+            ..ProtectedScope::default()
+        };
+        assert_eq!(
+            compose_plan_for_goal_with_policy(&current, &goal, vec![fragment], &[], &protected),
+            Err(CompositionError::ProtectedScopeViolation {
+                action: ActionId::new(0),
+                aspect: ProtectedAspect::Node(lv)
+            })
+        );
+    }
+
+    /// An automatic resize may predict unknown size while keeping an exact requested size conditional.
+    #[test]
+    fn goal_composition_retains_unknown_requested_capacity() {
+        let (mut current, _) = current_with_vg();
+        let disk = NodeId::new();
+        let mapping = NodeId::new();
+        for (id, kind, size) in [
+            (disk, NodeKind::Disk, 1000),
+            (
+                mapping,
+                NodeKind::DmCryptMapping {
+                    name: "data".to_owned(),
+                },
+                100,
+            ),
+        ] {
+            current.graph.insert_node(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind,
+                        size: Some(Bytes::new(size)),
+                    },
+                    size: NodeFacts::default(),
+                },
+            );
+        }
+        current.graph.insert_dependency(Dependency {
+            from: disk,
+            to: mapping,
+            kind: DependencyKind::Backs,
+        });
+        let goal = DesiredState {
+            graph: current.graph.clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+        let fragment = PlanFragment {
+            actions: vec![FragmentAction {
+                id: LocalActionId::new(0),
+                operation: ProviderAction::Luks(LuksAction::Resize {
+                    mapping,
+                    new_size: None,
+                }),
+            }],
+            dependencies: Vec::new(),
+            external_requirements: Vec::new(),
+            origin: origin(disk, "automatic mapping resize"),
+            diagnostics: Vec::new(),
+        };
+        let plan = compose_plan_for_goal(&current, &goal, vec![fragment])
+            .unwrap_or_else(|error| panic!("compose conditional mapping size: {error}"));
+        let report = crate::simulate_plan_for_goal(&current, &plan, &goal)
+            .unwrap_or_else(|error| panic!("report mapping size: {error}"));
+        assert!(
+            report
+                .unresolved_obligations
+                .iter()
+                .any(|obligation| matches!(
+                    obligation,
+                    crate::SimulationObligation::Goal {
+                        aspect: GoalAspect::Graph,
+                        ..
+                    }
+                ))
+        );
+        assert!(!report.is_complete());
+    }
+    /// Protected runtime hierarchy and persistent configuration remain separate across contexts.
+    #[test]
+    fn protected_mounts_enforce_hierarchy_context_and_persistence() {
+        let (current, subject) = current_with_vg();
+        let goal = DesiredState {
+            graph: current.graph.clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+        let host = crate::ProtectedMount {
+            target: PathBuf::from("/data/child"),
+            context: MountContext::Host,
+        };
+        let protected = ProtectedScope {
+            runtime_mounts: vec![host.clone()],
+            ..ProtectedScope::default()
+        };
+        for (target, context, conflict) in [
+            ("/data", MountContext::Host, true),
+            ("/data/child/deeper", MountContext::Host, true),
+            ("/data2", MountContext::Host, false),
+            ("/data", MountContext::Namespace("other".to_owned()), false),
+        ] {
+            let fragment = mount_fragment(
+                subject,
+                vec![MountAction::Mount {
+                    source: MountSource::Tmpfs,
+                    target: PathBuf::from(target),
+                    options: Vec::new(),
+                    context,
+                }],
+            );
+            let result =
+                compose_plan_for_goal_with_policy(&current, &goal, vec![fragment], &[], &protected);
+            if conflict {
+                assert_eq!(
+                    result,
+                    Err(CompositionError::ProtectedScopeViolation {
+                        action: ActionId::new(0),
+                        aspect: ProtectedAspect::RuntimeMount(host.clone())
+                    })
+                );
+            } else {
+                result.unwrap_or_else(|error| panic!("unrelated mount context or prefix: {error}"));
+            }
+        }
+        let fragment = mount_fragment(
+            subject,
+            vec![MountAction::Persist {
+                entry: storage_core::model::MountEntry {
+                    source: MountSource::Tmpfs,
+                    target: PathBuf::from("/other"),
+                    options: Vec::new(),
+                    persistent: true,
+                    context: MountContext::Host,
+                },
+            }],
+        );
+        compose_plan_for_goal_with_policy(&current, &goal, vec![fragment.clone()], &[], &protected)
+            .unwrap_or_else(|error| {
+                panic!("persistent write does not alter protected runtime mount: {error}")
+            });
+        let persistent = ProtectedScope {
+            persistent_mounts: vec![host.clone()],
+            ..ProtectedScope::default()
+        };
+        assert_eq!(
+            compose_plan_for_goal_with_policy(&current, &goal, vec![fragment], &[], &persistent),
+            Err(CompositionError::ProtectedScopeViolation {
+                action: ActionId::new(0),
+                aspect: ProtectedAspect::PersistentMount(host)
+            })
+        );
+    }
+
+    /// Mount policy paths must obey the same absolute lexical constraints as mount actions.
+    #[test]
+    fn rejects_ambiguous_protection_paths() {
+        let (current, _) = current_with_vg();
+        let goal = DesiredState {
+            graph: current.graph.clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+        for (target, context) in [
+            ("relative", MountContext::Host),
+            ("/data/../protected", MountContext::Host),
+            ("/data\0", MountContext::Host),
+            ("/data", MountContext::TargetRoot(PathBuf::from("relative"))),
+        ] {
+            let mount = crate::ProtectedMount {
+                target: PathBuf::from(target),
+                context,
+            };
+            let policy = ProtectedScope {
+                runtime_mounts: vec![mount.clone()],
+                ..ProtectedScope::default()
+            };
+            assert_eq!(
+                compose_plan_for_goal_with_policy(&current, &goal, Vec::new(), &[], &policy),
+                Err(CompositionError::FinalSimulation(
+                    PlanSimulationError::InvalidProtectedMount(mount)
+                ))
+            );
+        }
     }
 }
