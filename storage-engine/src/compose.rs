@@ -1802,6 +1802,63 @@ mod tests {
         );
     }
 
+    /// Mounting a filesystem must not reuse an explicitly deactivated backing LV.
+    #[test]
+    fn rejects_mount_after_backing_deactivation() {
+        let (current, lv, filesystem) = current_with_lv_and_filesystem();
+        let mut fragment = PlanFragment {
+            actions: vec![
+                FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Lvm(LvmAction::SetActivation {
+                        target: lv,
+                        active: false,
+                    }),
+                },
+                FragmentAction {
+                    id: LocalActionId::new(1),
+                    operation: ProviderAction::Mount(MountAction::Mount {
+                        source: MountSource::Filesystem(filesystem),
+                        target: PathBuf::from("/data"),
+                        options: vec!["ro".to_owned()],
+                        context: MountContext::Host,
+                    }),
+                },
+            ],
+            dependencies: vec![FragmentDependency {
+                before: LocalActionId::new(0),
+                after: LocalActionId::new(1),
+                reason: DependencyReason::RequestedOrder,
+            }],
+            external_requirements: Vec::new(),
+            origin: origin(filesystem, "deactivate then mount"),
+            diagnostics: Vec::new(),
+        };
+        assert!(matches!(
+            compose_plan(&current, vec![fragment.clone()]),
+            Err(CompositionError::ActionRejected(_))
+        ));
+        fragment.actions[0].operation = ProviderAction::Lvm(LvmAction::SetActivation {
+            target: lv,
+            active: true,
+        });
+        fragment.dependencies.clear();
+        assert!(matches!(
+            compose_plan(&current, vec![fragment.clone()]),
+            Err(CompositionError::AmbiguousResourceOrder {
+                resource: ActionResource::Node(node), ..
+            }) if node == lv
+        ));
+        fragment.dependencies.push(FragmentDependency {
+            before: LocalActionId::new(0),
+            after: LocalActionId::new(1),
+            reason: DependencyReason::RequestedOrder,
+        });
+        let plan = compose_plan(&current, vec![fragment])
+            .unwrap_or_else(|error| panic!("activate before mount: {error}"));
+        assert_eq!(plan.ordered_actions().len(), 2);
+    }
+
     /// Shrinking the lower LV before its filesystem is rejected.
     #[test]
     fn rejects_backing_shrink_before_filesystem_shrink() {

@@ -161,6 +161,17 @@ until their constraints are implemented. ext2 growth also requires unmounting.
 These constraints follow the upstream [resize2fs documentation](https://github.com/tytso/e2fsprogs/blob/master/resize/resize2fs.8.in)
 and the [e2fsck read-only and mounted-state rules](https://github.com/tytso/e2fsprogs/blob/master/e2fsck/e2fsck.8.in).
 
+Graph-backed runtime mounts require source availability in the predecessor state.
+Ordinary filesystems need one direct block backing: an explicit deactivation is
+rejected, a fresh endpoint observation or predicted interface permits access,
+and missing or invalidated observations remain `Unknown`. Read-only endpoints
+can supply read access; mount-option permissions and filesystem health still
+need live checks. Btrfs, subvolumes, datasets, and ambiguous backing topology
+retain a provider availability obligation. Source and ancestor node read locks
+coordinate mounting with backing changes and group deactivation. Persistent
+entries do not require a currently active source. Action semantics version 2
+rejects historical JSON plans using the earlier mount contracts.
+
 Runtime mount changes and offline filesystem actions share the conservative
 `RuntimeMountState` resource, so a safe sequential preview cannot authorize an
 unordered DAG. Bind and unsupported mount sources require further live evidence

@@ -236,7 +236,8 @@ impl Projection {
                     self.satisfied_for_node(*node)
                 }
             }
-            ActionPrerequisite::Writable(node) => self.evaluate_writable(*node),
+            ActionPrerequisite::Writable(node) => self.evaluate_endpoint(*node, true),
+            ActionPrerequisite::MountSourceAvailable(source) => self.evaluate_mount_source(source),
             ActionPrerequisite::FilesystemUnmounted(filesystem) => {
                 if self.graph.node(filesystem).is_none() {
                     CheckStatus::Violated {
@@ -320,8 +321,8 @@ impl Projection {
         }
     }
 
-    /// Resolves writable evidence without turning missing facts into success.
-    fn evaluate_writable(&self, node: NodeId) -> CheckStatus {
+    /// Resolves endpoint availability and optional write access without trusting missing facts.
+    fn evaluate_endpoint(&self, node: NodeId, writable: bool) -> CheckStatus {
         let Some(node_value) = self.graph.node(&node) else {
             return CheckStatus::Violated {
                 reason: "referenced node is absent".to_owned(),
@@ -337,6 +338,9 @@ impl Projection {
             Some(BlockInterfaceAccess::ReadWrite) => {
                 return CheckStatus::Satisfied(CheckEvidence::PredictedEffect);
             }
+            Some(BlockInterfaceAccess::ReadOnly) if !writable => {
+                return CheckStatus::Satisfied(CheckEvidence::PredictedEffect);
+            }
             Some(BlockInterfaceAccess::ReadOnly) => {
                 return CheckStatus::Violated {
                     reason: "projected block interface is read-only".to_owned(),
@@ -348,8 +352,17 @@ impl Projection {
             || self.is_observation_stale(&FactScope::Node(node), FactKind::Presence)
         {
             return CheckStatus::Unknown {
-                required_evidence: "fresh writable endpoint observation after runtime invalidation"
+                required_evidence: "fresh block endpoint observation after runtime invalidation"
                     .to_owned(),
+            };
+        }
+        if !writable {
+            return if node_value.size.block.is_some() {
+                CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot)
+            } else {
+                CheckStatus::Unknown {
+                    required_evidence: "available block endpoint observation".to_owned(),
+                }
             };
         }
         match node_value
@@ -365,6 +378,62 @@ impl Projection {
             None => CheckStatus::Unknown {
                 required_evidence: "writable block endpoint observation".to_owned(),
             },
+        }
+    }
+
+    /// Checks simple filesystem backing; multi-device and dataset health need live evidence.
+    fn evaluate_mount_source(&self, source: &MountSource) -> CheckStatus {
+        let node = match source {
+            MountSource::Filesystem(node)
+            | MountSource::BtrfsSubvolume(node)
+            | MountSource::ZfsDataset(node) => *node,
+            _ => {
+                return CheckStatus::Unknown {
+                    required_evidence: "provider mount-source availability check".to_owned(),
+                };
+            }
+        };
+        let Some(value) = self.graph.node(&node) else {
+            return CheckStatus::Violated {
+                reason: "mount source is absent".to_owned(),
+            };
+        };
+        let compatible = matches!(
+            (source, &value.kind.kind),
+            (MountSource::Filesystem(_), NodeKind::Filesystem { .. })
+                | (
+                    MountSource::BtrfsSubvolume(_),
+                    NodeKind::BtrfsSubvolume { .. }
+                )
+                | (MountSource::ZfsDataset(_), NodeKind::ZfsDataset { .. })
+        );
+        if !compatible {
+            return CheckStatus::Violated {
+                reason: "mount source has an incompatible node kind".to_owned(),
+            };
+        }
+        if matches!(&value.kind.kind, NodeKind::Filesystem { kind, .. }
+            if !matches!(kind, FilesystemKind::Btrfs(_)))
+        {
+            let backing: Vec<_> = self
+                .graph
+                .dependencies()
+                .filter(|dependency| {
+                    dependency.to == node && matches!(dependency.kind, DependencyKind::Backs)
+                })
+                .map(|dependency| dependency.from)
+                .collect();
+            if let [backing] = backing.as_slice()
+                && self
+                    .graph
+                    .node(backing)
+                    .is_some_and(|value| matches_kind(&value.kind.kind, NodeKindClass::Block))
+            {
+                return self.evaluate_endpoint(*backing, false);
+            }
+        }
+        CheckStatus::Unknown {
+            required_evidence: "provider mount-source topology and availability check".to_owned(),
         }
     }
 
@@ -1182,7 +1251,7 @@ mod tests {
     /// Group activation invalidates child access claims; explicit re-preparation supplies a new guarantee.
     #[test]
     fn activation_invalidation_revokes_descendant_endpoint_evidence() {
-        let (mut current, lv, _) = current_with_observed_mapping();
+        let (mut current, lv, filesystem) = current_with_observed_mapping();
         let vg = NodeId::new();
         let mut node = current
             .graph
@@ -1234,8 +1303,15 @@ mod tests {
             kind: FactKind::Activation
         }));
         assert_eq!(projection.block_interface(&lv), None);
-        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::Writable(lv)]);
-        assert!(matches!(checks[0].status, CheckStatus::Unknown { .. }));
+        let checks = projection.evaluate_prerequisites(&[
+            ActionPrerequisite::Writable(lv),
+            ActionPrerequisite::MountSourceAvailable(MountSource::Filesystem(filesystem)),
+        ]);
+        assert!(
+            checks
+                .iter()
+                .all(|check| matches!(check.status, CheckStatus::Unknown { .. }))
+        );
         assert_eq!(
             projection
                 .graph()
@@ -1247,9 +1323,16 @@ mod tests {
         projection
             .simulate_action(&activate_lv)
             .unwrap_or_else(|error| panic!("restore child endpoint guarantee: {error}"));
-        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::Writable(lv)]);
+        let checks = projection.evaluate_prerequisites(&[
+            ActionPrerequisite::Writable(lv),
+            ActionPrerequisite::MountSourceAvailable(MountSource::Filesystem(filesystem)),
+        ]);
         assert_eq!(
             checks[0].status,
+            CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
+        );
+        assert_eq!(
+            checks[1].status,
             CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
         );
         assert!(projection.is_observation_stale(&FactScope::Node(lv), FactKind::Activation));
@@ -1399,6 +1482,129 @@ mod tests {
                 kind: DependencyKind::Backs,
             });
         (current, disk, filesystem)
+    }
+
+    /// Mount availability accepts read-only endpoints but never fabricates missing observations.
+    #[test]
+    fn mount_source_requires_backing_evidence_and_matching_kind() {
+        let (mut current, backing, filesystem) = current_with_observed_mapping();
+        let condition =
+            ActionPrerequisite::MountSourceAvailable(MountSource::Filesystem(filesystem));
+        let status = |current: &CurrentState| {
+            Projection::from_current(current)
+                .evaluate_prerequisites(std::slice::from_ref(&condition))[0]
+                .status
+                .clone()
+        };
+        let mut endpoint = current
+            .graph
+            .node(&backing)
+            .unwrap_or_else(|| panic!("missing backing"))
+            .clone();
+        endpoint
+            .size
+            .block
+            .as_mut()
+            .unwrap_or_else(|| panic!("missing block facts"))
+            .read_only = Some(true);
+        current.graph.insert_node(backing, endpoint.clone());
+        assert_eq!(
+            status(&current),
+            CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot)
+        );
+        endpoint.size.block = None;
+        current.graph.insert_node(backing, endpoint);
+        assert!(matches!(status(&current), CheckStatus::Unknown { .. }));
+        let mut without_backing = current.clone();
+        without_backing
+            .graph
+            .remove_dependency(&storage_core::model::Dependency {
+                from: backing,
+                to: filesystem,
+                kind: DependencyKind::Backs,
+            });
+        assert!(matches!(
+            status(&without_backing),
+            CheckStatus::Unknown { .. }
+        ));
+        let mut projection = Projection::from_current(&current);
+        projection
+            .block_interfaces
+            .insert(backing, BlockInterfaceAccess::ReadOnly);
+        assert_eq!(
+            projection.evaluate_prerequisites(std::slice::from_ref(&condition))[0].status,
+            CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
+        );
+        let invalid = ActionPrerequisite::MountSourceAvailable(MountSource::Filesystem(backing));
+        assert!(matches!(
+            projection.evaluate_prerequisites(&[invalid])[0].status,
+            CheckStatus::Violated { .. }
+        ));
+        let mut source = current
+            .graph
+            .node(&filesystem)
+            .unwrap_or_else(|| panic!("missing filesystem"))
+            .clone();
+        source.kind.kind = NodeKind::Disk;
+        current.graph.insert_node(filesystem, source);
+        assert!(matches!(status(&current), CheckStatus::Violated { .. }));
+    }
+
+    /// Serialized mount contracts retain backing checks and reject weakened imports.
+    #[test]
+    fn mount_backing_contract_survives_serialization_and_rejects_tampering() {
+        let (current, backing, filesystem) = current_with_observed_mapping();
+        let action = ProviderAction::Mount(storage_provider::MountAction::Mount {
+            source: MountSource::Filesystem(filesystem),
+            target: PathBuf::from("/data"),
+            options: vec!["ro".to_owned()],
+            context: MountContext::Host,
+        });
+        let context = ActionDescriptionContext {
+            graph: &current.graph,
+        };
+        let contract = describe_action(&action, context);
+        assert!(
+            contract
+                .affected_resources
+                .iter()
+                .any(
+                    |access| access.resource == storage_provider::ActionResource::Node(backing)
+                        && access.mode == storage_provider::ResourceAccessMode::Read
+                )
+        );
+        for ancestor in current
+            .graph
+            .dependencies()
+            .filter(|dependency| dependency.to == backing)
+            .map(|dependency| dependency.from)
+        {
+            assert!(
+                contract
+                    .affected_resources
+                    .iter()
+                    .any(|access| access.resource
+                        == storage_provider::ActionResource::Node(ancestor)
+                        && access.mode == storage_provider::ResourceAccessMode::Read)
+            );
+        }
+        let json = serde_json::to_string(&contract)
+            .unwrap_or_else(|error| panic!("serialize mount contract: {error}"));
+        let mut imported: ActionContract = serde_json::from_str(&json)
+            .unwrap_or_else(|error| panic!("deserialize mount contract: {error}"));
+        assert_eq!(
+            storage_provider::verify_imported_contract(&action, imported.clone(), context),
+            Ok(contract.clone())
+        );
+        imported
+            .prerequisites
+            .retain(|condition| !matches!(condition, ActionPrerequisite::MountSourceAvailable(_)));
+        assert!(storage_provider::verify_imported_contract(&action, imported, context).is_err());
+        let mut imported = contract;
+        imported
+            .affected_resources
+            .retain(|access| access.resource != storage_provider::ActionResource::Node(backing));
+        assert!(storage_provider::verify_imported_contract(&action, imported, context).is_err());
     }
 
     /// Mounted ext4 shrink is rejected before publishing a smaller filesystem.

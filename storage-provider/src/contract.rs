@@ -1,6 +1,9 @@
 //! Trusted semantic contracts derived from typed provider actions.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use storage_core::model::{
@@ -57,6 +60,8 @@ pub enum ActionPrerequisite {
     NoUnexpectedConsumers(NodeId),
     /// The backing endpoint must not be observed read-only.
     Writable(NodeId),
+    /// The graph-backed mount source must expose an available backing endpoint.
+    MountSourceAvailable(MountSource),
     /// The filesystem must be unmounted in every observed namespace.
     FilesystemUnmounted(NodeId),
     /// A preceding forced read-only check must verify the filesystem is clean.
@@ -551,7 +556,7 @@ pub fn describe_action(
         ProviderAction::Lvm(action) => describe_lvm(action, context),
         ProviderAction::Filesystem(action) => describe_filesystem(action, context),
         ProviderAction::Btrfs(action) => describe_btrfs(action, context),
-        ProviderAction::Mount(action) => describe_mount(action),
+        ProviderAction::Mount(action) => describe_mount(action, context.graph),
     };
     let mut outputs = outputs_from_effect(&contract.predicted_effect);
     outputs.append(&mut contract.provided_outputs);
@@ -1365,7 +1370,7 @@ fn describe_btrfs(action: &BtrfsAction, context: ActionDescriptionContext<'_>) -
 }
 
 /// Describes mount actions.
-fn describe_mount(action: &MountAction) -> ActionContract {
+fn describe_mount(action: &MountAction, graph: &NodeGraph) -> ActionContract {
     match action {
         MountAction::Mount {
             source,
@@ -1385,7 +1390,29 @@ fn describe_mount(action: &MountAction) -> ActionContract {
                 result
                     .prerequisites
                     .push(ActionPrerequisite::NodeExists(node));
-                read(&mut result, ActionResource::Node(node));
+                result
+                    .prerequisites
+                    .push(ActionPrerequisite::MountSourceAvailable(source.clone()));
+                // Ancestor locks coordinate mounts with group and backing transitions.
+                let mut pending = vec![node];
+                let mut visited = HashSet::new();
+                while let Some(ancestor) = pending.pop() {
+                    if visited.insert(ancestor) {
+                        read(&mut result, ActionResource::Node(ancestor));
+                        pending.extend(
+                            graph
+                                .dependencies()
+                                .filter(|dependency| dependency.to == ancestor)
+                                .map(|dependency| dependency.from),
+                        );
+                    }
+                }
+                result
+                    .affected_resources
+                    .sort_by_key(|access| match access.resource {
+                        ActionResource::Node(id) => Some(id.as_uuid()),
+                        _ => None,
+                    });
             }
             result
                 .prerequisites
