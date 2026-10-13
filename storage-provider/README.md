@@ -103,6 +103,21 @@ until fresh provider evidence is available. Logical thin or RAID sizes are not
 treated as physical allocation. The [LVM creation manual](https://man7.org/linux/man-pages/man8/lvcreate.8.html)
 describes physical extent allocation and virtual sizes.
 
+Simulation keeps a cumulative invalidation ledger alongside the graph and lists
+invalidated observation aspects on each action step. Historical `NodeFacts` stay
+unchanged; consumers check `Projection::is_observation_stale` for the relevant
+scope and `FactKind`. A new prediction is not a new measurement. Preserved access
+observations retain `ObservedSnapshot` provenance even after a size prediction.
+
+Activation changes revoke prior endpoint claims, including dependent nodes such
+as LVs in a VG. Stale access observations require fresh evidence; explicit later
+preparation can supply a new predicted interface guarantee. Effects, clean-check
+revocation, and observation invalidations publish atomically, so failed actions
+leave all previous evidence intact. Automatic LUKS resize uses the shared
+`InvalidateNodeSize` effect: subsequent capacity checks cannot use the old size
+and remain `Unknown` until a new size is established. A fresh `CurrentState`
+starts a new projection with its own observations.
+
 ## Backend manifests
 
 Backend manifests belong to pdisks. Third-party packages such as `libzfs`,

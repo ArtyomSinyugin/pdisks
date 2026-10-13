@@ -5,6 +5,7 @@ use std::{collections::HashSet, path::PathBuf};
 use storage_core::model::{
     BootSpec, CurrentState, DesiredState, MountContext, MountEntry, NodeGraph, ObservedMount,
 };
+use storage_provider::FactInvalidation;
 use thiserror::Error;
 
 use crate::{
@@ -19,6 +20,8 @@ pub struct SimulatedStep {
     pub action: ActionId,
     /// Prerequisite results calculated immediately before the action.
     pub checks: Vec<PrerequisiteCheck>,
+    /// Observation aspects made stale by this action rather than new measurements.
+    pub invalidated_facts: Vec<FactInvalidation>,
 }
 
 /// Conditional projection produced without mutating the observed baseline.
@@ -79,6 +82,7 @@ pub fn simulate_plan_with_evidence(
         steps.push(SimulatedStep {
             action: action.id,
             checks: result.checks,
+            invalidated_facts: result.invalidated_facts,
         });
     }
     Ok(SimulationResult { projection, steps })

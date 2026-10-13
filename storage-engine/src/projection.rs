@@ -33,6 +33,8 @@ pub struct Projection {
     checked_filesystems: HashSet<NodeId>,
     /// Whether runtime mount evidence includes effects rather than only the snapshot.
     projected_runtime_mounts: bool,
+    /// Baseline observation aspects invalidated by successful projected actions.
+    invalidated_facts: Vec<FactInvalidation>,
 }
 
 impl Projection {
@@ -50,6 +52,7 @@ impl Projection {
             projected_graph_nodes: Vec::new(),
             checked_filesystems: HashSet::new(),
             projected_runtime_mounts: false,
+            invalidated_facts: Vec::new(),
         }
     }
 
@@ -71,8 +74,21 @@ impl Projection {
     }
 
     /// Returns the effective graph after all successfully applied effects.
+    /// Retained `NodeFacts` are historical observations qualified by `is_observation_stale`.
     pub const fn graph(&self) -> &NodeGraph {
         &self.graph
+    }
+
+    /// Returns observation aspects requiring fresh evidence, without duplicating historical facts.
+    pub fn invalidated_facts(&self) -> &[FactInvalidation] {
+        &self.invalidated_facts
+    }
+
+    /// Reports invalidation of an observation aspect; observation availability is checked separately.
+    pub fn is_observation_stale(&self, scope: &FactScope, kind: FactKind) -> bool {
+        self.invalidated_facts
+            .iter()
+            .any(|invalidation| invalidation.scope == *scope && invalidation.kind == kind)
     }
 
     /// Returns effective runtime mounts without mixing in persistent entries.
@@ -143,21 +159,39 @@ impl Projection {
         {
             return Err(ActionSimulationError::PrerequisitesViolated { checks });
         }
-        self.apply_effect(&contract.predicted_effect)?;
-        self.invalidate_filesystem_checks(&contract.invalidated_facts);
+        let invalidated_facts = self.apply_effect_with_invalidations(
+            &contract.predicted_effect,
+            &contract.invalidated_facts,
+        )?;
         self.apply_outputs(&contract.provided_outputs);
-        Ok(SimulatedAction { contract, checks })
+        Ok(SimulatedAction {
+            contract,
+            checks,
+            invalidated_facts,
+        })
     }
 
     /// Atomically applies one trusted predicted effect to this projection.
     pub fn apply_effect(&mut self, effect: &PredictedEffect) -> Result<(), EffectApplicationError> {
+        self.apply_effect_with_invalidations(effect, &[])
+            .map(|_| ())
+    }
+
+    /// Publishes effects and observation invalidations together only after every check succeeds.
+    fn apply_effect_with_invalidations(
+        &mut self,
+        effect: &PredictedEffect,
+        invalidations: &[FactInvalidation],
+    ) -> Result<Vec<FactInvalidation>, EffectApplicationError> {
         let mut candidate = self.clone();
+        let invalidated_facts = candidate.invalidate_observations(invalidations);
+        candidate.invalidate_filesystem_checks(invalidations);
         candidate.apply_graph_effects(&effect.graph)?;
         candidate.apply_mount_effects(&effect.mounts)?;
         candidate.apply_allocation_effects(&effect.allocations)?;
         candidate.validate_edges()?;
         *self = candidate;
-        Ok(())
+        Ok(invalidated_facts)
     }
 
     /// Evaluates one prerequisite without changing projected state.
@@ -308,13 +342,21 @@ impl Projection {
             }
             None => {}
         }
+        if self.is_observation_stale(&FactScope::Node(node), FactKind::Activation)
+            || self.is_observation_stale(&FactScope::Node(node), FactKind::Presence)
+        {
+            return CheckStatus::Unknown {
+                required_evidence: "fresh writable endpoint observation after runtime invalidation"
+                    .to_owned(),
+            };
+        }
         match node_value
             .size
             .block
             .as_ref()
             .and_then(|block| block.read_only)
         {
-            Some(false) => self.satisfied_for_node(node),
+            Some(false) => CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot),
             Some(true) => CheckStatus::Violated {
                 reason: "observed block endpoint is read-only".to_owned(),
             },
@@ -482,6 +524,12 @@ impl Projection {
                         true
                     })?;
                 }
+                GraphEffect::InvalidateNodeSize(node) => {
+                    self.update_node(*node, "invalidate node size", |value| {
+                        value.kind.size = None;
+                        true
+                    })?;
+                }
                 GraphEffect::SetPartitionAttributes {
                     partition,
                     attributes,
@@ -632,6 +680,54 @@ impl Projection {
                 _ => {}
             }
         }
+    }
+
+    /// Records stale baseline aspects and revokes runtime claims affected by activation changes.
+    fn invalidate_observations(
+        &mut self,
+        invalidations: &[FactInvalidation],
+    ) -> Vec<FactInvalidation> {
+        let mut expanded = invalidations.to_vec();
+        for invalidation in invalidations {
+            if let (FactScope::Node(node), FactKind::Activation) =
+                (&invalidation.scope, invalidation.kind)
+            {
+                let mut pending = vec![*node];
+                let mut visited = HashSet::new();
+                while let Some(node) = pending.pop() {
+                    if !visited.insert(node) {
+                        continue;
+                    }
+                    let propagated = FactInvalidation {
+                        scope: FactScope::Node(node),
+                        kind: FactKind::Activation,
+                    };
+                    if !expanded.contains(&propagated) {
+                        expanded.push(propagated);
+                    }
+                    let mut children = self
+                        .graph
+                        .dependencies()
+                        .filter(|dependency| dependency.from == node)
+                        .map(|dependency| dependency.to)
+                        .collect::<Vec<_>>();
+                    children.sort_unstable_by_key(|node| node.as_uuid());
+                    pending.extend(children);
+                }
+            }
+        }
+        for invalidation in &expanded {
+            if !self.invalidated_facts.contains(invalidation) {
+                self.invalidated_facts.push(invalidation.clone());
+            }
+            if let (FactScope::Node(node), FactKind::Activation | FactKind::Presence) =
+                (&invalidation.scope, invalidation.kind)
+            {
+                self.block_interfaces.remove(node);
+                self.activations.remove(node);
+            }
+        }
+        expanded
     }
 
     /// Revokes clean-check guarantees when content or backing geometry changes.
@@ -823,6 +919,8 @@ pub struct SimulatedAction {
     pub contract: ActionContract,
     /// Results of evaluating every prerequisite in that contract.
     pub checks: Vec<PrerequisiteCheck>,
+    /// Observations invalidated at this step, including affected activation descendants.
+    pub invalidated_facts: Vec<FactInvalidation>,
 }
 
 impl SimulatedAction {
@@ -948,6 +1046,249 @@ mod tests {
     use storage_provider::{FilesystemAction, LvmAction, ProviderAction};
 
     use super::*;
+
+    /// Builds a mapping with a historical writable endpoint and one filesystem consumer.
+    fn current_with_observed_mapping() -> (CurrentState, NodeId, NodeId) {
+        let (mut current, disk) = current_with_disk();
+        let mapping = NodeId::new();
+        current.graph.insert_node(
+            mapping,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::DmCryptMapping {
+                        name: "data".to_owned(),
+                    },
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts {
+                    block: Some(storage_core::model::BlockFacts {
+                        paths: vec![PathBuf::from("/dev/mapper/data")],
+                        devno: storage_core::model::DeviceNumber {
+                            major: 253,
+                            minor: 0,
+                        },
+                        geometry: None,
+                        read_only: Some(false),
+                    }),
+                    ..NodeFacts::default()
+                },
+            },
+        );
+        current
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: disk,
+                to: mapping,
+                kind: DependencyKind::Backs,
+            });
+        let filesystem = NodeId::new();
+        current.graph.insert_node(
+            filesystem,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Filesystem {
+                        kind: FilesystemKind::Ext4,
+                        label: None,
+                    },
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        current
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: mapping,
+                to: filesystem,
+                kind: DependencyKind::Backs,
+            });
+        (current, mapping, filesystem)
+    }
+
+    /// An automatic LUKS resize cannot retain the old observed capacity as future evidence.
+    #[test]
+    fn automatic_luks_resize_invalidates_the_previous_size() {
+        let (current, mapping, filesystem) = current_with_observed_mapping();
+        let baseline = current.clone();
+        let mut projection = Projection::from_current(&current);
+        let result = projection
+            .simulate_action(&ProviderAction::Luks(
+                storage_provider::LuksAction::Resize {
+                    mapping,
+                    new_size: None,
+                },
+            ))
+            .unwrap_or_else(|error| panic!("simulate automatic mapping resize: {error}"));
+        assert_eq!(
+            projection.graph().node(&mapping).map(|node| node.kind.size),
+            Some(None)
+        );
+        assert!(result.invalidated_facts.contains(&FactInvalidation {
+            scope: FactScope::Node(mapping),
+            kind: FactKind::Geometry
+        }));
+        assert!(projection.is_observation_stale(&FactScope::Node(mapping), FactKind::Geometry));
+        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::BackingSizeAtLeast {
+            node: filesystem,
+            size: Bytes::new(150),
+        }]);
+        assert!(matches!(checks[0].status, CheckStatus::Unknown { .. }));
+        assert_eq!(current, baseline);
+    }
+
+    /// Geometry predictions preserve access observations without relabelling them as new evidence.
+    #[test]
+    fn predicted_size_does_not_fabricate_new_access_observations() {
+        let (current, mapping, filesystem) = current_with_observed_mapping();
+        let historical = current.graph.node(&mapping).map(|node| node.size.clone());
+        let mut projection = Projection::from_current(&current);
+        projection
+            .simulate_action(&ProviderAction::Luks(
+                storage_provider::LuksAction::Resize {
+                    mapping,
+                    new_size: Some(Bytes::new(200)),
+                },
+            ))
+            .unwrap_or_else(|error| panic!("simulate explicit mapping resize: {error}"));
+        let checks = projection.evaluate_prerequisites(&[
+            ActionPrerequisite::Writable(mapping),
+            ActionPrerequisite::BackingSizeAtLeast {
+                node: filesystem,
+                size: Bytes::new(150),
+            },
+        ]);
+        assert_eq!(
+            checks[0].status,
+            CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot)
+        );
+        assert_eq!(
+            checks[1].status,
+            CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
+        );
+        assert!(projection.is_observation_stale(&FactScope::Node(mapping), FactKind::Geometry));
+        assert!(!projection.is_observation_stale(&FactScope::Node(mapping), FactKind::Activation));
+        assert_eq!(
+            projection
+                .graph()
+                .node(&mapping)
+                .map(|node| node.size.clone()),
+            historical
+        );
+    }
+
+    /// Group activation invalidates child access claims; explicit re-preparation supplies a new guarantee.
+    #[test]
+    fn activation_invalidation_revokes_descendant_endpoint_evidence() {
+        let (mut current, lv, _) = current_with_observed_mapping();
+        let vg = NodeId::new();
+        let mut node = current
+            .graph
+            .node(&lv)
+            .cloned()
+            .unwrap_or_else(|| panic!("endpoint is absent"));
+        node.kind.kind = NodeKind::LvmLv(LvmLv {
+            name: "data".to_owned(),
+            kind: LvmLvKind::Linear,
+        });
+        current.graph.insert_node(lv, node);
+        current.graph.insert_node(
+            vg,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmVg {
+                        name: "vg0".to_owned(),
+                        extent_size: Some(Bytes::new(1)),
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        current
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: vg,
+                to: lv,
+                kind: DependencyKind::Provides,
+            });
+        let baseline = current.clone();
+        let mut projection = Projection::from_current(&current);
+        let activate_lv = ProviderAction::Lvm(LvmAction::SetActivation {
+            target: lv,
+            active: true,
+        });
+        projection
+            .simulate_action(&activate_lv)
+            .unwrap_or_else(|error| panic!("prepare child endpoint: {error}"));
+        let result = projection
+            .simulate_action(&ProviderAction::Lvm(LvmAction::SetActivation {
+                target: vg,
+                active: false,
+            }))
+            .unwrap_or_else(|error| panic!("invalidate group activation: {error}"));
+        assert!(result.invalidated_facts.contains(&FactInvalidation {
+            scope: FactScope::Node(lv),
+            kind: FactKind::Activation
+        }));
+        assert_eq!(projection.block_interface(&lv), None);
+        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::Writable(lv)]);
+        assert!(matches!(checks[0].status, CheckStatus::Unknown { .. }));
+        assert_eq!(
+            projection
+                .graph()
+                .node(&lv)
+                .and_then(|node| node.size.block.as_ref())
+                .and_then(|block| block.read_only),
+            Some(false)
+        );
+        projection
+            .simulate_action(&activate_lv)
+            .unwrap_or_else(|error| panic!("restore child endpoint guarantee: {error}"));
+        let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::Writable(lv)]);
+        assert_eq!(
+            checks[0].status,
+            CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
+        );
+        assert!(projection.is_observation_stale(&FactScope::Node(lv), FactKind::Activation));
+        assert_eq!(current, baseline);
+    }
+
+    /// A failed action cannot publish staleness, graph mutations, or revoked runtime guarantees.
+    #[test]
+    fn failed_action_preserves_observation_validity() {
+        let (mut current, _) = current_with_disk();
+        let vg = NodeId::new();
+        current.graph.insert_node(
+            vg,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::LvmVg {
+                        name: "vg0".to_owned(),
+                        extent_size: Some(Bytes::new(1)),
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let mut projection = Projection::from_current(&current);
+        let before = projection.clone();
+        let result = projection.simulate_action(&ProviderAction::Lvm(LvmAction::CreateLv {
+            vg,
+            planned_node_id: vg,
+            name: "collision".to_owned(),
+            size: Bytes::new(100),
+            layout: LvmLvKind::Linear,
+        }));
+        assert!(matches!(
+            result,
+            Err(ActionSimulationError::Effect(
+                EffectApplicationError::DuplicateNode(_)
+            ))
+        ));
+        assert_eq!(projection, before);
+        assert!(projection.invalidated_facts().is_empty());
+    }
 
     /// Parent mount changes cannot hide or detach a still-mounted descendant.
     #[test]

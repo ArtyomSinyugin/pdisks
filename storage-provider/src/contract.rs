@@ -297,6 +297,8 @@ pub enum AllocationEffect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphEffect {
+    /// Discards a former capacity when the new capacity requires backend observation.
+    InvalidateNodeSize(NodeId),
     /// Inserts a planned node without inventing runtime facts.
     InsertNode {
         /// Stable planned identity.
@@ -797,6 +799,10 @@ fn describe_luks(action: &LuksAction, context: ActionDescriptionContext<'_>) -> 
                 let mut result = contract(RestartPolicy::ReprobeThenRetry);
                 require_kind(&mut result, *mapping, NodeKindClass::DmCryptMapping);
                 write(&mut result, ActionResource::Node(*mapping));
+                result
+                    .predicted_effect
+                    .graph
+                    .push(GraphEffect::InvalidateNodeSize(*mapping));
                 invalidate(&mut result, *mapping, FactKind::Geometry);
                 result
                     .postconditions
@@ -1826,6 +1832,42 @@ mod tests {
     };
 
     use super::*;
+
+    /// Imported contracts cannot preserve a superseded size by dropping the invalidation effect.
+    #[test]
+    fn automatic_luks_resize_contract_preserves_size_invalidation() {
+        let mapping = NodeId::new();
+        let mut graph = NodeGraph::new();
+        graph.insert_node(
+            mapping,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::DmCryptMapping {
+                        name: "data".to_owned(),
+                    },
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        );
+        let operation = ProviderAction::Luks(LuksAction::Resize {
+            mapping,
+            new_size: None,
+        });
+        let context = ActionDescriptionContext { graph: &graph };
+        let contract = describe_action(&operation, context);
+        assert_eq!(
+            contract.predicted_effect.graph,
+            vec![GraphEffect::InvalidateNodeSize(mapping)]
+        );
+        let json = serde_json::to_string(&contract)
+            .unwrap_or_else(|error| panic!("serialize automatic resize invalidation: {error}"));
+        let mut imported = serde_json::from_str::<ActionContract>(&json)
+            .unwrap_or_else(|error| panic!("deserialize automatic resize invalidation: {error}"));
+        assert_eq!(imported, contract);
+        imported.predicted_effect.graph.clear();
+        assert!(verify_imported_contract(&operation, imported, context).is_err());
+    }
 
     /// Import cannot remove the serialized condition protecting nested runtime mount state.
     #[test]

@@ -989,6 +989,49 @@ mod tests {
         }
     }
 
+    /// Step-local invalidations identify their action while the projection keeps one cumulative ledger.
+    #[test]
+    fn simulation_trace_retains_observation_invalidations() {
+        let (current, subject) = current_with_vg();
+        let mut fragment = mount_fragment(
+            subject,
+            vec![
+                MountAction::Mount {
+                    source: MountSource::Tmpfs,
+                    target: PathBuf::from("/data"),
+                    options: Vec::new(),
+                    context: MountContext::Host,
+                },
+                MountAction::Unmount {
+                    target: PathBuf::from("/data"),
+                    context: MountContext::Host,
+                },
+            ],
+        );
+        fragment.dependencies.push(FragmentDependency {
+            before: LocalActionId::new(0),
+            after: LocalActionId::new(1),
+            reason: DependencyReason::RequestedOrder,
+        });
+        let plan = compose_plan(&current, vec![fragment])
+            .unwrap_or_else(|error| panic!("compose invalidation trace: {error}"));
+        let result = crate::simulate_plan(&current, &plan)
+            .unwrap_or_else(|error| panic!("replay invalidation trace: {error}"));
+        let invalidation = storage_provider::FactInvalidation {
+            scope: storage_provider::FactScope::MountTarget {
+                target: PathBuf::from("/data"),
+                context: MountContext::Host,
+            },
+            kind: storage_provider::FactKind::Mount,
+        };
+        assert_eq!(result.steps.len(), 2);
+        for step in &result.steps {
+            assert_eq!(step.invalidated_facts, vec![invalidation.clone()]);
+        }
+        assert_eq!(result.projection.invalidated_facts(), &[invalidation]);
+        assert_eq!(current.mounts.entries.len(), 0);
+    }
+
     /// Wraps runtime actions with stable local identities for mount-order scenarios.
     fn mount_fragment(subject: NodeId, operations: Vec<MountAction>) -> PlanFragment {
         PlanFragment {
