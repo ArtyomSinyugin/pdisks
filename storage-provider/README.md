@@ -43,6 +43,20 @@ access, the shared predicted effect, invalidated facts, postconditions, and a
 restart policy. `storage-engine` validates actions through `validate_provider_action`
 and interprets this `predicted_effect` against the preceding projected state.
 
+`simulate_plan_for_goal` (and its capacity-evidence variant) returns a
+`SimulationReport`: the ordered prerequisite trace, final goal checks, typed
+intent coverage with action IDs, and every unresolved `Unknown` obligation.
+A matching final graph cannot erase a destructive approval, minimum-size check,
+or unread persistent configuration. Coverage describes proposed operations;
+it does not report that `Check` or `Repair` actually ran. Replaying against a
+goal with an absent intent index rejects inconsistent action provenance.
+
+`is_complete` requires satisfied goal checks, covered intents, and no unknown
+prerequisites. Known goal mismatches remain visible in the report and make it
+incomplete; goal-aware composition still rejects them. Completion concerns
+planning evidence only. Every action still requires live admission and verified
+postconditions before execution can be considered successful.
+
 The JSON contract is informational. After importing a plan,
 `verify_imported_contract` recalculates the complete contract and compares it
 with the imported representation. On success it returns the recalculated

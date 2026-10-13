@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::{
     ActionDependency, ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError,
     ExecutionPlan, FragmentId, GoalAspect, GoalStatus, PlanSimulationError, PlannedAction,
-    Projection, compare_goal, simulate_plan_with_evidence,
+    Projection, simulate_plan_for_goal_with_evidence,
 };
 
 /// Mutable action retained only while a plan is being composed.
@@ -55,6 +55,7 @@ pub fn compose_plan(
 }
 
 /// Builds a plan and proves coverage of every explicit goal intent.
+/// Unknown evidence remains conditional; inspect it with `simulate_plan_for_goal`.
 pub fn compose_plan_for_goal(
     current: &CurrentState,
     goal: &DesiredState,
@@ -64,6 +65,7 @@ pub fn compose_plan_for_goal(
 }
 
 /// Builds a goal-covering plan using provider capacity evidence for the baseline.
+/// Unknown evidence remains conditional; inspect it with the goal-aware simulator.
 pub fn compose_plan_for_goal_with_evidence(
     current: &CurrentState,
     goal: &DesiredState,
@@ -72,9 +74,10 @@ pub fn compose_plan_for_goal_with_evidence(
 ) -> Result<ExecutionPlan, CompositionError> {
     validate_intent_coverage(&goal.intents, &fragments)?;
     let plan = compose_plan_with_evidence(current, fragments, capacity_evidence)?;
-    let simulation = simulate_plan_with_evidence(current, &plan, capacity_evidence)
+    let report = simulate_plan_for_goal_with_evidence(current, &plan, goal, capacity_evidence)
         .map_err(CompositionError::FinalSimulation)?;
-    if let Some(check) = compare_goal(&simulation.projection, goal)
+    if let Some(check) = report
+        .goal_checks
         .into_iter()
         .find(|check| matches!(check.status, GoalStatus::Violated { .. }))
     {
@@ -237,6 +240,11 @@ fn intent_is_covered(index: usize, intent: &OperationIntent, fragments: &[PlanFr
         .filter(|fragment| fragment.origin == FragmentOrigin::Intent { index })
         .flat_map(|fragment| fragment.actions.iter().map(|action| &action.operation))
         .collect::<Vec<_>>();
+    actions_cover_intent(intent, &actions)
+}
+
+/// Shares typed intent matching between composition and simulation reports.
+pub(crate) fn actions_cover_intent(intent: &OperationIntent, actions: &[&ProviderAction]) -> bool {
     match intent {
         OperationIntent::Check { target, force } => actions.iter().any(|action| {
             matches!(
@@ -1501,6 +1509,56 @@ mod tests {
 
         let plan = compose_plan(&current, fragments)
             .unwrap_or_else(|error| panic!("compose cross-provider plan: {error}"));
+        let simulation = crate::simulate_plan(&current, &plan)
+            .unwrap_or_else(|error| panic!("simulate cross-provider plan: {error}"));
+        let goal = DesiredState {
+            graph: simulation.projection.graph().clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+        let report = crate::simulate_plan_for_goal(&current, &plan, &goal)
+            .unwrap_or_else(|error| panic!("report conditional creation: {error}"));
+        assert!(
+            report
+                .goal_checks
+                .iter()
+                .all(|check| check.status == GoalStatus::Satisfied)
+        );
+        let expected: Vec<_> = report
+            .simulation
+            .steps
+            .iter()
+            .flat_map(|step| {
+                step.checks
+                    .iter()
+                    .filter_map(move |check| match &check.status {
+                        crate::CheckStatus::Unknown { required_evidence } => {
+                            Some(crate::SimulationObligation::Prerequisite {
+                                action: step.action,
+                                prerequisite: check.prerequisite.clone(),
+                                required_evidence: required_evidence.clone(),
+                            })
+                        }
+                        _ => None,
+                    })
+            })
+            .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(report.unresolved_obligations, expected);
+        assert!(
+            report
+                .unresolved_obligations
+                .iter()
+                .any(|obligation| matches!(
+                    obligation,
+                    crate::SimulationObligation::Prerequisite {
+                        prerequisite: ActionPrerequisite::DestructiveApproval(_),
+                        ..
+                    }
+                ))
+        );
+        assert!(!report.is_complete());
         let ordered = plan.ordered_actions();
 
         assert!(matches!(
@@ -2337,6 +2395,39 @@ mod tests {
 
         let plan = compose_plan_for_goal(&current, &goal, vec![fragment])
             .unwrap_or_else(|error| panic!("compose explicit check: {error}"));
+
+        let baseline = current.clone();
+        let requested = goal.clone();
+        let report = crate::simulate_plan_for_goal(&current, &plan, &goal)
+            .unwrap_or_else(|error| panic!("report explicit check: {error}"));
+        assert_eq!(
+            report.intent_coverage,
+            vec![crate::IntentCoverage {
+                index: 0,
+                actions: vec![ActionId::new(0)],
+                covered: true,
+            }]
+        );
+        assert!(report.is_complete());
+        let mut wrong_goal = goal.clone();
+        wrong_goal.intents = vec![OperationIntent::Repair {
+            target: filesystem,
+            force: true,
+        }];
+        let wrong_report = crate::simulate_plan_for_goal(&current, &plan, &wrong_goal)
+            .unwrap_or_else(|error| panic!("report mismatched intent: {error}"));
+        assert!(!wrong_report.intent_coverage[0].covered);
+        assert!(!wrong_report.is_complete());
+        wrong_goal.intents.clear();
+        assert_eq!(
+            crate::simulate_plan_for_goal(&current, &plan, &wrong_goal),
+            Err(PlanSimulationError::UnknownIntentOrigin {
+                action: ActionId::new(0),
+                index: 0
+            })
+        );
+        assert_eq!(current, baseline);
+        assert_eq!(goal, requested);
 
         assert_eq!(plan.actions().len(), 1);
         assert!(

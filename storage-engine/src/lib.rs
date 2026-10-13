@@ -17,6 +17,7 @@ pub use projection::{
     EffectApplicationError, PrerequisiteCheck, Projection, SimulatedAction,
 };
 pub use simulate::{
-    GoalAspect, GoalCheck, GoalStatus, PlanSimulationError, SimulatedStep, SimulationResult,
-    compare_goal, simulate_plan, simulate_plan_with_evidence,
+    GoalAspect, GoalCheck, GoalStatus, IntentCoverage, PlanSimulationError, SimulatedStep,
+    SimulationObligation, SimulationReport, SimulationResult, compare_goal, simulate_plan,
+    simulate_plan_for_goal, simulate_plan_for_goal_with_evidence, simulate_plan_with_evidence,
 };

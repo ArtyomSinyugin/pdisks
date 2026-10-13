@@ -5,12 +5,12 @@ use std::{collections::HashSet, path::PathBuf};
 use storage_core::model::{
     BootSpec, CurrentState, DesiredState, MountContext, MountEntry, NodeGraph, ObservedMount,
 };
-use storage_provider::FactInvalidation;
+use storage_provider::{ActionPrerequisite, FactInvalidation, FragmentOrigin};
 use thiserror::Error;
 
 use crate::{
-    ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError, ExecutionPlan,
-    PrerequisiteCheck, Projection,
+    ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError, CheckStatus,
+    ExecutionPlan, PrerequisiteCheck, Projection,
 };
 
 /// One trusted action result in plan order.
@@ -33,9 +33,154 @@ pub struct SimulationResult {
     pub steps: Vec<SimulatedStep>,
 }
 
+/// Coverage of an explicit request by typed actions, without claiming execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentCoverage {
+    /// Index in the immutable requested goal.
+    pub index: usize,
+    /// Actions attributed to this intent, including any supporting operations.
+    pub actions: Vec<ActionId>,
+    /// Whether those actions implement the supported typed request.
+    pub covered: bool,
+}
+
+/// Evidence missing from a successful but conditional simulation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimulationObligation {
+    /// Condition that must hold before a particular action.
+    Prerequisite {
+        /// Action requiring the evidence at its own predecessor state.
+        action: ActionId,
+        /// Exact trusted condition to check.
+        prerequisite: ActionPrerequisite,
+        /// Missing evidence, rather than permission to assume success.
+        required_evidence: String,
+    },
+    /// Requested final aspect that pure simulation cannot establish.
+    Goal {
+        /// Goal aspect requiring evidence.
+        aspect: GoalAspect,
+        /// Missing evidence for this requested result.
+        required_evidence: String,
+    },
+}
+
+/// Goal-aware analysis; a prediction never grants live execution permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulationReport {
+    /// Conditional projection and the ordered prerequisite trace.
+    pub simulation: SimulationResult,
+    /// Three-valued comparisons against the requested final state.
+    pub goal_checks: Vec<GoalCheck>,
+    /// Typed action coverage of explicit requests, not actual operation results.
+    pub intent_coverage: Vec<IntentCoverage>,
+    /// All unknown conditions, retained even if the final graph matches.
+    pub unresolved_obligations: Vec<SimulationObligation>,
+}
+
+impl SimulationReport {
+    /// Reports complete planning evidence only; live admission is still required.
+    pub fn is_complete(&self) -> bool {
+        self.unresolved_obligations.is_empty()
+            && self
+                .goal_checks
+                .iter()
+                .all(|check| check.status == GoalStatus::Satisfied)
+            && self.intent_coverage.iter().all(|coverage| coverage.covered)
+    }
+}
+
+/// Replays a plan and reports goal coverage without extra provider evidence.
+pub fn simulate_plan_for_goal(
+    current: &CurrentState,
+    plan: &ExecutionPlan,
+    goal: &DesiredState,
+) -> Result<SimulationReport, PlanSimulationError> {
+    simulate_plan_for_goal_with_evidence(current, plan, goal, &[])
+}
+
+/// Replays with baseline capacity evidence and preserves all unknown obligations.
+pub fn simulate_plan_for_goal_with_evidence(
+    current: &CurrentState,
+    plan: &ExecutionPlan,
+    goal: &DesiredState,
+    capacity_evidence: &[CapacityEvidence],
+) -> Result<SimulationReport, PlanSimulationError> {
+    for action in plan.actions() {
+        if let FragmentOrigin::Intent { index } = action.origin
+            && index >= goal.intents.len()
+        {
+            return Err(PlanSimulationError::UnknownIntentOrigin {
+                action: action.id,
+                index,
+            });
+        }
+    }
+    let simulation = simulate_plan_with_evidence(current, plan, capacity_evidence)?;
+    let goal_checks = compare_goal(&simulation.projection, goal);
+    let ordered = plan.ordered_actions();
+    let intent_coverage = goal
+        .intents
+        .iter()
+        .enumerate()
+        .map(|(index, intent)| {
+            let actions: Vec<_> = ordered
+                .iter()
+                .copied()
+                .filter(|action| action.origin == FragmentOrigin::Intent { index })
+                .collect();
+            IntentCoverage {
+                index,
+                covered: crate::compose::actions_cover_intent(
+                    intent,
+                    &actions
+                        .iter()
+                        .map(|action| &action.operation)
+                        .collect::<Vec<_>>(),
+                ),
+                actions: actions.iter().map(|action| action.id).collect(),
+            }
+        })
+        .collect();
+    let mut unresolved_obligations = Vec::new();
+    for step in &simulation.steps {
+        for check in &step.checks {
+            if let CheckStatus::Unknown { required_evidence } = &check.status {
+                unresolved_obligations.push(SimulationObligation::Prerequisite {
+                    action: step.action,
+                    prerequisite: check.prerequisite.clone(),
+                    required_evidence: required_evidence.clone(),
+                });
+            }
+        }
+    }
+    for check in &goal_checks {
+        if let GoalStatus::Unknown { required_evidence } = &check.status {
+            unresolved_obligations.push(SimulationObligation::Goal {
+                aspect: check.aspect.clone(),
+                required_evidence: required_evidence.clone(),
+            });
+        }
+    }
+    Ok(SimulationReport {
+        simulation,
+        goal_checks,
+        intent_coverage,
+        unresolved_obligations,
+    })
+}
+
 /// Failure while replaying a frozen execution plan.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PlanSimulationError {
+    /// Plan provenance references an intent absent from the supplied goal.
+    #[error("action {action:?} references absent goal intent {index}")]
+    UnknownIntentOrigin {
+        /// Action whose provenance is invalid for this goal.
+        action: ActionId,
+        /// Missing intent index.
+        index: usize,
+    },
     /// Provider capacity evidence contains duplicate domains.
     #[error(transparent)]
     CapacityEvidence(#[from] CapacityEvidenceError),
@@ -286,7 +431,20 @@ mod tests {
             intents: Vec::new(),
         };
 
-        let checks = compare_goal(&Projection::from_current(&current), &goal);
+        let plan = crate::compose_plan_for_goal(&current, &goal, Vec::new())
+            .unwrap_or_else(|error| panic!("compose conditional persistent goal: {error}"));
+        let report = simulate_plan_for_goal(&current, &plan, &goal)
+            .unwrap_or_else(|error| panic!("report conditional persistent goal: {error}"));
+        assert_eq!(report.unresolved_obligations.len(), 1);
+        assert!(matches!(
+            &report.unresolved_obligations[0],
+            SimulationObligation::Goal {
+                aspect: GoalAspect::PersistentMount { .. },
+                ..
+            }
+        ));
+        assert!(!report.is_complete());
+        let checks = report.goal_checks;
 
         assert!(checks.iter().any(|check| matches!(
             check,
@@ -302,5 +460,60 @@ mod tests {
                 status: GoalStatus::Unknown { .. },
             }
         )));
+    }
+
+    /// A matching graph cannot cover an explicit operation, and mismatches remain visible.
+    #[test]
+    fn report_distinguishes_complete_uncovered_and_violated_goals() {
+        let current = CurrentState {
+            graph: NodeGraph::new(),
+            mounts: MountState::default(),
+            environment: Environment {
+                host: SystemEnvironment::default(),
+                target: None,
+            },
+            diagnostics: Vec::new(),
+        };
+        let mut goal = DesiredState {
+            graph: current.graph.clone(),
+            mounts: MountSpec::default(),
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        };
+        let plan = crate::compose_plan(&current, Vec::new())
+            .unwrap_or_else(|error| panic!("compose empty plan: {error}"));
+        assert!(
+            simulate_plan_for_goal(&current, &plan, &goal)
+                .unwrap_or_else(|error| panic!("report complete goal: {error}"))
+                .is_complete()
+        );
+        goal.intents
+            .push(storage_core::model::OperationIntent::Check {
+                target: storage_core::model::NodeId::new(),
+                force: true,
+            });
+        let report = simulate_plan_for_goal(&current, &plan, &goal)
+            .unwrap_or_else(|error| panic!("report uncovered goal: {error}"));
+        assert!(!report.is_complete());
+        assert!(!report.intent_coverage[0].covered);
+        assert!(report.intent_coverage[0].actions.is_empty());
+        goal.intents.clear();
+        goal.mounts.entries.push(MountEntry {
+            source: MountSource::Tmpfs,
+            target: PathBuf::from("/missing"),
+            options: Vec::new(),
+            persistent: false,
+            context: MountContext::Host,
+        });
+        let report = simulate_plan_for_goal(&current, &plan, &goal)
+            .unwrap_or_else(|error| panic!("report violated goal: {error}"));
+        assert!(!report.is_complete());
+        assert!(report.unresolved_obligations.is_empty());
+        assert!(
+            report
+                .goal_checks
+                .iter()
+                .any(|check| matches!(check.status, GoalStatus::Violated { .. }))
+        );
     }
 }
