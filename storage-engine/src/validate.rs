@@ -2,6 +2,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use storage_core::model::{MountContext, NodeId};
 use storage_provider::{ActionResource, FactScope, GraphEffect, MountEffect, ResourceAccessMode};
 
@@ -9,7 +11,8 @@ use crate::{ActionId, ExecutionPlan, PlanSimulationError, SimulationResult};
 
 /// Objects that must remain untouched throughout every predicted transition.
 /// This policy restricts planning; it never grants live write permission.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtectedScope {
     /// Nodes protected against writes, incident edge changes, and mutation-related invalidations.
     pub nodes: Vec<NodeId>,
@@ -21,7 +24,8 @@ pub struct ProtectedScope {
 }
 
 /// One namespace-qualified mount target in a preservation policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtectedMount {
     /// Absolute target whose mount relation is protected.
     pub target: PathBuf,

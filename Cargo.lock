@@ -561,9 +561,12 @@ dependencies = [
 name = "storage-engine"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "storage-core",
  "storage-provider",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

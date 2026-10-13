@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
+
 use storage_core::model::{
     CurrentState, DependencyKind, Diagnostic, DiagnosticSeverity, FilesystemKind, MountContext,
     MountEntry, MountSource, Node, NodeFacts, NodeGraph, NodeId, NodeKind, ObservedMount,
@@ -896,7 +898,8 @@ pub struct PrerequisiteCheck {
 }
 
 /// Read-only provider evidence about one allocation domain.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapacityEvidence {
     /// Domain to which the observation applies.
     pub domain: AllocationDomain,

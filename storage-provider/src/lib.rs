@@ -32,7 +32,7 @@ pub use contract::{
     ActionPrerequisite, ActionResource, AllocationDomain, AllocationEffect, AllocationQuantity,
     BlockInterfaceAccess, FactInvalidation, FactKind, FactScope, GraphEffect, MountEffect,
     NodeKindClass, Postcondition, PredictedEffect, ResourceAccess, ResourceAccessMode,
-    RestartPolicy, describe_action, verify_imported_contract,
+    RestartPolicy, canonicalize_contract, describe_action, verify_imported_contract,
 };
 pub use logical::{LogicalProvider, ProviderId, validate_provider_action};
 pub use luks::{
@@ -48,6 +48,10 @@ pub use transport::{
     ProviderRemoteError, ProviderRequest, ProviderResponse, ProviderResponsePayload,
     ProviderTransport, ProviderTransportError,
 };
+
+/// Version of the shared action-contract semantics, independent of transport and manifests.
+/// Increment when trusted prerequisite, effect, or verification meaning changes.
+pub const ACTION_SEMANTICS_VERSION: u32 = 1;
 
 /// Manifest JSON schema version supported by this release.
 pub const BACKEND_MANIFEST_VERSION: u16 = 1;

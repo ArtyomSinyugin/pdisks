@@ -5,7 +5,10 @@ use std::{collections::HashSet, path::PathBuf};
 use storage_core::model::{
     BootSpec, CurrentState, DesiredState, MountContext, MountEntry, NodeGraph, ObservedMount,
 };
-use storage_provider::{ActionPrerequisite, FactInvalidation, FragmentOrigin};
+use storage_provider::{
+    ActionDescriptionContext, ActionPrerequisite, FactInvalidation, FragmentOrigin,
+    verify_imported_contract,
+};
 use thiserror::Error;
 
 use crate::{
@@ -239,26 +242,48 @@ pub fn simulate_plan_with_evidence(
     plan: &ExecutionPlan,
     capacity_evidence: &[CapacityEvidence],
 ) -> Result<SimulationResult, PlanSimulationError> {
+    replay_plan(current, plan, capacity_evidence).map(|(_, simulation)| simulation)
+}
+
+/// Replays through the shared interpreter and retains only recalculated trusted contracts.
+pub(crate) fn replay_plan(
+    current: &CurrentState,
+    plan: &ExecutionPlan,
+    capacity_evidence: &[CapacityEvidence],
+) -> Result<(ExecutionPlan, SimulationResult), PlanSimulationError> {
     let mut projection =
         Projection::from_current(current).with_capacity_evidence(capacity_evidence)?;
+    let mut trusted_actions = Vec::with_capacity(plan.actions().len());
     let mut steps = Vec::with_capacity(plan.actions().len());
     for action in plan.ordered_actions() {
+        verify_imported_contract(
+            &action.operation,
+            action.informational_contract.clone(),
+            ActionDescriptionContext {
+                graph: projection.graph(),
+            },
+        )
+        .map_err(|_| PlanSimulationError::ContractMismatch(action.id))?;
         let result = projection
             .simulate_action(&action.operation)
             .map_err(|source| PlanSimulationError::Action {
                 action: action.id,
                 source,
             })?;
-        if result.contract != action.informational_contract {
-            return Err(PlanSimulationError::ContractMismatch(action.id));
-        }
+        let mut trusted_action = action.clone();
+        trusted_action.informational_contract = result.contract;
+        trusted_actions.push(trusted_action);
         steps.push(SimulatedStep {
             action: action.id,
             checks: result.checks,
             invalidated_facts: result.invalidated_facts,
         });
     }
-    Ok(SimulationResult { projection, steps })
+    trusted_actions.sort_by_key(|action| action.id);
+    Ok((
+        ExecutionPlan::new(trusted_actions, plan.dependencies().to_vec()),
+        SimulationResult { projection, steps },
+    ))
 }
 
 /// Requested aspect evaluated against a final projection.

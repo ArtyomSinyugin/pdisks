@@ -81,10 +81,40 @@ callers must supply objects to preserve explicitly. The policy concerns proposed
 mutations and does not replace destructive approval or live identity checks.
 
 The JSON contract is informational. After importing a plan,
-`verify_imported_contract` recalculates the complete contract and compares it
-with the imported representation. On success it returns the recalculated
-instance. Editing JSON therefore cannot remove `NoUnexpectedConsumers`, reduce
+`verify_imported_contract` recalculates the complete contract and compares its
+canonical semantics with the imported representation. On success it returns the
+recalculated instance. Editing JSON therefore cannot remove `NoUnexpectedConsumers`, reduce
 resource locks, or weaken postcondition verification.
+
+`storage-engine::PlanDocument` is the versioned JSON boundary. It records a
+plan identity, the original goal, protection policy, saved `HistoricalBaseline`,
+capacity evidence, actions, and dependencies. `PLAN_SCHEMA_VERSION` describes
+the outer format; `ACTION_SEMANTICS_VERSION` describes the shared provider
+catalogue independently of provider transport and backend-manifest versions.
+There are no run statuses, library handles, authorizations, or credential contents.
+
+`capture` validates the description before saving. `from_json` only parses;
+`analyse_historical` validates IDs, fragment provenance, references, graph edges,
+and the DAG before replay. It reuses the same predecessor-state interpreter and
+imported-contract verifier, retains trusted recalculated contracts, then checks
+resource coordination, goal coverage, and protected objects. Unknown obligations
+remain conditional; known violations reject import. `analyse_against` additionally
+compares the saved context with an independently retained historical baseline.
+This conservative comparison is for historical analysis, not live correlation.
+
+`canonical_json` validates and produces stable object keys, graph edge sets,
+action IDs, dependency sets, mount entries, capacity evidence, and protection
+sets. Contract prerequisites, outputs, resource accesses, invalidations, and
+postconditions are sets. Consecutive edge removals commute inside the atomic
+batch and are normalized as a run; other graph effects, mount effects, allocation
+effects, and ordered intents retain sequence. Duplicate edge removals retain
+multiplicity and cannot match a trusted contract that removes an edge once.
+
+`HistoricalAnalysis` explicitly represents saved evidence. Plan and baseline
+UUIDs identify documents; they do not authenticate content or authorize writes.
+Fresh identity correlation, per-action admission, and actual postcondition
+verification remain separate execution work. JSON rejects non-UTF-8 paths while
+identical in-process contracts can still be verified without JSON encoding.
 
 The current filesystem resize recipe supports ext2/ext3/ext4. Shrink requires
 unmounting the filesystem in every observed namespace, then a forced read-only

@@ -580,7 +580,7 @@ fn validate_declared_requirements(
 }
 
 /// Rejects conflicting accesses when the DAG does not define their order.
-fn validate_resource_order(
+pub(crate) fn validate_resource_order(
     contracts: &HashMap<ActionId, ActionContract>,
     dependencies: &[ActionDependency],
 ) -> Result<(), CompositionError> {
@@ -677,7 +677,7 @@ fn simulate_order(
 }
 
 /// Calculates a stable topological order or reports a cycle.
-fn topological_order(
+pub(crate) fn topological_order(
     action_count: usize,
     dependencies: &[ActionDependency],
 ) -> Result<Vec<ActionId>, CompositionError> {

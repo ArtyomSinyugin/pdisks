@@ -7,6 +7,7 @@ mod plan;
 mod projection;
 mod simulate;
 mod validate;
+mod wire;
 
 pub use compose::{
     CompositionError, compose_plan, compose_plan_for_goal, compose_plan_for_goal_with_evidence,
@@ -25,3 +26,7 @@ pub use simulate::{
 };
 
 pub use validate::{ProtectedAspect, ProtectedMount, ProtectedScope, ProtectionViolation};
+
+pub use wire::{
+    HistoricalAnalysis, HistoricalBaseline, PLAN_SCHEMA_VERSION, PlanDocument, PlanDocumentError,
+};

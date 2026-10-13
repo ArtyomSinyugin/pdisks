@@ -1,12 +1,15 @@
 //! Immutable cross-provider execution plan.
 
+use serde::{Deserialize, Serialize};
+
 use storage_provider::{
     ActionContract, DependencyReason, FragmentOrigin, LocalActionId, ProviderAction,
 };
 
 /// Action identity scoped to one execution plan.
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ActionId(u32);
 
 impl ActionId {
@@ -23,7 +26,8 @@ impl ActionId {
 
 /// Fragment identity assigned during composition.
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct FragmentId(u32);
 
 impl FragmentId {
@@ -39,7 +43,8 @@ impl FragmentId {
 }
 
 /// One action in a composed execution plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlannedAction {
     /// Identity used by global dependencies.
     pub id: ActionId,
@@ -56,7 +61,8 @@ pub struct PlannedAction {
 }
 
 /// Required ordering between two actions in the global DAG.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActionDependency {
     /// Action that must reach a verified result first.
     pub before: ActionId,

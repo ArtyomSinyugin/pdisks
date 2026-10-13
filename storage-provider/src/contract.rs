@@ -570,7 +570,12 @@ pub fn verify_imported_contract(
     context: ActionDescriptionContext<'_>,
 ) -> Result<ActionContract, ActionContractMismatch> {
     let trusted = describe_action(action, context);
-    if trusted == imported {
+    if trusted == imported
+        || canonicalize_contract(trusted.clone())
+            .ok()
+            .zip(canonicalize_contract(imported.clone()).ok())
+            .is_some_and(|(trusted, imported)| trusted == imported)
+    {
         Ok(trusted)
     } else {
         Err(ActionContractMismatch {
@@ -578,6 +583,61 @@ pub fn verify_imported_contract(
             imported: Box::new(imported),
         })
     }
+}
+
+/// Canonicalizes set-valued contract fields without reordering sequential mutations.
+/// Consecutive edge removals commute inside the atomic effect batch; other effects retain order.
+pub fn canonicalize_contract(
+    mut contract: ActionContract,
+) -> Result<ActionContract, serde_json::Error> {
+    sort_contract_values(&mut contract.prerequisites, true)?;
+    sort_contract_values(&mut contract.provided_outputs, true)?;
+    sort_contract_values(&mut contract.affected_resources, true)?;
+    sort_contract_values(&mut contract.invalidated_facts, true)?;
+    sort_contract_values(&mut contract.postconditions, true)?;
+    let mut start = 0;
+    while start < contract.predicted_effect.graph.len() {
+        if !is_edge_removal(&contract.predicted_effect.graph[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < contract.predicted_effect.graph.len()
+            && is_edge_removal(&contract.predicted_effect.graph[end])
+        {
+            end += 1;
+        }
+        let mut run = contract.predicted_effect.graph[start..end].to_vec();
+        sort_contract_values(&mut run, false)?;
+        contract.predicted_effect.graph[start..end].clone_from_slice(&run);
+        start = end;
+    }
+    Ok(contract)
+}
+
+/// Identifies mutations that commute with other adjacent edge removals.
+fn is_edge_removal(effect: &GraphEffect) -> bool {
+    matches!(
+        effect,
+        GraphEffect::RemoveDependency(_) | GraphEffect::RemoveRelation(_)
+    )
+}
+
+/// Sorts typed values by their deterministic JSON key, deduplicating only semantic sets.
+fn sort_contract_values<T: Serialize>(
+    values: &mut Vec<T>,
+    deduplicate: bool,
+) -> Result<(), serde_json::Error> {
+    let mut keyed = std::mem::take(values)
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).map(|key| (key, value)))
+        .collect::<Result<Vec<_>, _>>()?;
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    if deduplicate {
+        keyed.dedup_by(|left, right| left.0 == right.0);
+    }
+    *values = keyed.into_iter().map(|(_, value)| value).collect();
+    Ok(())
 }
 
 /// Creates an empty contract with a selected recovery policy.
@@ -2316,5 +2376,89 @@ mod tests {
         let restored = serde_json::from_str::<ActionContract>(&json)
             .unwrap_or_else(|error| panic!("deserialize unknown LVM allocation: {error}"));
         assert_eq!(restored, contract);
+    }
+
+    /// Hash-order edge removals commute, but node/property effect sequencing stays exact.
+    #[test]
+    fn canonical_import_normalizes_edge_removal_runs_only() {
+        let mapping = NodeId::new();
+        let mut graph = NodeGraph::new();
+        let first = NodeId::new();
+        let second = NodeId::new();
+        for (id, kind) in [
+            (first, NodeKind::Disk),
+            (second, NodeKind::Disk),
+            (
+                mapping,
+                NodeKind::DmCryptMapping {
+                    name: "data".to_owned(),
+                },
+            ),
+        ] {
+            graph.insert_node(
+                id,
+                storage_core::model::Node {
+                    kind: NodeSpec { kind, size: None },
+                    size: storage_core::model::NodeFacts::default(),
+                },
+            );
+        }
+        for from in [first, second] {
+            graph.insert_dependency(Dependency {
+                from,
+                to: mapping,
+                kind: DependencyKind::Backs,
+            });
+            graph.insert_relation(Relation {
+                from,
+                to: mapping,
+                kind: storage_core::model::RelationKind::SnapshotOf,
+            });
+        }
+        let action = ProviderAction::Luks(LuksAction::Close { mapping });
+        let context = ActionDescriptionContext { graph: &graph };
+        let trusted = describe_action(&action, context);
+        let mut reordered = trusted.clone();
+        reordered.predicted_effect.graph[1..].reverse();
+        reordered.postconditions.reverse();
+        reordered.prerequisites.reverse();
+        assert_eq!(
+            verify_imported_contract(&action, reordered.clone(), context),
+            Ok(trusted.clone())
+        );
+        let canonical = canonicalize_contract(trusted.clone())
+            .unwrap_or_else(|error| panic!("canonical contract: {error}"));
+        assert_eq!(
+            canonicalize_contract(reordered.clone())
+                .unwrap_or_else(|error| panic!("canonical reordered contract: {error}")),
+            canonical
+        );
+        // Sequential placement of the node mutation is never normalized away.
+        reordered.predicted_effect.graph.reverse();
+        assert!(verify_imported_contract(&action, reordered, context).is_err());
+        let mut duplicate_removal = trusted;
+        duplicate_removal
+            .predicted_effect
+            .graph
+            .push(duplicate_removal.predicted_effect.graph[1].clone());
+        assert!(verify_imported_contract(&action, duplicate_removal, context).is_err());
+    }
+
+    /// Pure in-process verification remains available for Linux paths that JSON cannot encode.
+    #[test]
+    fn identical_non_utf8_contract_does_not_require_json_encoding() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let graph = NodeGraph::new();
+        let action = ProviderAction::Mount(MountAction::Unmount {
+            target: PathBuf::from(OsString::from_vec(vec![b'/', 0xff])),
+            context: MountContext::Host,
+        });
+        let context = ActionDescriptionContext { graph: &graph };
+        let trusted = describe_action(&action, context);
+        assert_eq!(
+            verify_imported_contract(&action, trusted.clone(), context),
+            Ok(trusted.clone())
+        );
+        assert!(canonicalize_contract(trusted).is_err());
     }
 }
