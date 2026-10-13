@@ -161,6 +161,13 @@ until their constraints are implemented. ext2 growth also requires unmounting.
 These constraints follow the upstream [resize2fs documentation](https://github.com/tytso/e2fsprogs/blob/master/resize/resize2fs.8.in)
 and the [e2fsck read-only and mounted-state rules](https://github.com/tytso/e2fsprogs/blob/master/e2fsck/e2fsck.8.in).
 
+Mount goals compare the opaque option sequences exactly, including order and
+repetition: `ro,rw` and `rw,ro` must not prove the same requested behavior.
+Runtime and persistent goals share this rule. JSON canonicalization preserves
+these sequences. Provider-specific option normalization is not implemented,
+so even reordered independent options require an exact match during planning;
+this conservative comparison never guesses equivalence from a string set.
+
 Graph-backed runtime mounts require source availability in the predecessor state.
 Ordinary filesystems need one direct block backing: an explicit deactivation is
 rejected, a fresh endpoint observation or predicted interface permits access,

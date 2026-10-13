@@ -1,6 +1,6 @@
 //! Whole-plan simulation and semantic goal comparison.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::path::PathBuf;
 
 use storage_core::model::{
     BootSpec, CurrentState, DesiredState, MountContext, MountEntry, NodeGraph, ObservedMount,
@@ -462,9 +462,9 @@ fn persistent_mount_check(projection: &Projection, requested: &MountEntry) -> Go
     }
 }
 
-/// Compares mount options as an order-independent set.
+/// Compares opaque option sequences exactly because later options can override earlier ones.
 fn options_match(left: &[String], right: &[String]) -> bool {
-    left.iter().collect::<HashSet<_>>() == right.iter().collect::<HashSet<_>>()
+    left == right
 }
 
 #[cfg(test)]
@@ -474,6 +474,64 @@ mod tests {
     };
 
     use super::*;
+
+    /// Conflicting option order and repeated overrides must not prove the requested mount goal.
+    #[test]
+    fn mount_goals_preserve_option_order_and_multiplicity() {
+        for actual in [vec!["rw", "ro"], vec!["ro", "rw", "ro"]] {
+            let entry = MountEntry {
+                source: MountSource::Tmpfs,
+                target: PathBuf::from("/data"),
+                options: vec!["ro".to_owned(), "rw".to_owned()],
+                persistent: true,
+                context: MountContext::Host,
+            };
+            let mut actual_entry = entry.clone();
+            actual_entry.options = actual.into_iter().map(str::to_owned).collect();
+            let current = CurrentState {
+                graph: NodeGraph::new(),
+                mounts: MountState {
+                    entries: vec![ObservedMount {
+                        source: actual_entry.source.clone(),
+                        target: actual_entry.target.clone(),
+                        options: actual_entry.options.clone(),
+                        context: actual_entry.context.clone(),
+                    }],
+                },
+                environment: Environment {
+                    host: SystemEnvironment::default(),
+                    target: None,
+                },
+                diagnostics: Vec::new(),
+            };
+            let mut projection = Projection::from_current(&current);
+            projection
+                .apply_effect(&storage_provider::PredictedEffect {
+                    graph: Vec::new(),
+                    mounts: vec![storage_provider::MountEffect::SetPersistent(
+                        actual_entry.clone(),
+                    )],
+                    allocations: Vec::new(),
+                })
+                .unwrap_or_else(|error| panic!("project persistent mount: {error}"));
+            assert!(matches!(
+                runtime_mount_check(projection.runtime_mounts(), &entry).status,
+                GoalStatus::Violated { .. }
+            ));
+            assert!(matches!(
+                persistent_mount_check(&projection, &entry).status,
+                GoalStatus::Violated { .. }
+            ));
+            assert_eq!(
+                runtime_mount_check(projection.runtime_mounts(), &actual_entry).status,
+                GoalStatus::Satisfied
+            );
+            assert_eq!(
+                persistent_mount_check(&projection, &actual_entry).status,
+                GoalStatus::Satisfied
+            );
+        }
+    }
 
     /// Runtime evidence does not fabricate an unread persistent configuration.
     #[test]
