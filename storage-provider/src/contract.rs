@@ -1,9 +1,6 @@
 //! Trusted semantic contracts derived from typed provider actions.
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use storage_core::model::{
@@ -1400,18 +1397,9 @@ fn describe_mount(action: &MountAction, graph: &NodeGraph) -> ActionContract {
                     .prerequisites
                     .push(ActionPrerequisite::MountSourceAvailable(source.clone()));
                 // Ancestor locks coordinate mounts with group and backing transitions.
-                let mut pending = vec![node];
-                let mut visited = HashSet::new();
-                while let Some(ancestor) = pending.pop() {
-                    if visited.insert(ancestor) {
-                        read(&mut result, ActionResource::Node(ancestor));
-                        pending.extend(
-                            graph
-                                .dependencies()
-                                .filter(|dependency| dependency.to == ancestor)
-                                .map(|dependency| dependency.from),
-                        );
-                    }
+                read(&mut result, ActionResource::Node(node));
+                for ancestor in graph.ancestors(node) {
+                    read(&mut result, ActionResource::Node(ancestor));
                 }
                 result
                     .affected_resources

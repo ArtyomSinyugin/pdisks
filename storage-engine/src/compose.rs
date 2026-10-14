@@ -126,6 +126,7 @@ pub fn compose_plan_with_evidence(
     fragments: Vec<PlanFragment>,
     capacity_evidence: &[CapacityEvidence],
 ) -> Result<ExecutionPlan, CompositionError> {
+    current.graph.validate_structure()?;
     let FlattenedFragments {
         actions: draft,
         mut dependencies,
@@ -878,6 +879,9 @@ fn output_satisfies(output: &ActionOutput, prerequisite: &ActionPrerequisite) ->
 /// Failure to compose provider fragments into a safe global DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CompositionError {
+    /// The supplied storage graph has an invalid representation.
+    #[error(transparent)]
+    Structure(#[from] storage_core::model::GraphError),
     /// A planned mutation intersects the caller's explicit protected area.
     #[error("action {action:?} modifies protected aspect {aspect:?}")]
     ProtectedScopeViolation {
@@ -3368,6 +3372,27 @@ mod tests {
         assert!(matches!(
             compose_plan(&current, vec![fragment]),
             Err(CompositionError::ActionRejected(_))
+        ));
+    }
+    /// An empty action list cannot bypass storage structure checks on in-memory snapshots.
+    #[test]
+    fn empty_plans_reject_invalid_storage_graphs() {
+        let (mut current, vg) = current_with_vg();
+        current
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: vg,
+                to: vg,
+                kind: storage_core::model::DependencyKind::Backs,
+            });
+        assert!(matches!(
+            compose_plan(&current, Vec::new()),
+            Err(CompositionError::Structure(_))
+        ));
+        let empty = ExecutionPlan::new(Vec::new(), Vec::new());
+        assert!(matches!(
+            crate::simulate_plan(&current, &empty),
+            Err(PlanSimulationError::Structure(_))
         ));
     }
 }

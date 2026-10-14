@@ -130,6 +130,7 @@ pub fn simulate_plan_for_goal_with_policy(
     capacity_evidence: &[CapacityEvidence],
     protected: &ProtectedScope,
 ) -> Result<SimulationReport, PlanSimulationError> {
+    goal.graph.validate_structure()?;
     crate::validate::validate_protected_scope(protected)?;
     for action in plan.actions() {
         if let FragmentOrigin::Intent { index } = action.origin
@@ -201,6 +202,9 @@ pub fn simulate_plan_for_goal_with_policy(
 /// Failure while replaying a frozen execution plan.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PlanSimulationError {
+    /// The supplied storage graph has an invalid representation.
+    #[error(transparent)]
+    Structure(#[from] storage_core::model::GraphError),
     /// A protection policy contains a relative, traversing, or NUL-bearing mount path.
     #[error("invalid protected mount target or context: {0:?}")]
     InvalidProtectedMount(crate::ProtectedMount),
@@ -251,6 +255,7 @@ pub(crate) fn replay_plan(
     plan: &ExecutionPlan,
     capacity_evidence: &[CapacityEvidence],
 ) -> Result<(ExecutionPlan, SimulationResult), PlanSimulationError> {
+    current.graph.validate_structure()?;
     let mut projection =
         Projection::from_current(current).with_capacity_evidence(capacity_evidence)?;
     let mut trusted_actions = Vec::with_capacity(plan.actions().len());

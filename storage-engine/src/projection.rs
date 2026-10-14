@@ -191,7 +191,7 @@ impl Projection {
         candidate.apply_graph_effects(&effect.graph)?;
         candidate.apply_mount_effects(&effect.mounts)?;
         candidate.apply_allocation_effects(&effect.allocations)?;
-        candidate.validate_edges()?;
+        candidate.graph.validate_structure()?;
         *self = candidate;
         Ok(invalidated_facts)
     }
@@ -571,15 +571,13 @@ impl Projection {
                     if self.graph.node(id).is_some() {
                         return Err(EffectApplicationError::DuplicateNode(*id));
                     }
-                    self.graph
-                        .insert_new(
-                            *id,
-                            Node {
-                                kind: spec.clone(),
-                                size: NodeFacts::default(),
-                            },
-                        )
-                        .map_err(|_| EffectApplicationError::DuplicateNode(*id))?;
+                    self.graph.insert_new(
+                        *id,
+                        Node {
+                            kind: spec.clone(),
+                            size: NodeFacts::default(),
+                        },
+                    )?;
                     self.projected_graph_nodes.push(*id);
                 }
                 GraphEffect::RemoveNode(node) => {
@@ -887,9 +885,7 @@ impl Projection {
         if !update(&mut node) {
             return Err(EffectApplicationError::WrongNodeKind { node: id, effect });
         }
-        self.graph
-            .replace_existing(id, node)
-            .map_err(|_| EffectApplicationError::MissingNode(id))?;
+        self.graph.replace_existing(id, node)?;
         if !self.projected_graph_nodes.contains(&id) {
             self.projected_graph_nodes.push(id);
         }
@@ -917,20 +913,6 @@ impl Projection {
         } else {
             CheckEvidence::ObservedSnapshot
         }
-    }
-    /// Rejects a candidate graph that would publish dangling edges.
-    fn validate_edges(&self) -> Result<(), EffectApplicationError> {
-        if self.graph.dependencies().any(|dependency| {
-            self.graph.node(&dependency.from).is_none() || self.graph.node(&dependency.to).is_none()
-        }) {
-            return Err(EffectApplicationError::DanglingDependency);
-        }
-        if self.graph.relations().any(|relation| {
-            self.graph.node(&relation.from).is_none() || self.graph.node(&relation.to).is_none()
-        }) {
-            return Err(EffectApplicationError::DanglingRelation);
-        }
-        Ok(())
     }
 }
 
@@ -1030,6 +1012,9 @@ pub enum ActionSimulationError {
 /// Failure to apply a predicted effect to an isolated projection.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EffectApplicationError {
+    /// The completed graph violates a shared representation invariant.
+    #[error(transparent)]
+    Structure(#[from] storage_core::model::GraphError),
     /// An inserted planned identity already exists.
     #[error("planned node {0:?} already exists")]
     DuplicateNode(NodeId),
@@ -1050,12 +1035,6 @@ pub enum EffectApplicationError {
     /// A requested relation removal did not match the graph.
     #[error("relation selected for removal is absent")]
     MissingRelation,
-    /// The completed effect would leave a dependency referencing an absent node.
-    #[error("predicted effect would leave a dangling dependency")]
-    DanglingDependency,
-    /// The completed effect would leave a relation referencing an absent node.
-    #[error("predicted effect would leave a dangling relation")]
-    DanglingRelation,
     /// A runtime mount effect targets an occupied namespace path.
     #[error("runtime mount target {0:?} is already occupied")]
     OccupiedMountTarget(PathBuf),
@@ -2229,5 +2208,50 @@ mod tests {
                 ..
             }]
         ));
+    }
+    /// Structural failures at batch completion cannot publish any earlier effect.
+    #[test]
+    fn structural_validation_is_atomic_and_allows_intermediate_dangling_edges() {
+        let (current, backing, filesystem) = current_with_observed_mapping();
+        let edge = storage_core::model::Dependency {
+            from: backing,
+            to: filesystem,
+            kind: DependencyKind::Backs,
+        };
+        let mut projection = Projection::from_current(&current);
+        let original = projection.clone();
+        let cycle = PredictedEffect {
+            graph: vec![
+                GraphEffect::SetNodeSize {
+                    node: backing,
+                    size: Bytes::new(42),
+                },
+                GraphEffect::InsertDependency(storage_core::model::Dependency {
+                    from: filesystem,
+                    to: backing,
+                    kind: DependencyKind::Backs,
+                }),
+            ],
+            mounts: Vec::new(),
+            allocations: Vec::new(),
+        };
+        assert_eq!(
+            projection.apply_effect(&cycle),
+            Err(EffectApplicationError::Structure(
+                storage_core::model::GraphError::DependencyCycle
+            ))
+        );
+        assert_eq!(projection, original);
+        let removal = PredictedEffect {
+            graph: vec![
+                GraphEffect::RemoveNode(filesystem),
+                GraphEffect::RemoveDependency(edge),
+            ],
+            mounts: Vec::new(),
+            allocations: Vec::new(),
+        };
+        assert!(projection.apply_effect(&removal).is_ok());
+        assert!(projection.graph().node(&filesystem).is_none());
+        assert_eq!(projection.graph().validate_structure(), Ok(()));
     }
 }

@@ -1,13 +1,13 @@
 //! Storage graph and relationship semantics.
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     num::NonZeroU64,
 };
 
 use serde::{Deserialize, Serialize};
 
-use super::{Bytes, Node, NodeId, ZfsMember};
+use super::{Bytes, Node, NodeId, NodeKind, ZfsMember};
 use thiserror::Error;
 
 /// Canonical collection of storage nodes and their relationships.
@@ -88,6 +88,133 @@ impl NodeGraph {
     pub fn relations(&self) -> impl ExactSizeIterator<Item = &Relation> {
         self.relations.iter()
     }
+
+    /// Visits dependency ancestors once; non-owning relations do not participate.
+    pub fn ancestors(&self, id: NodeId) -> HashSet<NodeId> {
+        let mut visited = HashSet::from([id]);
+        let mut pending = vec![id];
+        while let Some(node) = pending.pop() {
+            for edge in self.dependencies.iter().filter(|edge| edge.to == node) {
+                if visited.insert(edge.from) {
+                    pending.push(edge.from);
+                }
+            }
+        }
+        visited.remove(&id);
+        visited
+    }
+
+    /// Checks representation invariants without requiring healthy or complete storage.
+    /// Missing nodes must be explicit placeholders; overlapping extents remain representable.
+    /// Contains owners, MD data slots, Btrfs devids, and each cache role are unique per target.
+    /// Multiple backing providers and unknown member slots remain valid.
+    pub fn validate_structure(&self) -> Result<(), GraphError> {
+        for edge in &self.relations {
+            self.require_endpoints(edge.from, edge.to)?;
+        }
+        let mut owners = HashSet::new();
+        let mut logical_edges = HashSet::new();
+        let mut md_slots = HashSet::new();
+        let mut btrfs_ids = HashSet::new();
+        let mut cache_roles = HashSet::new();
+        for edge in &self.dependencies {
+            self.require_endpoints(edge.from, edge.to)?;
+            if edge.from == edge.to {
+                return Err(GraphError::SelfDependency(edge.from));
+            }
+            if !logical_edges.insert((
+                edge.from,
+                edge.to,
+                std::mem::discriminant(&edge.kind),
+                match &edge.kind {
+                    DependencyKind::Caches(role) => Some(role),
+                    _ => None,
+                },
+            )) {
+                return Err(GraphError::ConflictingRole(edge.to));
+            }
+            match &edge.kind {
+                DependencyKind::Contains { offset } => {
+                    if !owners.insert(edge.to) {
+                        return Err(GraphError::ConflictingOwner(edge.to));
+                    }
+                    if let Some(NodeKind::Partition {
+                        offset: partition_offset,
+                        ..
+                    }) = self.node(&edge.to).map(|node| &node.kind.kind)
+                        && offset != partition_offset
+                    {
+                        return Err(GraphError::PartitionOffset(edge.to));
+                    }
+                }
+                DependencyKind::MemberOf(MemberRole::Md(member)) => {
+                    if let Some(slot) = member.slot
+                        && member.role == MdMemberRole::Data
+                        && !md_slots.insert((edge.to, slot))
+                    {
+                        return Err(GraphError::ConflictingRole(edge.to));
+                    }
+                }
+                DependencyKind::MemberOf(MemberRole::Btrfs(member)) => {
+                    if let Some(devid) = member.devid
+                        && !btrfs_ids.insert((edge.to, devid))
+                    {
+                        return Err(GraphError::ConflictingRole(edge.to));
+                    }
+                }
+                DependencyKind::Caches(role) if !cache_roles.insert((edge.to, role)) => {
+                    return Err(GraphError::ConflictingRole(edge.to));
+                }
+                _ => {}
+            }
+        }
+        self.topological_order().map(|_| ())
+    }
+
+    /// Orders backing objects before consumers, rejecting dangling edges and cycles.
+    /// Relations can contain cycles and never constrain dependency ordering.
+    pub fn topological_order(&self) -> Result<Vec<NodeId>, GraphError> {
+        let mut indegrees: HashMap<_, usize> = self.nodes.keys().map(|id| (*id, 0)).collect();
+        let mut outgoing: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for edge in &self.dependencies {
+            self.require_endpoints(edge.from, edge.to)?;
+            if edge.from == edge.to {
+                return Err(GraphError::SelfDependency(edge.from));
+            }
+            *indegrees.entry(edge.to).or_default() += 1;
+            outgoing.entry(edge.from).or_default().push(edge.to);
+        }
+        let mut ready: VecDeque<_> = indegrees
+            .iter()
+            .filter_map(|(id, degree)| (*degree == 0).then_some(*id))
+            .collect();
+        let mut order = Vec::with_capacity(self.nodes.len());
+        while let Some(id) = ready.pop_front() {
+            order.push(id);
+            for to in outgoing.get(&id).into_iter().flatten() {
+                if let Some(degree) = indegrees.get_mut(to) {
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.push_back(*to);
+                    }
+                }
+            }
+        }
+        if order.len() != self.nodes.len() {
+            return Err(GraphError::DependencyCycle);
+        }
+        Ok(order)
+    }
+
+    /// Checks both endpoints before interpreting an edge's semantics.
+    fn require_endpoints(&self, from: NodeId, to: NodeId) -> Result<(), GraphError> {
+        for id in [from, to] {
+            if !self.nodes.contains_key(&id) {
+                return Err(GraphError::MissingNode(id));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Invalid graph representation or an invalid explicit node mutation.
@@ -99,6 +226,21 @@ pub enum GraphError {
     /// An edge or replacement references an absent identity.
     #[error("node {0:?} is absent")]
     MissingNode(NodeId),
+    /// A dependency references the same object twice.
+    #[error("node {0:?} depends on itself")]
+    SelfDependency(NodeId),
+    /// Backing dependencies cannot be ordered.
+    #[error("storage dependencies contain a cycle")]
+    DependencyCycle,
+    /// An object has multiple incompatible containing edges.
+    #[error("node {0:?} has conflicting containing edges")]
+    ConflictingOwner(NodeId),
+    /// Two edges assign incompatible or repeated semantic roles.
+    #[error("node {0:?} has conflicting dependency roles")]
+    ConflictingRole(NodeId),
+    /// Partition and containing edge disagree about the start position.
+    #[error("partition {0:?} disagrees with its containing offset")]
+    PartitionOffset(NodeId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -291,5 +433,209 @@ mod tests {
             Ok(disk_node())
         );
         assert_eq!(graph.node(&ids[0]), Some(&replacement));
+    }
+
+    /// Direct validation rejects malformed graph representations.
+    #[test]
+    fn invalid_structure_is_rejected() {
+        for case in 0..6 {
+            let (mut graph, ids) = graph_with_nodes(3);
+            graph.insert_dependency(Dependency {
+                from: ids[0],
+                to: ids[1],
+                kind: DependencyKind::Backs,
+            });
+            match case {
+                0 => {
+                    graph.remove_node(&ids[0]);
+                }
+                1 => {
+                    graph.insert_dependency(Dependency {
+                        from: ids[1],
+                        to: ids[1],
+                        kind: DependencyKind::Backs,
+                    });
+                }
+                2 => {
+                    graph.insert_dependency(Dependency {
+                        from: ids[1],
+                        to: ids[0],
+                        kind: DependencyKind::Provides,
+                    });
+                }
+                3 => {
+                    graph.insert_relation(Relation {
+                        from: ids[0],
+                        to: NodeId::new(),
+                        kind: RelationKind::Replicates,
+                    });
+                }
+                4 => {
+                    for from in [ids[0], ids[2]] {
+                        graph.insert_dependency(Dependency {
+                            from,
+                            to: ids[1],
+                            kind: DependencyKind::Contains {
+                                offset: Bytes::new(0),
+                            },
+                        });
+                    }
+                }
+                _ => {
+                    for offset in [0, 1] {
+                        graph.insert_dependency(Dependency {
+                            from: ids[0],
+                            to: ids[1],
+                            kind: DependencyKind::Contains {
+                                offset: Bytes::new(offset),
+                            },
+                        });
+                    }
+                }
+            }
+            assert!(graph.validate_structure().is_err(), "case {case}");
+        }
+    }
+
+    /// Typed membership and cache roles cannot be duplicated through different edge payloads.
+    #[test]
+    fn semantic_roles_are_checked_beyond_edge_equality() {
+        for case in 0..3 {
+            let (mut graph, ids) = graph_with_nodes(3);
+            for from in [ids[0], ids[1]] {
+                let kind = match case {
+                    0 => DependencyKind::MemberOf(MemberRole::Md(MdMember {
+                        role: MdMemberRole::Data,
+                        slot: Some(0),
+                        data_offset: None,
+                    })),
+                    1 => DependencyKind::MemberOf(MemberRole::Btrfs(BtrfsMember {
+                        devid: NonZeroU64::new(1),
+                    })),
+                    _ => DependencyKind::Caches(CacheRole::Metadata),
+                };
+                graph.insert_dependency(Dependency {
+                    from,
+                    to: ids[2],
+                    kind,
+                });
+            }
+            assert_eq!(
+                graph.validate_structure(),
+                Err(GraphError::ConflictingRole(ids[2]))
+            );
+        }
+    }
+
+    /// Overlapping observed partitions remain readable when their duplicated offsets agree.
+    #[test]
+    fn overlapping_partitions_are_allowed_but_mismatched_offsets_are_not() {
+        let (mut graph, ids) = graph_with_nodes(3);
+        for id in &ids[1..] {
+            let mut partition = disk_node();
+            partition.kind.kind = NodeKind::Partition {
+                number: std::num::NonZeroU32::new(1).unwrap_or_else(|| unreachable!()),
+                offset: Bytes::new(4096),
+                role: None,
+                attributes: super::super::PartitionAttributes::default(),
+            };
+            partition.kind.size = Some(Bytes::new(1024));
+            assert!(graph.replace_existing(*id, partition).is_ok());
+            graph.insert_dependency(Dependency {
+                from: ids[0],
+                to: *id,
+                kind: DependencyKind::Contains {
+                    offset: Bytes::new(4096),
+                },
+            });
+        }
+        assert_eq!(graph.validate_structure(), Ok(()));
+    }
+
+    /// Partial and unsupported observations, multiple providers, and relation cycles stay valid.
+    #[test]
+    fn partial_observations_and_relation_cycles_roundtrip() {
+        let (mut graph, ids) = graph_with_nodes(4);
+        let mut missing = disk_node();
+        missing.size.presence = super::super::Presence::Missing;
+        missing.kind.kind = NodeKind::Unknown("unsupported LVM segment".to_owned());
+        assert!(graph.replace_existing(ids[0], missing).is_ok());
+        for (from, to) in [(ids[0], ids[2]), (ids[1], ids[2]), (ids[2], ids[3])] {
+            graph.insert_dependency(Dependency {
+                from,
+                to,
+                kind: DependencyKind::Provides,
+            });
+        }
+        for (from, to) in [(ids[0], ids[1]), (ids[1], ids[0])] {
+            graph.insert_relation(Relation {
+                from,
+                to,
+                kind: RelationKind::Replicates,
+            });
+        }
+        assert_eq!(graph.validate_structure(), Ok(()));
+        let order = graph
+            .topological_order()
+            .unwrap_or_else(|error| panic!("DAG: {error}"));
+        for edge in graph.dependencies() {
+            assert!(
+                order.iter().position(|id| *id == edge.from)
+                    < order.iter().position(|id| *id == edge.to)
+            );
+        }
+        assert_eq!(
+            graph.ancestors(ids[3]),
+            HashSet::from([ids[0], ids[1], ids[2]])
+        );
+        assert!(graph.ancestors(ids[0]).is_empty());
+        let value =
+            serde_json::to_value(&graph).unwrap_or_else(|error| panic!("graph JSON: {error}"));
+        assert!(value["nodes"].is_object());
+        assert_eq!(serde_json::from_value::<NodeGraph>(value).ok(), Some(graph));
+    }
+
+    /// Traversal terminates even on an unpublished draft with a dependency cycle.
+    #[test]
+    fn ancestor_walk_excludes_itself_in_a_cycle() {
+        let (mut graph, ids) = graph_with_nodes(2);
+        for (from, to) in [(ids[0], ids[1]), (ids[1], ids[0])] {
+            graph.insert_dependency(Dependency {
+                from,
+                to,
+                kind: DependencyKind::Backs,
+            });
+        }
+        assert_eq!(graph.ancestors(ids[0]), HashSet::from([ids[1]]));
+        assert_eq!(graph.topological_order(), Err(GraphError::DependencyCycle));
+    }
+    /// A degraded array may retain missing members and unknown slots without inventing health.
+    #[test]
+    fn degraded_md_members_roundtrip() {
+        let (mut graph, ids) = graph_with_nodes(3);
+        let mut array = disk_node();
+        array.kind.kind = NodeKind::MdArray(crate::model::MdArray {
+            personality: crate::model::MdPersonality::Raid(crate::model::MdRaid::Raid1),
+            metadata: crate::model::MdMetadata::None,
+        });
+        assert!(graph.replace_existing(ids[2], array).is_ok());
+        let mut missing = disk_node();
+        missing.size.presence = crate::model::Presence::Missing;
+        assert!(graph.replace_existing(ids[1], missing).is_ok());
+        for from in [ids[0], ids[1]] {
+            graph.insert_dependency(Dependency {
+                from,
+                to: ids[2],
+                kind: DependencyKind::MemberOf(MemberRole::Md(MdMember {
+                    role: MdMemberRole::Data,
+                    slot: None,
+                    data_offset: None,
+                })),
+            });
+        }
+        assert_eq!(graph.validate_structure(), Ok(()));
+        let json =
+            serde_json::to_string(&graph).unwrap_or_else(|error| panic!("graph JSON: {error}"));
+        assert_eq!(serde_json::from_str::<NodeGraph>(&json).ok(), Some(graph));
     }
 }

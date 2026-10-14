@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage_core::model::{CurrentState, DesiredState, NodeGraph};
+use storage_core::model::{CurrentState, DesiredState};
 use storage_provider::{ACTION_SEMANTICS_VERSION, canonicalize_contract};
 use thiserror::Error;
 use uuid::Uuid;
@@ -246,11 +246,9 @@ impl PlanDocument {
     /// Validates indices and references before any array-indexing DAG algorithm runs.
     fn structural_plan(&self) -> Result<ExecutionPlan, PlanDocumentError> {
         for graph in [&self.baseline.snapshot.graph, &self.requested_goal.graph] {
-            if graph_has_missing_endpoint(graph) {
-                return Err(PlanDocumentError::Structure(
-                    "baseline or goal graph has a missing edge endpoint".to_owned(),
-                ));
-            }
+            graph
+                .validate_structure()
+                .map_err(|error| PlanDocumentError::Structure(error.to_string()))?;
         }
         let mut actions = self.actions.clone();
         actions.sort_by_key(|action| action.id);
@@ -300,15 +298,6 @@ fn canonical_snapshot(snapshot: &CurrentState) -> Result<Value, serde_json::Erro
     canonical_graph(&mut value["graph"]);
     sort_json_array(&mut value["mounts"]["entries"], false);
     Ok(value)
-}
-
-/// Rejects dangling historical or requested topology even when an empty plan has no effects.
-fn graph_has_missing_endpoint(graph: &NodeGraph) -> bool {
-    graph
-        .dependencies()
-        .map(|edge| (edge.from, edge.to))
-        .chain(graph.relations().map(|edge| (edge.from, edge.to)))
-        .any(|(from, to)| graph.node(&from).is_none() || graph.node(&to).is_none())
 }
 
 /// Sorts object members recursively while preserving all array sequencing by default.
@@ -803,5 +792,33 @@ pub(crate) mod tests {
             document.analyse_historical(),
             Err(PlanDocumentError::ProtectionViolation(_))
         ));
+    }
+    /// Storage cycles are rejected independently of the action DAG, including empty plans.
+    #[test]
+    fn rejects_storage_cycles_in_baseline_and_goal() {
+        for goal in [false, true] {
+            let mut document = document_fixture();
+            document.actions.clear();
+            document.dependencies.clear();
+            let graph = if goal {
+                &mut document.requested_goal.graph
+            } else {
+                &mut document.baseline.snapshot.graph
+            };
+            let edge = graph
+                .dependencies()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| panic!("fixture edge"));
+            graph.insert_dependency(Dependency {
+                from: edge.to,
+                to: edge.from,
+                kind: DependencyKind::Backs,
+            });
+            assert!(matches!(
+                document.analyse_historical(),
+                Err(PlanDocumentError::Structure(_))
+            ));
+        }
     }
 }
