@@ -1931,18 +1931,20 @@ mod tests {
     fn automatic_luks_resize_contract_preserves_size_invalidation() {
         let mapping = NodeId::new();
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            mapping,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::DmCryptMapping {
-                        name: "data".to_owned(),
+        graph
+            .insert_new(
+                mapping,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::DmCryptMapping {
+                            name: "data".to_owned(),
+                        },
+                        size: Some(Bytes::new(100)),
                     },
-                    size: Some(Bytes::new(100)),
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let operation = ProviderAction::Luks(LuksAction::Resize {
             mapping,
             new_size: None,
@@ -2002,19 +2004,21 @@ mod tests {
     fn filesystem_shrink_contract_preserves_preparation_requirements() {
         let filesystem = NodeId::new();
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            filesystem,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Filesystem {
-                        kind: FilesystemKind::Ext4,
-                        label: None,
+        graph
+            .insert_new(
+                filesystem,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Filesystem {
+                            kind: FilesystemKind::Ext4,
+                            label: None,
+                        },
+                        size: Some(Bytes::new(100)),
                     },
-                    size: Some(Bytes::new(100)),
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let context = ActionDescriptionContext { graph: &graph };
         let shrink = ProviderAction::Filesystem(FilesystemAction::Resize {
             filesystem,
@@ -2066,22 +2070,24 @@ mod tests {
     fn block_graph() -> (NodeGraph, NodeId) {
         let backing = NodeId::new();
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            backing,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: Some(Bytes::new(1_000_000)),
+        graph
+            .insert_new(
+                backing,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(1_000_000)),
+                    },
+                    size: NodeFacts {
+                        observed_in: None,
+                        presence: Presence::Present,
+                        identities: Vec::new(),
+                        block: None,
+                        device: None,
+                    },
                 },
-                size: NodeFacts {
-                    observed_in: None,
-                    presence: Presence::Present,
-                    identities: Vec::new(),
-                    block: None,
-                    device: None,
-                },
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         (graph, backing)
     }
 
@@ -2174,18 +2180,20 @@ mod tests {
         let container = NodeId::new();
         let mapping = NodeId::new();
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            container,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LuksContainer {
-                        version: LuksVersion::Luks2,
+        graph
+            .insert_new(
+                container,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LuksContainer {
+                            version: LuksVersion::Luks2,
+                        },
+                        size: Some(Bytes::new(1_000_000)),
                     },
-                    size: Some(Bytes::new(1_000_000)),
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let action = ProviderAction::Luks(LuksAction::Open {
             container,
             planned_node_id: mapping,
@@ -2211,19 +2219,21 @@ mod tests {
     fn lvm_activation_contract_reports_writable_interface() {
         let lv = NodeId::new();
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            lv,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmLv(LvmLv {
-                        name: "data".to_owned(),
-                        kind: LvmLvKind::Linear,
-                    }),
-                    size: Some(Bytes::new(1_000_000)),
+        graph
+            .insert_new(
+                lv,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmLv(LvmLv {
+                            name: "data".to_owned(),
+                            kind: LvmLvKind::Linear,
+                        }),
+                        size: Some(Bytes::new(1_000_000)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let action = ProviderAction::Lvm(LvmAction::SetActivation {
             target: lv,
             active: true,
@@ -2248,19 +2258,21 @@ mod tests {
         let lv = NodeId::new();
         let size = Bytes::new(60);
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            vg,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmVg {
-                        name: "vg0".to_owned(),
-                        extent_size: Some(Bytes::new(4)),
+        graph
+            .insert_new(
+                vg,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmVg {
+                            name: "vg0".to_owned(),
+                            extent_size: Some(Bytes::new(4)),
+                        },
+                        size: None,
                     },
-                    size: None,
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let action = ProviderAction::Lvm(LvmAction::CreateLv {
             vg,
             planned_node_id: lv,
@@ -2298,32 +2310,36 @@ mod tests {
         let vg = NodeId::new();
         let lv = NodeId::new();
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            vg,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmVg {
-                        name: "vg0".to_owned(),
-                        extent_size: Some(Bytes::new(4)),
+        graph
+            .insert_new(
+                vg,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmVg {
+                            name: "vg0".to_owned(),
+                            extent_size: Some(Bytes::new(4)),
+                        },
+                        size: None,
                     },
-                    size: None,
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
-        graph.insert_node(
-            lv,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmLv(LvmLv {
-                        name: "data".to_owned(),
-                        kind: LvmLvKind::Linear,
-                    }),
-                    size: Some(Bytes::new(60)),
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        graph
+            .insert_new(
+                lv,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmLv(LvmLv {
+                            name: "data".to_owned(),
+                            kind: LvmLvKind::Linear,
+                        }),
+                        size: Some(Bytes::new(60)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         graph.insert_dependency(Dependency {
             from: vg,
             to: lv,
@@ -2393,7 +2409,9 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| panic!("LV is absent"));
         node.kind.size = None;
-        graph.insert_node(lv, node);
+        graph
+            .replace_existing(lv, node)
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let contract = describe_action(
             &ProviderAction::Lvm(LvmAction::RemoveLv { lv }),
             ActionDescriptionContext { graph: &graph },
@@ -2428,13 +2446,15 @@ mod tests {
                 },
             ),
         ] {
-            graph.insert_node(
-                id,
-                storage_core::model::Node {
-                    kind: NodeSpec { kind, size: None },
-                    size: storage_core::model::NodeFacts::default(),
-                },
-            );
+            graph
+                .insert_new(
+                    id,
+                    storage_core::model::Node {
+                        kind: NodeSpec { kind, size: None },
+                        size: storage_core::model::NodeFacts::default(),
+                    },
+                )
+                .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         }
         for from in [first, second] {
             graph.insert_dependency(Dependency {

@@ -132,7 +132,12 @@ fn merge_provider_state(
             }),
             Some(_) => {}
             None => {
-                state.graph.insert_node(*id, node.clone());
+                state
+                    .graph
+                    .insert_new(*id, node.clone())
+                    .unwrap_or_else(|error| {
+                        unreachable!("node absence checked under exclusive access: {error}")
+                    });
                 owners.insert(*id, provider_id.to_owned());
             }
         }
@@ -244,19 +249,21 @@ mod tests {
     /// Creates one canonical disk contribution.
     fn disk_state(id: NodeId) -> ProviderState {
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: None,
+        graph
+            .insert_new(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: None,
+                    },
+                    size: NodeFacts {
+                        presence: Presence::Present,
+                        ..NodeFacts::default()
+                    },
                 },
-                size: NodeFacts {
-                    presence: Presence::Present,
-                    ..NodeFacts::default()
-                },
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         ProviderState {
             graph,
             ..ProviderState::default()
@@ -333,16 +340,19 @@ mod tests {
             result: Ok(disk_state(id)),
         };
         let mut conflicting = disk_state(id);
-        conflicting.graph.insert_node(
-            id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Zram,
-                    size: None,
+        conflicting
+            .graph
+            .replace_existing(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Zram,
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let second = FakeProvider {
             id: "zram",
             responsibility: "zram.devices",

@@ -395,19 +395,21 @@ mod tests {
     fn graph_with(kind: NodeKind) -> (NodeGraph, NodeId) {
         let id = NodeId::new();
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            id,
-            Node {
-                kind: NodeSpec { kind, size: None },
-                size: NodeFacts {
-                    observed_in: None,
-                    presence: Presence::Present,
-                    identities: Vec::new(),
-                    block: None,
-                    device: None,
+        graph
+            .insert_new(
+                id,
+                Node {
+                    kind: NodeSpec { kind, size: None },
+                    size: NodeFacts {
+                        observed_in: None,
+                        presence: Presence::Present,
+                        identities: Vec::new(),
+                        block: None,
+                        device: None,
+                    },
                 },
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         (graph, id)
     }
 

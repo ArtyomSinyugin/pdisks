@@ -1039,16 +1039,19 @@ mod tests {
     fn validates_luks_resize_against_the_intermediate_graph() {
         let (mut current, _) = current_with_vg();
         let disk = NodeId::new();
-        current.graph.insert_node(
-            disk,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: Some(Bytes::new(1024)),
+        current
+            .graph
+            .insert_new(
+                disk,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(1024)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let baseline = current.clone();
         let container = NodeId::new();
         let mapping = NodeId::new();
@@ -1407,19 +1410,21 @@ mod tests {
     fn current_with_vg() -> (CurrentState, NodeId) {
         let vg = NodeId::new();
         let mut graph = storage_core::model::NodeGraph::new();
-        graph.insert_node(
-            vg,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmVg {
-                        name: "vg0".to_owned(),
-                        extent_size: Some(Bytes::new(1)),
+        graph
+            .insert_new(
+                vg,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmVg {
+                            name: "vg0".to_owned(),
+                            extent_size: Some(Bytes::new(1)),
+                        },
+                        size: None,
                     },
-                    size: None,
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         (
             CurrentState {
                 graph,
@@ -1447,32 +1452,38 @@ mod tests {
         let (mut current, vg) = current_with_vg();
         let lv = NodeId::new();
         let filesystem = NodeId::new();
-        current.graph.insert_node(
-            lv,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmLv(LvmLv {
-                        name: "data".to_owned(),
-                        kind: LvmLvKind::Linear,
-                    }),
-                    size: Some(Bytes::new(100)),
-                },
-                size: NodeFacts::default(),
-            },
-        );
-        current.graph.insert_node(
-            filesystem,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Filesystem {
-                        kind: FilesystemKind::Ext4,
-                        label: Some("data".to_owned()),
+        current
+            .graph
+            .insert_new(
+                lv,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmLv(LvmLv {
+                            name: "data".to_owned(),
+                            kind: LvmLvKind::Linear,
+                        }),
+                        size: Some(Bytes::new(100)),
                     },
-                    size: Some(Bytes::new(100)),
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        current
+            .graph
+            .insert_new(
+                filesystem,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Filesystem {
+                            kind: FilesystemKind::Ext4,
+                            label: Some("data".to_owned()),
+                        },
+                        size: Some(Bytes::new(100)),
+                    },
+                    size: NodeFacts::default(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         current.graph.insert_dependency(Dependency {
             from: vg,
             to: lv,
@@ -2060,19 +2071,22 @@ mod tests {
     fn current_with_linear_lv() -> (CurrentState, NodeId, NodeId) {
         let (mut current, vg) = current_with_vg();
         let lv = NodeId::new();
-        current.graph.insert_node(
-            lv,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmLv(LvmLv {
-                        name: "old".to_owned(),
-                        kind: LvmLvKind::Linear,
-                    }),
-                    size: Some(Bytes::new(100)),
+        current
+            .graph
+            .insert_new(
+                lv,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmLv(LvmLv {
+                            name: "old".to_owned(),
+                            kind: LvmLvKind::Linear,
+                        }),
+                        size: Some(Bytes::new(100)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         current.graph.insert_dependency(Dependency {
             from: vg,
             to: lv,
@@ -2288,32 +2302,38 @@ mod tests {
             ),
         ] {
             let mut baseline = current.clone();
-            baseline.graph.insert_node(
-                lv,
-                Node {
-                    kind: NodeSpec {
-                        kind: NodeKind::LvmLv(LvmLv {
-                            name: "old".to_owned(),
-                            kind: layout.clone(),
-                        }),
-                        size,
-                    },
-                    size: NodeFacts::default(),
-                },
-            );
-            baseline.graph.insert_node(
-                vg,
-                Node {
-                    kind: NodeSpec {
-                        kind: NodeKind::LvmVg {
-                            name: "vg0".to_owned(),
-                            extent_size: extent,
+            baseline
+                .graph
+                .replace_existing(
+                    lv,
+                    Node {
+                        kind: NodeSpec {
+                            kind: NodeKind::LvmLv(LvmLv {
+                                name: "old".to_owned(),
+                                kind: layout.clone(),
+                            }),
+                            size,
                         },
-                        size: None,
+                        size: NodeFacts::default(),
                     },
-                    size: NodeFacts::default(),
-                },
-            );
+                )
+                .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+            baseline
+                .graph
+                .replace_existing(
+                    vg,
+                    Node {
+                        kind: NodeSpec {
+                            kind: NodeKind::LvmVg {
+                                name: "vg0".to_owned(),
+                                extent_size: extent,
+                            },
+                            size: None,
+                        },
+                        size: NodeFacts::default(),
+                    },
+                )
+                .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
             let domain = AllocationDomain::LvmVolumeGroup(vg);
             let mut operations = vec![
                 LvmAction::ResizeLv {
@@ -2373,7 +2393,10 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| panic!("LV is absent"));
         node.kind.size = Some(Bytes::new(u64::MAX));
-        current.graph.insert_node(lv, node);
+        current
+            .graph
+            .replace_existing(lv, node)
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let mut projection = Projection::from_current(&current)
             .with_capacity_evidence(&[CapacityEvidence {
                 domain: AllocationDomain::LvmVolumeGroup(vg),
@@ -2473,34 +2496,40 @@ mod tests {
         let (mut current, _) = current_with_vg();
         let table = NodeId::new();
         let partition = NodeId::new();
-        current.graph.insert_node(
-            table,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::PartitionTable(storage_core::model::PartitionTable::Gpt),
-                    size: Some(Bytes::new(1024)),
+        current
+            .graph
+            .insert_new(
+                table,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::PartitionTable(storage_core::model::PartitionTable::Gpt),
+                        size: Some(Bytes::new(1024)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let attributes = storage_core::model::PartitionAttributes::default();
         let number = std::num::NonZeroU32::new(1)
             .unwrap_or_else(|| panic!("partition number must be nonzero"));
-        current.graph.insert_node(
-            partition,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Partition {
-                        number,
-                        offset: Bytes::new(0),
-                        role: None,
-                        attributes,
+        current
+            .graph
+            .insert_new(
+                partition,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Partition {
+                            number,
+                            offset: Bytes::new(0),
+                            role: None,
+                            attributes,
+                        },
+                        size: Some(Bytes::new(100)),
                     },
-                    size: Some(Bytes::new(100)),
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         current.graph.insert_dependency(Dependency {
             from: table,
             to: partition,
@@ -2553,14 +2582,17 @@ mod tests {
             ));
             let mut independent_current = current.clone();
             let other_table = NodeId::new();
-            independent_current.graph.insert_node(
-                other_table,
-                current
-                    .graph
-                    .node(&table)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("existing partition table is absent")),
-            );
+            independent_current
+                .graph
+                .insert_new(
+                    other_table,
+                    current
+                        .graph
+                        .node(&table)
+                        .cloned()
+                        .unwrap_or_else(|| panic!("existing partition table is absent")),
+                )
+                .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
             let mut independent_fragment = fragment.clone();
             if let ProviderAction::Partition(PartitionAction::Create { table, .. }) =
                 &mut independent_fragment.actions[1].operation
@@ -2672,16 +2704,18 @@ mod tests {
     fn rejects_plan_that_does_not_reach_requested_graph() {
         let (current, _vg) = current_with_vg();
         let mut goal_graph = current.graph.clone();
-        goal_graph.insert_node(
-            NodeId::new(),
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: Some(Bytes::new(1)),
+        goal_graph
+            .insert_new(
+                NodeId::new(),
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(1)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let goal = DesiredState {
             graph: goal_graph,
             mounts: MountSpec::default(),
@@ -2812,7 +2846,10 @@ mod tests {
             geometry: None,
             read_only: Some(true),
         });
-        current.graph.insert_node(lv, node);
+        current
+            .graph
+            .replace_existing(lv, node)
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let baseline = current.clone();
         let fragment = PlanFragment {
             actions: vec![
@@ -2869,7 +2906,10 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| panic!("LV fixture"));
         node.kind.size = None;
-        current.graph.insert_node(lv, node);
+        current
+            .graph
+            .replace_existing(lv, node)
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let condition = ActionPrerequisite::BackingSizeAtLeast {
             node: filesystem,
             size: Bytes::new(200),
@@ -2904,7 +2944,9 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| panic!("FS fixture"));
         node.kind.size = Some(Bytes::new(200));
-        goal.graph.insert_node(filesystem, node);
+        goal.graph
+            .replace_existing(filesystem, node)
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let report = crate::simulate_plan_for_goal(&current, &plan, &goal)
             .unwrap_or_else(|error| panic!("report unknown geometry: {error}"));
         assert!(report.unresolved_obligations.iter().any(|obligation| matches!(obligation,
@@ -3070,16 +3112,19 @@ mod tests {
                 100,
             ),
         ] {
-            current.graph.insert_node(
-                id,
-                Node {
-                    kind: NodeSpec {
-                        kind,
-                        size: Some(Bytes::new(size)),
+            current
+                .graph
+                .insert_new(
+                    id,
+                    Node {
+                        kind: NodeSpec {
+                            kind,
+                            size: Some(Bytes::new(size)),
+                        },
+                        size: NodeFacts::default(),
                     },
-                    size: NodeFacts::default(),
-                },
-            );
+                )
+                .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         }
         current.graph.insert_dependency(Dependency {
             from: disk,

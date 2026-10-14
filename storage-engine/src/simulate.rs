@@ -659,103 +659,119 @@ mod tests {
         use storage_core::model::{Bytes, Node, NodeFacts, NodeId, NodeKind, NodeSpec};
         let id = NodeId::new();
         let mut projected = NodeGraph::new();
-        projected.insert_node(
-            id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: None,
+        projected
+            .insert_new(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let mut requested = projected.clone();
         assert_eq!(compare_graph(&projected, &requested), GoalStatus::Satisfied);
-        requested.insert_node(
-            id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: Some(Bytes::new(100)),
+        requested
+            .replace_existing(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(100)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         assert!(matches!(
             compare_graph(&projected, &requested),
             GoalStatus::Unknown { .. }
         ));
-        projected.insert_node(
-            id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: Some(Bytes::new(90)),
+        projected
+            .replace_existing(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(90)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         assert!(matches!(
             compare_graph(&projected, &requested),
             GoalStatus::Violated { .. }
         ));
-        requested.insert_node(
-            id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: None,
+        requested
+            .replace_existing(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         assert_eq!(compare_graph(&projected, &requested), GoalStatus::Satisfied);
-        requested.insert_node(
-            id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Loop { backing_file: None },
-                    size: None,
+        requested
+            .replace_existing(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Loop { backing_file: None },
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         assert!(matches!(
             compare_graph(&projected, &requested),
             GoalStatus::Violated { .. }
         ));
         // An unknown node does not hide a different node with a known wrong size.
         let unknown = NodeId::new();
-        projected.insert_node(
-            unknown,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: None,
+        projected
+            .insert_new(
+                unknown,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
-        requested.insert_node(
-            unknown,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: Some(Bytes::new(100)),
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        requested
+            .insert_new(
+                unknown,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(100)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
-        requested.insert_node(
-            id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Disk,
-                    size: Some(Bytes::new(100)),
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        requested
+            .replace_existing(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(100)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         assert!(matches!(
             compare_graph(&projected, &requested),
             GoalStatus::Violated { .. }

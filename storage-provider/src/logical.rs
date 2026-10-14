@@ -351,32 +351,36 @@ mod tests {
         let vg = NodeId::new();
         let lv = NodeId::new();
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            vg,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmVg {
-                        name: "vg0".to_owned(),
-                        extent_size: Some(Bytes::new(4)),
+        graph
+            .insert_new(
+                vg,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmVg {
+                            name: "vg0".to_owned(),
+                            extent_size: Some(Bytes::new(4)),
+                        },
+                        size: None,
                     },
-                    size: None,
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
-        graph.insert_node(
-            lv,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmLv(storage_core::model::LvmLv {
-                        name: "data".to_owned(),
-                        kind: storage_core::model::LvmLvKind::Linear,
-                    }),
-                    size: Some(Bytes::new(60)),
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        graph
+            .insert_new(
+                lv,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmLv(storage_core::model::LvmLv {
+                            name: "data".to_owned(),
+                            kind: storage_core::model::LvmLvKind::Linear,
+                        }),
+                        size: Some(Bytes::new(60)),
+                    },
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let ownership = Dependency {
             from: vg,
             to: lv,
@@ -412,19 +416,21 @@ mod tests {
             }
         }
         let mut invalid_extent = graph.clone();
-        invalid_extent.insert_node(
-            vg,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmVg {
-                        name: "vg0".to_owned(),
-                        extent_size: Some(Bytes::new(0)),
+        invalid_extent
+            .replace_existing(
+                vg,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmVg {
+                            name: "vg0".to_owned(),
+                            extent_size: Some(Bytes::new(0)),
+                        },
+                        size: None,
                     },
-                    size: None,
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let diagnostics = validate_provider_action(
             &ProviderAction::Lvm(LvmAction::ResizeLv {
                 lv,
@@ -436,13 +442,15 @@ mod tests {
             matches!(diagnostics.as_slice(), [diagnostic] if diagnostic.code == "lvm.action.invalid_extent_size")
         );
         let other_vg = NodeId::new();
-        graph.insert_node(
-            other_vg,
-            graph
-                .node(&vg)
-                .cloned()
-                .unwrap_or_else(|| panic!("VG is absent")),
-        );
+        graph
+            .insert_new(
+                other_vg,
+                graph
+                    .node(&vg)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("VG is absent")),
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         for owner_count in [0, 1, 2] {
             graph.remove_dependency(&ownership);
             let competing = Dependency {
@@ -486,20 +494,22 @@ mod tests {
             for valid_kind in [false, true] {
                 let mut graph = NodeGraph::new();
                 for table in [first, second].into_iter().take(owner_count) {
-                    graph.insert_node(
-                        table,
-                        Node {
-                            kind: NodeSpec {
-                                kind: if valid_kind {
-                                    NodeKind::PartitionTable(PartitionTable::Gpt)
-                                } else {
-                                    NodeKind::Disk
+                    graph
+                        .insert_new(
+                            table,
+                            Node {
+                                kind: NodeSpec {
+                                    kind: if valid_kind {
+                                        NodeKind::PartitionTable(PartitionTable::Gpt)
+                                    } else {
+                                        NodeKind::Disk
+                                    },
+                                    size: None,
                                 },
-                                size: None,
+                                size: NodeFacts::default(),
                             },
-                            size: NodeFacts::default(),
-                        },
-                    );
+                        )
+                        .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
                     graph.insert_dependency(Dependency {
                         from: table,
                         to: partition,

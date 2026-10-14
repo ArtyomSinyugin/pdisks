@@ -385,13 +385,15 @@ pub(crate) mod tests {
                 },
             ),
         ] {
-            graph.insert_node(
-                id,
-                Node {
-                    kind: NodeSpec { kind, size: None },
-                    size: NodeFacts::default(),
-                },
-            );
+            graph
+                .insert_new(
+                    id,
+                    Node {
+                        kind: NodeSpec { kind, size: None },
+                        size: NodeFacts::default(),
+                    },
+                )
+                .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         }
         graph.insert_dependency(Dependency {
             from: disk,
@@ -423,32 +425,36 @@ pub(crate) mod tests {
             diagnostics: Vec::new(),
         };
         let mut goal_graph = current.graph.clone();
-        goal_graph.insert_node(
-            lv,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmLv(LvmLv {
-                        name: "data".to_owned(),
-                        kind: LvmLvKind::Linear,
-                    }),
-                    size: Some(Bytes::new(32)),
-                },
-                size: NodeFacts::default(),
-            },
-        );
-        goal_graph.insert_node(
-            filesystem,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Filesystem {
-                        kind: FilesystemKind::Ext4,
-                        label: Some("data".to_owned()),
+        goal_graph
+            .insert_new(
+                lv,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmLv(LvmLv {
+                            name: "data".to_owned(),
+                            kind: LvmLvKind::Linear,
+                        }),
+                        size: Some(Bytes::new(32)),
                     },
-                    size: None,
+                    size: NodeFacts::default(),
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        goal_graph
+            .insert_new(
+                filesystem,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Filesystem {
+                            kind: FilesystemKind::Ext4,
+                            label: Some("data".to_owned()),
+                        },
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         goal_graph.insert_dependency(Dependency {
             from: vg,
             to: lv,

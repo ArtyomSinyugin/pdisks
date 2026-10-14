@@ -606,7 +606,8 @@ fn assemble_native_block_state(
             continue;
         };
         let table_id = stable_node_id("partition-table-path", &table.device.to_string_lossy());
-        graph.insert_node(
+        upsert_observation(
+            &mut graph,
             table_id,
             Node {
                 kind: NodeSpec {
@@ -641,7 +642,8 @@ fn assemble_native_block_state(
             {
                 facts.identities.push(ExternalId::GptPartitionUuid(uuid));
             }
-            graph.insert_node(
+            upsert_observation(
+                &mut graph,
                 id,
                 Node {
                     kind: NodeSpec {
@@ -743,7 +745,7 @@ fn enrich_luks(state: &mut ProviderState, entries: &[storage_provider::LuksObser
         if let Some(identity) = &entry.identity {
             node.size.identities.push(identity.clone());
         }
-        state.graph.insert_node(id, node);
+        upsert_observation(&mut state.graph, id, node);
     }
 }
 
@@ -790,7 +792,7 @@ fn enrich_devmapper(
             }
             block.read_only = Some(entry.read_only);
         }
-        graph.insert_node(id, node);
+        upsert_observation(graph, id, node);
 
         for dependency in &entry.dependencies {
             let Some(source_path) = paths.get(&(dependency.major, dependency.minor)) else {
@@ -833,7 +835,7 @@ fn enrich_loop(graph: &mut NodeGraph, entries: &[storage_provider::LoopEntry]) {
         if let Some(block) = &mut node.size.block {
             block.read_only = Some(entry.read_only);
         }
-        graph.insert_node(id, node);
+        upsert_observation(graph, id, node);
     }
 }
 
@@ -915,7 +917,7 @@ fn enrich_mdraid(
                 node.size.identities.push(identity);
             }
         }
-        graph.insert_node(id, node);
+        upsert_observation(graph, id, node);
         if array.failed_devices > 0 || array.active_devices < array.raid_devices {
             diagnostics.push(Diagnostic {
                 code: "mdraid.array_degraded".to_owned(),
@@ -1037,7 +1039,8 @@ fn enrich_lvm(
 
     for vg in &topology.vgs {
         let id = stable_node_id("lvm-vg", &vg.uuid);
-        graph.insert_node(
+        upsert_observation(
+            graph,
             id,
             Node {
                 kind: NodeSpec {
@@ -1078,7 +1081,7 @@ fn enrich_lvm(
         } else {
             Presence::Present
         };
-        graph.insert_node(id, node);
+        upsert_observation(graph, id, node);
         if pv.missing {
             diagnostics.push(Diagnostic {
                 code: "lvm.pv_missing".to_owned(),
@@ -1130,7 +1133,8 @@ fn enrich_lvm(
         if !facts.identities.contains(&identity) {
             facts.identities.push(identity);
         }
-        graph.insert_node(
+        upsert_observation(
+            graph,
             id,
             Node {
                 kind: NodeSpec {
@@ -1275,7 +1279,7 @@ fn enrich_btrfs_filesystems(
             {
                 node.size.identities.push(ExternalId::BtrfsFsid(uuid));
             }
-            graph.insert_node(filesystem_id, node);
+            upsert_observation(graph, filesystem_id, node);
         }
 
         for member in &filesystem.devices {
@@ -1323,7 +1327,8 @@ fn enrich_btrfs(
                 "btrfs-subvolume",
                 &format!("{}:{}", filesystem_id.as_uuid(), subvolume.id),
             );
-            graph.insert_node(
+            upsert_observation(
+                graph,
                 id,
                 Node {
                     kind: NodeSpec {
@@ -1366,7 +1371,8 @@ fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) -> V
         })
         .collect::<HashMap<_, _>>();
     for (name, (id, pool)) in &pools {
-        graph.insert_node(
+        upsert_observation(
+            graph,
             *id,
             Node {
                 kind: NodeSpec {
@@ -1410,7 +1416,8 @@ fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) -> V
                 },
                 |guid| stable_node_id("zfs-vdev", &guid.to_string()),
             );
-            graph.insert_node(
+            upsert_observation(
+                graph,
                 vdev_id,
                 Node {
                     kind: NodeSpec {
@@ -1500,7 +1507,8 @@ fn enrich_zfs(graph: &mut NodeGraph, topology: &storage_provider::ZfsEntry) -> V
                 name: dataset.name.clone(),
             },
         };
-        graph.insert_node(
+        upsert_observation(
+            graph,
             id,
             Node {
                 kind: NodeSpec {
@@ -1586,7 +1594,8 @@ const fn zfs_vdev_class(class: storage_provider::ZfsVdevClass) -> ZfsVdevClass {
 fn enrich_nvme(graph: &mut NodeGraph, topology: &storage_provider::NvmeEntry) {
     for subsystem in &topology.subsystems {
         let subsystem_id = stable_node_id("nvme-subsystem", &subsystem.nqn);
-        graph.insert_node(
+        upsert_observation(
+            graph,
             subsystem_id,
             Node {
                 kind: NodeSpec {
@@ -1614,7 +1623,8 @@ fn enrich_nvme(graph: &mut NodeGraph, topology: &storage_provider::NvmeEntry) {
             });
         for controller in &subsystem.controllers {
             let controller_id = stable_node_id("nvme-controller", &controller.name);
-            graph.insert_node(
+            upsert_observation(
+                graph,
                 controller_id,
                 Node {
                     kind: NodeSpec {
@@ -1693,7 +1703,7 @@ fn enrich_nvme(graph: &mut NodeGraph, topology: &storage_provider::NvmeEntry) {
                     node.size.identities.push(identity);
                 }
             }
-            graph.insert_node(id, node);
+            upsert_observation(graph, id, node);
             graph.insert_dependency(Dependency {
                 from: subsystem_id,
                 to: id,
@@ -1745,7 +1755,8 @@ fn devmapper_kind(entry: &storage_provider::DevmapperEntry) -> NodeKind {
 
 /// Inserts one endpoint and its udev-backed runtime facts.
 fn insert_native_endpoint(graph: &mut NodeGraph, endpoint: &UdevBlockEntry, kind: NodeKind) {
-    graph.insert_node(
+    upsert_observation(
+        graph,
         block_node_id(&endpoint.devnode),
         Node {
             kind: NodeSpec {
@@ -1870,7 +1881,8 @@ fn add_native_content(
             value: uuid.clone(),
         }]
     });
-    graph.insert_node(
+    upsert_observation(
+        graph,
         id,
         Node {
             kind: NodeSpec {
@@ -2032,7 +2044,8 @@ fn add_block_device(
         },
         other => NodeKind::Unknown(format!("lsblk:{other}")),
     };
-    graph.insert_node(
+    upsert_observation(
+        graph,
         node_id,
         Node {
             kind: NodeSpec {
@@ -2063,7 +2076,8 @@ fn add_block_device(
             Some("dos" | "mbr") => PartitionTable::Mbr,
             _ => PartitionTable::Gpt,
         };
-        graph.insert_node(
+        upsert_observation(
+            graph,
             table_id,
             Node {
                 kind: NodeSpec {
@@ -2137,7 +2151,8 @@ fn add_content(
             }]
         })
         .unwrap_or_default();
-    graph.insert_node(
+    upsert_observation(
+        graph,
         content_id,
         Node {
             kind: NodeSpec {
@@ -2453,6 +2468,19 @@ mod linux_fixtures {
     }
 }
 
+/// Creates or enriches one native observation; configuration editing cannot use this helper.
+fn upsert_observation(graph: &mut NodeGraph, id: NodeId, node: Node) {
+    // Exclusive access keeps the identity present or absent between lookup and mutation.
+    let result = if graph.node(&id).is_some() {
+        graph.replace_existing(id, node).map(|_| ())
+    } else {
+        graph.insert_new(id, node)
+    };
+    result.unwrap_or_else(|error| {
+        unreachable!("observation identity changed under exclusive access: {error}")
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2472,43 +2500,47 @@ mod tests {
         let block_id = block_node_id(Path::new("/dev/dm-0"));
         let content_id = content_node_id("/dev/dm-0");
         let mut graph = NodeGraph::new();
-        graph.insert_node(
-            block_id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Unknown("device-mapper endpoint".to_owned()),
-                    size: None,
-                },
-                size: NodeFacts {
-                    block: Some(BlockFacts {
-                        paths: vec![
-                            PathBuf::from("/dev/dm-0"),
-                            PathBuf::from("/dev/mapper/vg-root"),
-                        ],
-                        devno: DeviceNumber {
-                            major: 253,
-                            minor: 0,
-                        },
-                        geometry: None,
-                        read_only: None,
-                    }),
-                    ..NodeFacts::default()
-                },
-            },
-        );
-        graph.insert_node(
-            content_id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Filesystem {
-                        kind: FilesystemKind::Ext4,
-                        label: None,
+        graph
+            .insert_new(
+                block_id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Unknown("device-mapper endpoint".to_owned()),
+                        size: None,
                     },
-                    size: None,
+                    size: NodeFacts {
+                        block: Some(BlockFacts {
+                            paths: vec![
+                                PathBuf::from("/dev/dm-0"),
+                                PathBuf::from("/dev/mapper/vg-root"),
+                            ],
+                            devno: DeviceNumber {
+                                major: 253,
+                                minor: 0,
+                            },
+                            geometry: None,
+                            read_only: None,
+                        }),
+                        ..NodeFacts::default()
+                    },
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        graph
+            .insert_new(
+                content_id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Filesystem {
+                            kind: FilesystemKind::Ext4,
+                            label: None,
+                        },
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         graph.insert_dependency(Dependency {
             from: block_id,
             to: content_id,
@@ -2718,19 +2750,21 @@ mod tests {
             &mapper_endpoint,
             NodeKind::Unknown("device-mapper:linear".to_owned()),
         );
-        graph.insert_node(
-            content_node_id("/dev/vda1"),
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::LvmPv,
-                    size: Some(Bytes::new(512_000)),
+        graph
+            .insert_new(
+                content_node_id("/dev/vda1"),
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::LvmPv,
+                        size: Some(Bytes::new(512_000)),
+                    },
+                    size: NodeFacts {
+                        presence: Presence::Present,
+                        ..NodeFacts::default()
+                    },
                 },
-                size: NodeFacts {
-                    presence: Presence::Present,
-                    ..NodeFacts::default()
-                },
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let mappings = vec![DevmapperEntry {
             name: "vg-root".to_owned(),
             uuid: Some("LVM-aaaaaaaa-bbbbbbbb".to_owned()),
@@ -2835,49 +2869,53 @@ mod tests {
         let mut graph = NodeGraph::new();
         let backing_id = block_node_id(Path::new("/dev/vda1"));
         let filesystem_id = content_node_id("/dev/vda1");
-        graph.insert_node(
-            backing_id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Partition {
-                        number: NonZeroU32::new(1).unwrap_or_else(|| unreachable!()),
-                        offset: Bytes::new(1_048_576),
-                        role: None,
-                        attributes: PartitionAttributes::default(),
+        graph
+            .insert_new(
+                backing_id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Partition {
+                            number: NonZeroU32::new(1).unwrap_or_else(|| unreachable!()),
+                            offset: Bytes::new(1_048_576),
+                            role: None,
+                            attributes: PartitionAttributes::default(),
+                        },
+                        size: Some(Bytes::new(1_073_741_824)),
                     },
-                    size: Some(Bytes::new(1_073_741_824)),
-                },
-                size: NodeFacts {
-                    block: Some(BlockFacts {
-                        paths: vec![PathBuf::from("/dev/vda1")],
-                        ..BlockFacts {
-                            devno: DeviceNumber { major: 0, minor: 0 },
-                            paths: Default::default(),
-                            geometry: Default::default(),
-                            read_only: Default::default(),
-                        }
-                    }),
-                    ..NodeFacts::default()
-                },
-            },
-        );
-        graph.insert_node(
-            filesystem_id,
-            Node {
-                kind: NodeSpec {
-                    kind: NodeKind::Filesystem {
-                        kind: FilesystemKind::Btrfs(BtrfsAllocation {
-                            data: HashSet::new(),
-                            metadata: HashSet::new(),
-                            system: HashSet::new(),
+                    size: NodeFacts {
+                        block: Some(BlockFacts {
+                            paths: vec![PathBuf::from("/dev/vda1")],
+                            ..BlockFacts {
+                                devno: DeviceNumber { major: 0, minor: 0 },
+                                paths: Default::default(),
+                                geometry: Default::default(),
+                                read_only: Default::default(),
+                            }
                         }),
-                        label: None,
+                        ..NodeFacts::default()
                     },
-                    size: None,
                 },
-                size: NodeFacts::default(),
-            },
-        );
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        graph
+            .insert_new(
+                filesystem_id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Filesystem {
+                            kind: FilesystemKind::Btrfs(BtrfsAllocation {
+                                data: HashSet::new(),
+                                metadata: HashSet::new(),
+                                system: HashSet::new(),
+                            }),
+                            label: None,
+                        },
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         graph.insert_dependency(Dependency {
             from: backing_id,
             to: filesystem_id,

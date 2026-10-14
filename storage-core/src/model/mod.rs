@@ -15,8 +15,8 @@ mod state;
 
 pub use block::*;
 pub use graph::{
-    BtrfsMember, CacheRole, Dependency, DependencyKind, MdMember, MdMemberRole, MemberRole,
-    NodeGraph, Relation, RelationKind,
+    BtrfsMember, CacheRole, Dependency, DependencyKind, GraphError, MdMember, MdMemberRole,
+    MemberRole, NodeGraph, Relation, RelationKind,
 };
 pub use node::{Node, NodeFacts, NodeId, NodeKind, NodeSpec, Presence, ProbeEpoch};
 pub use raid::{

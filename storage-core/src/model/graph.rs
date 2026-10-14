@@ -1,13 +1,14 @@
 //! Storage graph and relationship semantics.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     num::NonZeroU64,
 };
 
 use serde::{Deserialize, Serialize};
 
 use super::{Bytes, Node, NodeId, ZfsMember};
+use thiserror::Error;
 
 /// Canonical collection of storage nodes and their relationships.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,9 +24,21 @@ impl NodeGraph {
         Self::default()
     }
 
-    /// Inserts or replaces a node under its canonical identity.
-    pub fn insert_node(&mut self, id: NodeId, node: Node) -> Option<Node> {
-        self.nodes.insert(id, node)
+    /// Inserts a new identity without overwriting an existing observation or spec.
+    pub fn insert_new(&mut self, id: NodeId, node: Node) -> Result<(), GraphError> {
+        match self.nodes.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(node);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(GraphError::DuplicateNode(id)),
+        }
+    }
+
+    /// Replaces an existing identity without accidentally creating a new object.
+    pub fn replace_existing(&mut self, id: NodeId, node: Node) -> Result<Node, GraphError> {
+        let current = self.nodes.get_mut(&id).ok_or(GraphError::MissingNode(id))?;
+        Ok(std::mem::replace(current, node))
     }
 
     /// Adds a dependency, returning whether it was new.
@@ -75,6 +88,17 @@ impl NodeGraph {
     pub fn relations(&self) -> impl ExactSizeIterator<Item = &Relation> {
         self.relations.iter()
     }
+}
+
+/// Invalid graph representation or an invalid explicit node mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum GraphError {
+    /// Insertion would overwrite an existing node.
+    #[error("node {0:?} already exists")]
+    DuplicateNode(NodeId),
+    /// An edge or replacement references an absent identity.
+    #[error("node {0:?} is absent")]
+    MissingNode(NodeId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -174,8 +198,12 @@ mod tests {
             kind: RelationKind::SnapshotOf,
         };
         let mut graph = NodeGraph::new();
-        graph.insert_node(from, disk_node());
-        graph.insert_node(to, disk_node());
+        graph
+            .insert_new(from, disk_node())
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+        graph
+            .insert_new(to, disk_node())
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         graph.insert_dependency(dependency.clone());
         graph.insert_relation(relation.clone());
 
@@ -230,5 +258,38 @@ mod tests {
             graph.relations().collect::<Vec<_>>(),
             vec![&retained_relation]
         );
+    }
+    /// Creates a small graph with independently addressable placeholder nodes.
+    fn graph_with_nodes(count: usize) -> (NodeGraph, Vec<NodeId>) {
+        let ids: Vec<_> = (0..count).map(|_| NodeId::new()).collect();
+        let mut graph = NodeGraph::new();
+        for id in &ids {
+            assert!(graph.insert_new(*id, disk_node()).is_ok());
+        }
+        (graph, ids)
+    }
+
+    /// New and replacement operations fail without changing the existing graph.
+    #[test]
+    fn explicit_node_mutations_preserve_state_on_failure() {
+        let (mut graph, ids) = graph_with_nodes(1);
+        let original = graph.clone();
+        let missing = NodeId::new();
+        let mut replacement = disk_node();
+        replacement.kind.size = Some(Bytes::new(42));
+        assert_eq!(
+            graph.insert_new(ids[0], replacement.clone()),
+            Err(GraphError::DuplicateNode(ids[0]))
+        );
+        assert_eq!(
+            graph.replace_existing(missing, replacement.clone()),
+            Err(GraphError::MissingNode(missing))
+        );
+        assert_eq!(graph, original);
+        assert_eq!(
+            graph.replace_existing(ids[0], replacement.clone()),
+            Ok(disk_node())
+        );
+        assert_eq!(graph.node(&ids[0]), Some(&replacement));
     }
 }

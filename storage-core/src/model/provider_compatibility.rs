@@ -49,94 +49,103 @@ fn lsblk_blkid_libfdisk_and_udev_fit_existing_block_types() {
     let filesystem_id = id(4);
     let mut graph = NodeGraph::new();
 
-    graph.insert_node(
-        disk_id,
-        node(
-            NodeKind::Disk,
-            Some(1_000_000_000),
-            NodeFacts {
-                observed_in: Some(ProbeEpoch::new(3)),
-                presence: Presence::Present,
-                identities: vec![
-                    ExternalId::Wwn("0x5000c500abcd".into()),
-                    ExternalId::Serial {
-                        vendor: Some("ATA".into()),
-                        value: "SERIAL".into(),
-                    },
-                ],
-                block: Some(BlockFacts {
-                    paths: vec![
-                        PathBuf::from("/dev/sda"),
-                        PathBuf::from("/dev/disk/by-id/wwn-test"),
+    graph
+        .insert_new(
+            disk_id,
+            node(
+                NodeKind::Disk,
+                Some(1_000_000_000),
+                NodeFacts {
+                    observed_in: Some(ProbeEpoch::new(3)),
+                    presence: Presence::Present,
+                    identities: vec![
+                        ExternalId::Wwn("0x5000c500abcd".into()),
+                        ExternalId::Serial {
+                            vendor: Some("ATA".into()),
+                            value: "SERIAL".into(),
+                        },
                     ],
-                    devno: DeviceNumber { major: 8, minor: 0 },
-                    geometry: Some(BlockGeometry {
-                        logical_block_size: BlockSize::new(512).unwrap_or_else(|| unreachable!()),
-                        physical_block_size: BlockSize::new(4096),
-                        alignment_offset: Some(Bytes::new(0)),
-                        minimum_io_size: Some(Bytes::new(4096)),
-                        optimal_io_size: Some(Bytes::new(1_048_576)),
+                    block: Some(BlockFacts {
+                        paths: vec![
+                            PathBuf::from("/dev/sda"),
+                            PathBuf::from("/dev/disk/by-id/wwn-test"),
+                        ],
+                        devno: DeviceNumber { major: 8, minor: 0 },
+                        geometry: Some(BlockGeometry {
+                            logical_block_size: BlockSize::new(512)
+                                .unwrap_or_else(|| unreachable!()),
+                            physical_block_size: BlockSize::new(4096),
+                            alignment_offset: Some(Bytes::new(0)),
+                            minimum_io_size: Some(Bytes::new(4096)),
+                            optimal_io_size: Some(Bytes::new(1_048_576)),
+                        }),
+                        read_only: Some(false),
                     }),
-                    read_only: Some(false),
-                }),
-                device: Some(DeviceInfo {
-                    model: Some("TEST DISK".into()),
-                    vendor: Some("ATA".into()),
-                    transport: Some(Transport::Sata),
-                    network_backing: None,
-                    rotational: Some(false),
-                    removable: Some(false),
-                    zoned: Some(ZonedModel::None),
-                }),
-            },
-        ),
-    );
-    graph.insert_node(
-        table_id,
-        node(
-            NodeKind::PartitionTable(PartitionTable::Gpt),
-            None,
-            NodeFacts::default(),
-        ),
-    );
-    graph.insert_node(
-        partition_id,
-        node(
-            NodeKind::Partition {
-                number: NonZeroU32::new(1).unwrap_or_else(|| unreachable!()),
-                offset: Bytes::new(1_048_576),
-                role: Some(UsageRole::Root),
-                attributes: PartitionAttributes {
-                    gpt: Some(1 << 60),
-                    bootable: None,
+                    device: Some(DeviceInfo {
+                        model: Some("TEST DISK".into()),
+                        vendor: Some("ATA".into()),
+                        transport: Some(Transport::Sata),
+                        network_backing: None,
+                        rotational: Some(false),
+                        removable: Some(false),
+                        zoned: Some(ZonedModel::None),
+                    }),
                 },
-            },
-            Some(900_000_000),
-            NodeFacts {
-                identities: vec![ExternalId::GptPartitionUuid(Uuid::from_u128(30))],
-                presence: Presence::Present,
-                ..NodeFacts::default()
-            },
-        ),
-    );
-    graph.insert_node(
-        filesystem_id,
-        node(
-            NodeKind::Filesystem {
-                kind: FilesystemKind::Ext4,
-                label: Some("root".into()),
-            },
-            Some(890_000_000),
-            NodeFacts {
-                identities: vec![ExternalId::Filesystem {
-                    fs_type: "ext4".into(),
-                    value: Uuid::from_u128(40).to_string(),
-                }],
-                presence: Presence::Present,
-                ..NodeFacts::default()
-            },
-        ),
-    );
+            ),
+        )
+        .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+    graph
+        .insert_new(
+            table_id,
+            node(
+                NodeKind::PartitionTable(PartitionTable::Gpt),
+                None,
+                NodeFacts::default(),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+    graph
+        .insert_new(
+            partition_id,
+            node(
+                NodeKind::Partition {
+                    number: NonZeroU32::new(1).unwrap_or_else(|| unreachable!()),
+                    offset: Bytes::new(1_048_576),
+                    role: Some(UsageRole::Root),
+                    attributes: PartitionAttributes {
+                        gpt: Some(1 << 60),
+                        bootable: None,
+                    },
+                },
+                Some(900_000_000),
+                NodeFacts {
+                    identities: vec![ExternalId::GptPartitionUuid(Uuid::from_u128(30))],
+                    presence: Presence::Present,
+                    ..NodeFacts::default()
+                },
+            ),
+        )
+        .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+    graph
+        .insert_new(
+            filesystem_id,
+            node(
+                NodeKind::Filesystem {
+                    kind: FilesystemKind::Ext4,
+                    label: Some("root".into()),
+                },
+                Some(890_000_000),
+                NodeFacts {
+                    identities: vec![ExternalId::Filesystem {
+                        fs_type: "ext4".into(),
+                        value: Uuid::from_u128(40).to_string(),
+                    }],
+                    presence: Presence::Present,
+                    ..NodeFacts::default()
+                },
+            ),
+        )
+        .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
 
     assert!(graph.insert_dependency(Dependency {
         from: disk_id,
@@ -648,66 +657,71 @@ fn real_lsblk_nvme_shape_builds_existing_model_without_partition_type() {
     let table_id = id(1_001);
     let mut graph = NodeGraph::new();
 
-    graph.insert_node(
-        disk_id,
-        node(
-            NodeKind::Disk,
-            disk["size"].as_u64(),
-            NodeFacts {
-                presence: Presence::Present,
-                identities: vec![
-                    ExternalId::Wwn(
-                        disk["wwn"]
-                            .as_str()
-                            .unwrap_or_else(|| unreachable!())
-                            .into(),
-                    ),
-                    ExternalId::Serial {
-                        vendor: None,
-                        value: disk["serial"]
-                            .as_str()
-                            .unwrap_or_else(|| unreachable!())
-                            .into(),
-                    },
-                ],
-                block: Some(BlockFacts {
-                    paths: vec![PathBuf::from(
-                        disk["path"].as_str().unwrap_or_else(|| unreachable!()),
-                    )],
-                    devno: DeviceNumber {
-                        major: 259,
-                        minor: 0,
-                    },
-                    geometry: Some(BlockGeometry {
-                        logical_block_size: BlockSize::new(512).unwrap_or_else(|| unreachable!()),
-                        physical_block_size: BlockSize::new(512),
-                        alignment_offset: None,
-                        minimum_io_size: None,
-                        optimal_io_size: None,
+    graph
+        .insert_new(
+            disk_id,
+            node(
+                NodeKind::Disk,
+                disk["size"].as_u64(),
+                NodeFacts {
+                    presence: Presence::Present,
+                    identities: vec![
+                        ExternalId::Wwn(
+                            disk["wwn"]
+                                .as_str()
+                                .unwrap_or_else(|| unreachable!())
+                                .into(),
+                        ),
+                        ExternalId::Serial {
+                            vendor: None,
+                            value: disk["serial"]
+                                .as_str()
+                                .unwrap_or_else(|| unreachable!())
+                                .into(),
+                        },
+                    ],
+                    block: Some(BlockFacts {
+                        paths: vec![PathBuf::from(
+                            disk["path"].as_str().unwrap_or_else(|| unreachable!()),
+                        )],
+                        devno: DeviceNumber {
+                            major: 259,
+                            minor: 0,
+                        },
+                        geometry: Some(BlockGeometry {
+                            logical_block_size: BlockSize::new(512)
+                                .unwrap_or_else(|| unreachable!()),
+                            physical_block_size: BlockSize::new(512),
+                            alignment_offset: None,
+                            minimum_io_size: None,
+                            optimal_io_size: None,
+                        }),
+                        read_only: disk["ro"].as_bool(),
                     }),
-                    read_only: disk["ro"].as_bool(),
-                }),
-                device: Some(DeviceInfo {
-                    model: disk["model"].as_str().map(str::to_owned),
-                    vendor: None,
-                    transport: Some(Transport::Nvme),
-                    network_backing: None,
-                    rotational: disk["rota"].as_bool(),
-                    removable: disk["rm"].as_bool(),
-                    zoned: Some(ZonedModel::None),
-                }),
-                ..NodeFacts::default()
-            },
-        ),
-    );
-    graph.insert_node(
-        table_id,
-        node(
-            NodeKind::PartitionTable(PartitionTable::Gpt),
-            None,
-            NodeFacts::default(),
-        ),
-    );
+                    device: Some(DeviceInfo {
+                        model: disk["model"].as_str().map(str::to_owned),
+                        vendor: None,
+                        transport: Some(Transport::Nvme),
+                        network_backing: None,
+                        rotational: disk["rota"].as_bool(),
+                        removable: disk["rm"].as_bool(),
+                        zoned: Some(ZonedModel::None),
+                    }),
+                    ..NodeFacts::default()
+                },
+            ),
+        )
+        .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
+    graph
+        .insert_new(
+            table_id,
+            node(
+                NodeKind::PartitionTable(PartitionTable::Gpt),
+                None,
+                NodeFacts::default(),
+            ),
+        )
+        .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
     assert!(graph.insert_dependency(Dependency {
         from: disk_id,
         to: table_id,
@@ -747,28 +761,30 @@ fn real_lsblk_nvme_shape_builds_existing_model_without_partition_type() {
         )
         .unwrap_or_else(|error| panic!("partition UUID parses: {error}"));
 
-        graph.insert_node(
-            partition_id,
-            node(
-                NodeKind::Partition {
-                    number: NonZeroU32::new(number).unwrap_or_else(|| unreachable!()),
-                    offset: Bytes::new(
-                        partition["start"]
-                            .as_u64()
-                            .unwrap_or_else(|| unreachable!())
-                            * 512,
-                    ),
-                    role,
-                    attributes: PartitionAttributes::default(),
-                },
-                partition["size"].as_u64(),
-                NodeFacts {
-                    presence: Presence::Present,
-                    identities: vec![ExternalId::GptPartitionUuid(partition_uuid)],
-                    ..NodeFacts::default()
-                },
-            ),
-        );
+        graph
+            .insert_new(
+                partition_id,
+                node(
+                    NodeKind::Partition {
+                        number: NonZeroU32::new(number).unwrap_or_else(|| unreachable!()),
+                        offset: Bytes::new(
+                            partition["start"]
+                                .as_u64()
+                                .unwrap_or_else(|| unreachable!())
+                                * 512,
+                        ),
+                        role,
+                        attributes: PartitionAttributes::default(),
+                    },
+                    partition["size"].as_u64(),
+                    NodeFacts {
+                        presence: Presence::Present,
+                        identities: vec![ExternalId::GptPartitionUuid(partition_uuid)],
+                        ..NodeFacts::default()
+                    },
+                ),
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         assert!(
             graph.insert_dependency(Dependency {
                 from: table_id,
@@ -802,10 +818,12 @@ fn real_lsblk_nvme_shape_builds_existing_model_without_partition_type() {
                 label: None,
             },
         };
-        graph.insert_node(
-            content_id,
-            node(content, partition["size"].as_u64(), NodeFacts::default()),
-        );
+        graph
+            .insert_new(
+                content_id,
+                node(content, partition["size"].as_u64(), NodeFacts::default()),
+            )
+            .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         assert!(graph.insert_dependency(Dependency {
             from: partition_id,
             to: content_id,
