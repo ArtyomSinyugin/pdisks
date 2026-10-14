@@ -819,6 +819,39 @@ pub(crate) mod tests {
                 document.analyse_historical(),
                 Err(PlanDocumentError::Structure(_))
             ));
+            let json = serde_json::to_string(&document)
+                .unwrap_or_else(|error| panic!("plan JSON: {error}"));
+            assert!(PlanDocument::from_json(&json).is_err());
         }
+    }
+
+    /// Plan import must not normalize repeated graph identities or edge arrays away.
+    #[test]
+    fn plan_import_preserves_duplicate_evidence_until_validation() {
+        let document = document_fixture();
+        let json =
+            serde_json::to_string(&document).unwrap_or_else(|error| panic!("plan JSON: {error}"));
+        let (id, node) = document
+            .baseline
+            .snapshot
+            .graph
+            .nodes()
+            .next()
+            .unwrap_or_else(|| panic!("fixture node"));
+        let entry = format!(
+            "\"{}\":{}",
+            id.as_uuid(),
+            serde_json::to_string(node).unwrap_or_else(|error| panic!("node JSON: {error}"))
+        );
+        let duplicate = json.replacen(&entry, &format!("{entry},{entry}"), 1);
+        assert_ne!(json, duplicate);
+        assert!(PlanDocument::from_json(&duplicate).is_err());
+        let mut value =
+            serde_json::to_value(document).unwrap_or_else(|error| panic!("plan JSON: {error}"));
+        let edges = value["baseline"]["snapshot"]["graph"]["dependencies"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("fixture edges"));
+        edges.push(edges[0].clone());
+        assert!(PlanDocument::from_json(&value.to_string()).is_err());
     }
 }

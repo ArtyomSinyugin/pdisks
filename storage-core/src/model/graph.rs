@@ -12,6 +12,7 @@ use thiserror::Error;
 
 /// Canonical collection of storage nodes and their relationships.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "NodeGraphDto")]
 pub struct NodeGraph {
     nodes: HashMap<NodeId, Node>,
     dependencies: HashSet<Dependency>,
@@ -226,6 +227,9 @@ pub enum GraphError {
     /// An edge or replacement references an absent identity.
     #[error("node {0:?} is absent")]
     MissingNode(NodeId),
+    /// Wire input repeats an exact dependency or relation.
+    #[error("duplicate graph edge")]
+    DuplicateEdge,
     /// A dependency references the same object twice.
     #[error("node {0:?} depends on itself")]
     SelfDependency(NodeId),
@@ -241,6 +245,78 @@ pub enum GraphError {
     /// Partition and containing edge disagree about the start position.
     #[error("partition {0:?} disagrees with its containing offset")]
     PartitionOffset(NodeId),
+}
+
+/// Untrusted wire fields preserve arrays until duplicates have been checked.
+#[derive(Deserialize)]
+struct NodeGraphDto {
+    /// The existing JSON object format, read without silently overwriting keys.
+    #[serde(deserialize_with = "deserialize_nodes")]
+    nodes: HashMap<NodeId, Node>,
+    /// Dependency duplicates must be detected before collecting into a set.
+    dependencies: Vec<Dependency>,
+    /// Relation duplicates must be detected before collecting into a set.
+    relations: Vec<Relation>,
+}
+
+impl TryFrom<NodeGraphDto> for NodeGraph {
+    type Error = GraphError;
+
+    /// Publishes a graph only after wire duplicates and structural checks pass.
+    fn try_from(dto: NodeGraphDto) -> Result<Self, Self::Error> {
+        let mut graph = Self {
+            nodes: dto.nodes,
+            ..Self::new()
+        };
+        for edge in dto.dependencies {
+            if !graph.insert_dependency(edge) {
+                return Err(GraphError::DuplicateEdge);
+            }
+        }
+        for edge in dto.relations {
+            if !graph.insert_relation(edge) {
+                return Err(GraphError::DuplicateEdge);
+            }
+        }
+        graph.validate_structure()?;
+        Ok(graph)
+    }
+}
+
+/// Reads node entries directly so even repeated UUID object keys are rejected.
+fn deserialize_nodes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<NodeId, Node>, D::Error> {
+    /// Map visitor retaining duplicate-key evidence before collection insertion.
+    struct NodesVisitor;
+    impl<'de> serde::de::Visitor<'de> for NodesVisitor {
+        type Value = HashMap<NodeId, Node>;
+
+        /// Describes the compatible graph node object expected on the wire.
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object with unique node UUID keys")
+        }
+
+        /// Rejects repeated parsed identities, including equivalent UUID spellings.
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut nodes = HashMap::new();
+            while let Some((id, node)) = map.next_entry::<NodeId, Node>()? {
+                match nodes.entry(id) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(node);
+                    }
+                    Entry::Occupied(_) => {
+                        return Err(serde::de::Error::custom(GraphError::DuplicateNode(id)));
+                    }
+                }
+            }
+            Ok(nodes)
+        }
+    }
+    deserializer.deserialize_map(NodesVisitor)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -435,9 +511,39 @@ mod tests {
         assert_eq!(graph.node(&ids[0]), Some(&replacement));
     }
 
-    /// Direct validation rejects malformed graph representations.
+    /// Tests the raw JSON boundary, before maps and sets could erase duplicates.
     #[test]
-    fn invalid_structure_is_rejected() {
+    fn deserialize_rejects_duplicate_nodes_and_edges() {
+        let id = NodeId::new();
+        let node = serde_json::to_string(&disk_node())
+            .unwrap_or_else(|error| panic!("node JSON: {error}"));
+        let duplicate_nodes = format!(
+            r#"{{"nodes":{{"{id}":{node},"{id}":{node}}},"dependencies":[],"relations":[]}}"#,
+            id = id.as_uuid()
+        );
+        let error = serde_json::from_str::<NodeGraph>(&duplicate_nodes)
+            .err()
+            .unwrap_or_else(|| panic!("duplicate node accepted"));
+        assert!(error.to_string().contains("already exists"));
+
+        let (graph, ids) = graph_with_nodes(2);
+        let mut value =
+            serde_json::to_value(graph).unwrap_or_else(|error| panic!("graph JSON: {error}"));
+        for field in ["dependencies", "relations"] {
+            let edge = if field == "dependencies" {
+                serde_json::json!({"from": ids[0], "to": ids[1], "kind": "Backs"})
+            } else {
+                serde_json::json!({"from": ids[0], "to": ids[1], "kind": "SnapshotOf"})
+            };
+            value[field] = serde_json::json!([edge, edge]);
+            assert!(serde_json::from_str::<NodeGraph>(&value.to_string()).is_err());
+            value[field] = serde_json::json!([]);
+        }
+    }
+
+    /// Both direct validation and deserialization reject malformed representations.
+    #[test]
+    fn invalid_structure_is_rejected_at_the_wire_boundary() {
         for case in 0..6 {
             let (mut graph, ids) = graph_with_nodes(3);
             graph.insert_dependency(Dependency {
@@ -494,6 +600,12 @@ mod tests {
                 }
             }
             assert!(graph.validate_structure().is_err(), "case {case}");
+            let json =
+                serde_json::to_string(&graph).unwrap_or_else(|error| panic!("graph JSON: {error}"));
+            assert!(
+                serde_json::from_str::<NodeGraph>(&json).is_err(),
+                "case {case}"
+            );
         }
     }
 
@@ -550,6 +662,33 @@ mod tests {
             });
         }
         assert_eq!(graph.validate_structure(), Ok(()));
+        let json =
+            serde_json::to_string(&graph).unwrap_or_else(|error| panic!("graph JSON: {error}"));
+        assert_eq!(
+            serde_json::from_str::<NodeGraph>(&json).ok(),
+            Some(graph.clone())
+        );
+        graph.remove_dependency(&Dependency {
+            from: ids[0],
+            to: ids[1],
+            kind: DependencyKind::Contains {
+                offset: Bytes::new(4096),
+            },
+        });
+        graph.insert_dependency(Dependency {
+            from: ids[0],
+            to: ids[1],
+            kind: DependencyKind::Contains {
+                offset: Bytes::new(8192),
+            },
+        });
+        assert_eq!(
+            graph.validate_structure(),
+            Err(GraphError::PartitionOffset(ids[1]))
+        );
+        let json =
+            serde_json::to_string(&graph).unwrap_or_else(|error| panic!("graph JSON: {error}"));
+        assert!(serde_json::from_str::<NodeGraph>(&json).is_err());
     }
 
     /// Partial and unsupported observations, multiple providers, and relation cycles stay valid.
