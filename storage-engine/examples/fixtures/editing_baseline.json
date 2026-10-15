@@ -1,0 +1,51 @@
+{
+  "id": "00000000-0000-7000-8000-000000000101",
+  "snapshot": {
+    "graph": {
+      "nodes": {
+        "00000000-0000-7000-8000-000000000002": {
+          "kind": {
+            "kind": {
+              "LvmVg": {
+                "name": "vg0",
+                "extent_size": 4194304
+              }
+            },
+            "size": null
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Unknown",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        }
+      },
+      "dependencies": [],
+      "relations": []
+    },
+    "mounts": {
+      "entries": []
+    },
+    "environment": {
+      "host": {
+        "os_release": null,
+        "architecture": null,
+        "kernel_release": null,
+        "tools": [],
+        "kernel_modules": []
+      },
+      "target": null
+    },
+    "diagnostics": []
+  },
+  "capacity_evidence": [
+    {
+      "domain": {
+        "lvm_volume_group": "00000000-0000-7000-8000-000000000002"
+      },
+      "available": 16384
+    }
+  ]
+}

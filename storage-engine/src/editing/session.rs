@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use storage_core::model::NodeId;
+use storage_core::model::{Bytes, FilesystemKind, LvmLvKind, MountEntry, NodeId};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -74,6 +74,9 @@ pub enum EditError {
     /// Changing request kind requires removing the old request and adding a new one.
     #[error("cannot replace the kind of operation {0:?}")]
     RequestKindChange(OperationId),
+    /// The LV size convenience method requires a planned CreateLv request.
+    #[error("operation {0:?} is not a planned LV creation")]
+    NotCreatedLv(OperationId),
     /// Cancelling a creator requires an explicit decision about its dependent requests.
     #[error("removal requires dependent operations {operations:?}")]
     DependentOperations {
@@ -265,6 +268,90 @@ impl PlanSession {
         Ok(receipt)
     }
 
+    /// Adds a linear logical volume with activation enabled; other layouts use `edit(Add(...))`.
+    pub fn add_lv(
+        &mut self,
+        expected_revision: DraftRevision,
+        vg: NodeId,
+        name: impl Into<String>,
+        size: Bytes,
+    ) -> Result<EditReceipt, EditError> {
+        self.edit(
+            expected_revision,
+            PlanEdit::Add(PlanRequest::CreateLv {
+                vg,
+                name: name.into(),
+                size,
+                layout: LvmLvKind::Linear,
+                activate: true,
+            }),
+        )
+    }
+
+    /// Adds a filesystem request without an initial label; unsupported kinds remain diagnosed.
+    pub fn add_filesystem(
+        &mut self,
+        expected_revision: DraftRevision,
+        backing: NodeId,
+        filesystem: FilesystemKind,
+    ) -> Result<EditReceipt, EditError> {
+        self.edit(
+            expected_revision,
+            PlanEdit::Add(PlanRequest::CreateFilesystem {
+                backing,
+                filesystem,
+                label: None,
+            }),
+        )
+    }
+
+    /// Adds a runtime mount with the entry's explicit options and namespace.
+    pub fn mount(
+        &mut self,
+        expected_revision: DraftRevision,
+        entry: MountEntry,
+    ) -> Result<EditReceipt, EditError> {
+        self.edit(expected_revision, PlanEdit::Add(PlanRequest::Mount(entry)))
+    }
+
+    /// Adds a persistent mount independently of the runtime mount request.
+    pub fn persist_mount(
+        &mut self,
+        expected_revision: DraftRevision,
+        entry: MountEntry,
+    ) -> Result<EditReceipt, EditError> {
+        self.edit(
+            expected_revision,
+            PlanEdit::Add(PlanRequest::PersistMount(entry)),
+        )
+    }
+
+    /// Edits the original LV create size, preserving identities and never adding a resize action.
+    pub fn set_created_lv_size(
+        &mut self,
+        expected_revision: DraftRevision,
+        operation: OperationId,
+        size: Bytes,
+    ) -> Result<EditReceipt, EditError> {
+        self.check_revision(expected_revision)?;
+        let index = operation_index(&self.draft, operation)?;
+        let mut request = self.draft.operations[index].request.clone();
+        let PlanRequest::CreateLv {
+            size: requested, ..
+        } = &mut request
+        else {
+            return Err(EditError::NotCreatedLv(operation));
+        };
+        *requested = size;
+        self.edit(expected_revision, PlanEdit::Replace { operation, request })
+    }
+
+    /// Returns this creator and its transitive existence dependents, in current request order.
+    /// Shared resources and scheduling edges do not imply cancellation dependencies.
+    pub fn removal_impact(&self, operation: OperationId) -> Result<Vec<OperationId>, EditError> {
+        removal_impact(&self.draft, &[operation])
+    }
+
     /// Restores the previous draft and its identities; the publication revision still increases.
     pub fn undo(&mut self, expected_revision: DraftRevision) -> Result<DraftRevision, EditError> {
         let revision = self.check_revision(expected_revision)?;
@@ -340,8 +427,11 @@ fn operation_index(draft: &PlanDraft, id: OperationId) -> Result<usize, EditErro
         .ok_or(EditError::UnknownOperation(id))
 }
 
-/// Cancels only explicitly selected requests after computing all existence dependents.
-fn remove_operations(draft: &mut PlanDraft, operations: &[OperationId]) -> Result<(), EditError> {
+/// Finds all request identities whose existence depends on the selected operations.
+fn removal_impact(
+    draft: &PlanDraft,
+    operations: &[OperationId],
+) -> Result<Vec<OperationId>, EditError> {
     for operation in operations {
         operation_index(draft, *operation)?;
     }
@@ -369,11 +459,21 @@ fn remove_operations(draft: &mut PlanDraft, operations: &[OperationId]) -> Resul
             break;
         }
     }
-    let missing: Vec<_> = draft
+    Ok(draft
         .operations
         .iter()
-        .filter(|operation| affected.contains(&operation.id) && !selected.contains(&operation.id))
+        .filter(|operation| affected.contains(&operation.id))
         .map(|operation| operation.id)
+        .collect())
+}
+
+/// Cancels only explicitly selected requests after computing all existence dependents.
+fn remove_operations(draft: &mut PlanDraft, operations: &[OperationId]) -> Result<(), EditError> {
+    let affected = removal_impact(draft, operations)?;
+    let selected: HashSet<_> = operations.iter().copied().collect();
+    let missing: Vec<_> = affected
+        .into_iter()
+        .filter(|operation| !selected.contains(operation))
         .collect();
     if !missing.is_empty() {
         return Err(EditError::DependentOperations {
@@ -522,6 +622,16 @@ mod tests {
         let preview = session.preview().clone();
         let revision = session.revision();
         let creator = original.operations[0].id;
+        assert_eq!(
+            session
+                .removal_impact(creator)
+                .unwrap_or_else(|error| panic!("impact: {error}")),
+            original
+                .operations
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             session.edit(
                 revision,
@@ -775,6 +885,36 @@ mod tests {
         assert_eq!(session.preview(), &preview);
         assert_eq!(session.revision(), revision);
         assert!(session.undo.is_empty());
+    }
+
+    /// Size helpers reject stale, missing, and wrong-kind requests without touching history.
+    #[test]
+    fn convenience_edits_keep_concurrency_and_request_kind_checks() {
+        let mut session = workflow_session();
+        let revision = session.revision();
+        let draft = session.draft().clone();
+        let preview = session.preview().clone();
+        let filesystem = draft.operations[1].id;
+        let unknown = OperationId::new();
+        assert_eq!(
+            session.set_created_lv_size(revision, filesystem, Bytes::new(1024)),
+            Err(EditError::NotCreatedLv(filesystem))
+        );
+        assert_eq!(
+            session.set_created_lv_size(revision, unknown, Bytes::new(1024)),
+            Err(EditError::UnknownOperation(unknown))
+        );
+        assert!(matches!(
+            session.set_created_lv_size(DraftRevision::default(), unknown, Bytes::new(1024)),
+            Err(EditError::RevisionConflict { .. })
+        ));
+        assert_eq!(
+            session.removal_impact(unknown),
+            Err(EditError::UnknownOperation(unknown))
+        );
+        assert_eq!(session.draft(), &draft);
+        assert_eq!(session.preview(), &preview);
+        assert_eq!(session.revision(), revision);
     }
 
     /// Malformed baseline evidence prevents opening a session instead of creating a broken editor.
