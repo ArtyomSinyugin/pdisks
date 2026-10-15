@@ -1224,7 +1224,7 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("filesystem fixture"));
         document.baseline.snapshot.graph = document.requested_goal.graph.clone();
-        document.requested_goal.mounts.entries.clear();
+        document.requested_goal.mounts.runtime.clear();
         document.actions.truncate(2);
         document.dependencies.clear();
         for action in &mut document.actions {

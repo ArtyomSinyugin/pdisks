@@ -348,11 +348,11 @@ pub fn compare_goal(projection: &Projection, goal: &DesiredState) -> Vec<GoalChe
         aspect: GoalAspect::Graph,
         status: compare_graph(projection.graph(), &goal.graph),
     }];
-    for entry in &goal.mounts.entries {
+    for entry in &goal.mounts.runtime {
         checks.push(runtime_mount_check(projection.runtime_mounts(), entry));
-        if entry.persistent {
-            checks.push(persistent_mount_check(projection, entry));
-        }
+    }
+    for entry in &goal.mounts.persistent {
+        checks.push(persistent_mount_check(projection, entry));
     }
     checks.push(GoalCheck {
         aspect: GoalAspect::Boot,
@@ -598,7 +598,8 @@ mod tests {
         let goal = DesiredState {
             graph: NodeGraph::new(),
             mounts: MountSpec {
-                entries: vec![entry],
+                runtime: vec![entry.clone()],
+                persistent: vec![entry],
             },
             boot: BootSpec::Unmanaged,
             intents: Vec::new(),
@@ -671,7 +672,7 @@ mod tests {
         assert!(!report.intent_coverage[0].covered);
         assert!(report.intent_coverage[0].actions.is_empty());
         goal.intents.clear();
-        goal.mounts.entries.push(MountEntry {
+        goal.mounts.runtime.push(MountEntry {
             source: MountSource::Tmpfs,
             target: PathBuf::from("/missing"),
             options: Vec::new(),

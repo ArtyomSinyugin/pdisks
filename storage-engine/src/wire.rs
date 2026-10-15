@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// Supported plan document schema, independent of provider semantics and transport.
-pub const PLAN_SCHEMA_VERSION: u32 = 1;
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
 
 /// Saved observations and provider evidence used only for historical analysis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +134,14 @@ impl PlanDocument {
 
     /// Parses a document without trusting its versions, baseline, contracts, or scope.
     pub fn from_json(json: &str) -> Result<Self, PlanDocumentError> {
+        let value: Value = serde_json::from_str(json)?;
+        if let Some(version) = value.get("schema_version").and_then(Value::as_u64)
+            && version != u64::from(PLAN_SCHEMA_VERSION)
+        {
+            return Err(PlanDocumentError::SchemaVersion(
+                u32::try_from(version).unwrap_or(u32::MAX),
+            ));
+        }
         Ok(serde_json::from_str(json)?)
     }
 
@@ -156,7 +164,8 @@ impl PlanDocument {
             &mut value["baseline"]["snapshot"]["mounts"]["entries"],
             false,
         );
-        sort_json_array(&mut value["requested_goal"]["mounts"]["entries"], false);
+        sort_json_array(&mut value["requested_goal"]["mounts"]["runtime"], false);
+        sort_json_array(&mut value["requested_goal"]["mounts"]["persistent"], false);
         for field in ["nodes", "runtime_mounts", "persistent_mounts"] {
             sort_json_array(&mut value["protected_scope"][field], true);
         }
@@ -464,7 +473,8 @@ pub(crate) mod tests {
         let goal = DesiredState {
             graph: goal_graph,
             mounts: MountSpec {
-                entries: vec![entry.clone()],
+                runtime: vec![entry.clone()],
+                persistent: Vec::new(),
             },
             boot: BootSpec::Unmanaged,
             intents: Vec::new(),
@@ -539,6 +549,19 @@ pub(crate) mod tests {
         .unwrap_or_else(|error| panic!("compose wire fixture: {error}"));
         PlanDocument::capture(&plan, &current, &goal, &evidence, &protected)
             .unwrap_or_else(|error| panic!("capture wire fixture: {error}"))
+    }
+
+    /// Old mount schemas are rejected explicitly before typed decoding loses their version.
+    #[test]
+    fn rejects_legacy_mount_schema_before_decoding_goal() {
+        let mut value = serde_json::to_value(document_fixture())
+            .unwrap_or_else(|error| panic!("encode fixture: {error}"));
+        value["schema_version"] = serde_json::json!(1);
+        value["requested_goal"]["mounts"] = serde_json::json!({"entries": []});
+        assert!(matches!(
+            PlanDocument::from_json(&value.to_string()),
+            Err(PlanDocumentError::SchemaVersion(1))
+        ));
     }
 
     /// Round-trip replay uses projected predecessor nodes and retains every historical obligation.

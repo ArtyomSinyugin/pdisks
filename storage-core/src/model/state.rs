@@ -32,6 +32,75 @@ pub struct DesiredState {
     pub intents: Vec<OperationIntent>,
 }
 
+impl DesiredState {
+    /// Copies observed configuration without claiming knowledge of persistent mounts or boot.
+    /// Retained node facts remain historical observations, qualified by simulation evidence.
+    pub fn from_current(current: &CurrentState) -> Self {
+        Self {
+            graph: current.graph.clone(),
+            mounts: MountSpec {
+                runtime: current
+                    .mounts
+                    .entries
+                    .iter()
+                    .map(|entry| MountEntry {
+                        source: entry.source.clone(),
+                        target: entry.target.clone(),
+                        options: entry.options.clone(),
+                        persistent: false,
+                        context: entry.context.clone(),
+                    })
+                    .collect(),
+                persistent: Vec::new(),
+            },
+            boot: BootSpec::Unmanaged,
+            intents: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod desired_state_tests {
+    use super::*;
+
+    /// Initial goals copy runtime observations independently and leave unobserved aspects unmanaged.
+    #[test]
+    fn from_current_copies_only_observed_configuration() {
+        let current = CurrentState {
+            graph: NodeGraph::new(),
+            mounts: MountState {
+                entries: vec![ObservedMount {
+                    source: MountSource::Tmpfs,
+                    target: PathBuf::from("/run"),
+                    options: vec!["nosuid".to_owned()],
+                    context: MountContext::Host,
+                }],
+            },
+            environment: Environment {
+                host: SystemEnvironment::default(),
+                target: None,
+            },
+            diagnostics: Vec::new(),
+        };
+        let mut desired = DesiredState::from_current(&current);
+        assert_eq!(desired.graph, current.graph);
+        assert_eq!(
+            desired.mounts.runtime[0].target,
+            current.mounts.entries[0].target
+        );
+        assert_eq!(
+            desired.mounts.runtime[0].options,
+            current.mounts.entries[0].options
+        );
+        assert!(!desired.mounts.runtime[0].persistent);
+        assert!(desired.mounts.persistent.is_empty());
+        assert_eq!(desired.boot, BootSpec::Unmanaged);
+        assert!(desired.intents.is_empty());
+        desired.mounts.runtime.clear();
+        assert_eq!(current.mounts.entries.len(), 1);
+    }
+}
+
 /// Runtime mounts observed during probing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountState {
@@ -55,8 +124,10 @@ pub struct ObservedMount {
 /// Requested mount configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountSpec {
-    /// Requested mount entries.
-    pub entries: Vec<MountEntry>,
+    /// Mounts requested to be active in their runtime namespaces.
+    pub runtime: Vec<MountEntry>,
+    /// Requested persistent configuration; baseline knowledge is tracked separately.
+    pub persistent: Vec<MountEntry>,
 }
 
 /// A requested mount and its persistence policy.
@@ -68,7 +139,7 @@ pub struct MountEntry {
     pub target: PathBuf,
     /// Mount options to apply.
     pub options: Vec<String>,
-    /// Whether the mount must be written to persistent system configuration.
+    /// Persistence policy used by provider actions; MountSpec membership selects the goal aspect.
     pub persistent: bool,
     /// Context in which the mount must exist.
     pub context: MountContext,
