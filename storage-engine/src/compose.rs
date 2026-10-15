@@ -211,10 +211,34 @@ pub fn compose_plan_with_ordering(
     Ok(ExecutionPlan::new(actions, dependencies))
 }
 
+/// Assigns the same global IDs to composer actions and editing source maps.
+pub(crate) fn fragment_action_ids(
+    fragments: &[PlanFragment],
+) -> Result<HashMap<(usize, LocalActionId), ActionId>, CompositionError> {
+    let mut ids = HashMap::new();
+    for (fragment_index, fragment) in fragments.iter().enumerate() {
+        let fragment_id = FragmentId::new(
+            u32::try_from(fragment_index).map_err(|_| CompositionError::PlanTooLarge)?,
+        );
+        for action in &fragment.actions {
+            let id = ActionId::new(
+                u32::try_from(ids.len()).map_err(|_| CompositionError::PlanTooLarge)?,
+            );
+            if ids.insert((fragment_index, action.id), id).is_some() {
+                return Err(CompositionError::DuplicateLocalAction {
+                    fragment: fragment_id,
+                    action: action.id,
+                });
+            }
+        }
+    }
+    Ok(ids)
+}
+
 /// Assigns global identities and preserves fragment-local structure.
 fn flatten_fragments(fragments: &[PlanFragment]) -> Result<FlattenedFragments, CompositionError> {
     let mut draft = Vec::new();
-    let mut local_to_global = HashMap::new();
+    let local_to_global = fragment_action_ids(fragments)?;
     for (fragment_index, fragment) in fragments.iter().enumerate() {
         let fragment_id = FragmentId::new(
             u32::try_from(fragment_index).map_err(|_| CompositionError::PlanTooLarge)?,
@@ -227,18 +251,7 @@ fn flatten_fragments(fragments: &[PlanFragment]) -> Result<FlattenedFragments, C
             return Err(CompositionError::FragmentHasErrors(fragment_id));
         }
         for action in &fragment.actions {
-            let id = ActionId::new(
-                u32::try_from(draft.len()).map_err(|_| CompositionError::PlanTooLarge)?,
-            );
-            if local_to_global
-                .insert((fragment_index, action.id), id)
-                .is_some()
-            {
-                return Err(CompositionError::DuplicateLocalAction {
-                    fragment: fragment_id,
-                    action: action.id,
-                });
-            }
+            let id = local_to_global[&(fragment_index, action.id)];
             draft.push(DraftAction {
                 id,
                 operation: action.operation.clone(),

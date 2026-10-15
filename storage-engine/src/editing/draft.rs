@@ -15,6 +15,11 @@ use super::PlanRequest;
 pub struct OperationId(Uuid);
 
 impl OperationId {
+    /// Returns the UUID for persistence and validation at import boundaries.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
     /// Allocates a UUIDv7 identity once when an operation is added.
     pub fn new() -> Self {
         Self(Uuid::now_v7())
