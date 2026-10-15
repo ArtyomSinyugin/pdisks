@@ -33,7 +33,7 @@ impl Default for OperationId {
     }
 }
 
-/// Session revision, initially zero; future session edits will advance it monotonically.
+/// Session revision, initially zero and advanced monotonically by accepted edits.
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -42,6 +42,11 @@ impl Default for OperationId {
 pub struct DraftRevision(u64);
 
 impl DraftRevision {
+    /// Advances without wrapping, including when restoring an older draft from history.
+    pub(super) fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+
     /// Returns the revision value used for optimistic editing checks.
     pub const fn get(self) -> u64 {
         self.0

@@ -21,7 +21,7 @@ pub enum PlanRequest {
         name: String,
         /// Exact requested size in bytes.
         size: Bytes,
-        /// Allocation layout; the first recipe will support linear volumes.
+        /// Allocation layout; the initial recipe supports linear volumes.
         layout: LvmLvKind,
         /// Whether the created volume should be activated.
         activate: bool,
@@ -30,7 +30,7 @@ pub enum PlanRequest {
     CreateFilesystem {
         /// Existing or planned block-providing node.
         backing: NodeId,
-        /// Filesystem implementation; the first recipe will support ext4.
+        /// Filesystem implementation; the initial recipe supports ext4.
         filesystem: FilesystemKind,
         /// Optional initial filesystem label.
         label: Option<String>,
