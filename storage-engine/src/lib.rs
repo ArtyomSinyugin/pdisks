@@ -14,9 +14,12 @@ mod wire;
 
 pub use compose::{
     CompositionError, compose_plan, compose_plan_for_goal, compose_plan_for_goal_with_evidence,
-    compose_plan_for_goal_with_policy, compose_plan_with_evidence,
+    compose_plan_for_goal_with_policy, compose_plan_with_evidence, compose_plan_with_ordering,
 };
-pub use plan::{ActionDependency, ActionId, ExecutionPlan, FragmentId, PlannedAction};
+pub use plan::{
+    ActionDependency, ActionId, ExecutionPlan, FragmentActionRef, FragmentId, FragmentOrdering,
+    PlannedAction,
+};
 pub use simulate::{
     GoalAspect, GoalCheck, GoalStatus, IntentCoverage, PlanSimulationError, SimulatedStep,
     SimulationObligation, SimulationReport, SimulationResult, analyse_plan, compare_goal,

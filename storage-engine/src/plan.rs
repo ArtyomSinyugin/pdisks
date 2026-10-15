@@ -42,6 +42,28 @@ impl FragmentId {
     }
 }
 
+/// Address of a provider action within the inputs of one composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FragmentActionRef {
+    /// Input fragment position; not a persistent user operation identity.
+    pub fragment: FragmentId,
+    /// Provider-assigned identity within that fragment.
+    pub action: LocalActionId,
+}
+
+/// Explicit ordering supplied before transition and resource validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FragmentOrdering {
+    /// Action required to precede the other endpoint.
+    pub before: FragmentActionRef,
+    /// Action required to follow the other endpoint.
+    pub after: FragmentActionRef,
+    /// Semantic reason retained in the frozen plan dependency.
+    pub reason: DependencyReason,
+}
+
 /// One action in a composed execution plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

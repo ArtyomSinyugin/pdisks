@@ -19,8 +19,9 @@ use thiserror::Error;
 
 use crate::{
     ActionDependency, ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError,
-    ExecutionPlan, FragmentId, GoalAspect, GoalStatus, PlanSimulationError, PlannedAction,
-    PrerequisiteCheck, ProtectedAspect, ProtectedScope, simulate_plan_for_goal_with_policy,
+    ExecutionPlan, FragmentActionRef, FragmentId, FragmentOrdering, GoalAspect, GoalStatus,
+    PlanSimulationError, PlannedAction, PrerequisiteCheck, ProtectedAspect, ProtectedScope,
+    simulate_plan_for_goal_with_policy,
 };
 
 use crate::{
@@ -130,12 +131,49 @@ pub fn compose_plan_with_evidence(
     fragments: Vec<PlanFragment>,
     capacity_evidence: &[CapacityEvidence],
 ) -> Result<ExecutionPlan, CompositionError> {
+    compose_plan_with_ordering(current, fragments, &[], capacity_evidence)
+}
+
+/// Builds a plan with explicit cross-fragment edges before any transition is simulated.
+/// Endpoints belong to this input set; mandatory inferred dependencies still apply.
+pub fn compose_plan_with_ordering(
+    current: &CurrentState,
+    fragments: Vec<PlanFragment>,
+    ordering: &[FragmentOrdering],
+    capacity_evidence: &[CapacityEvidence],
+) -> Result<ExecutionPlan, CompositionError> {
     current.graph.validate_structure()?;
     let FlattenedFragments {
         actions: draft,
         mut dependencies,
         requirements,
     } = flatten_fragments(&fragments)?;
+    let endpoints: HashMap<_, _> = draft
+        .iter()
+        .map(|action| {
+            (
+                FragmentActionRef {
+                    fragment: action.fragment,
+                    action: action.local_id,
+                },
+                action.id,
+            )
+        })
+        .collect();
+    for edge in ordering {
+        let resolve = |endpoint: FragmentActionRef| {
+            endpoints
+                .get(&endpoint)
+                .copied()
+                .ok_or(CompositionError::UnknownOrderingAction(endpoint))
+        };
+        add_dependency(
+            &mut dependencies,
+            resolve(edge.before)?,
+            resolve(edge.after)?,
+            edge.reason,
+        )?;
+    }
     bind_planned_nodes(current, &draft, &mut dependencies)?;
     bind_mount_order(&draft, &mut dependencies)?;
     let first_contracts = simulate_order(
@@ -888,6 +926,9 @@ fn output_satisfies(output: &ActionOutput, prerequisite: &ActionPrerequisite) ->
 /// Failure to compose provider fragments into a safe global DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CompositionError {
+    /// Explicit cross-fragment ordering refers to an absent fragment or local action.
+    #[error("ordering references absent action {0:?}")]
+    UnknownOrderingAction(FragmentActionRef),
     /// The supplied storage graph has an invalid representation.
     #[error(transparent)]
     Structure(#[from] storage_core::model::GraphError),
@@ -2586,6 +2627,175 @@ mod tests {
             reason: DependencyReason::ResourceCoordination,
         });
         assert!(compose_plan(&current, vec![fragment]).is_ok());
+    }
+
+    /// Explicit edges resolve shared VG writes and reject malformed or cyclic ordering.
+    #[test]
+    fn cross_fragment_ordering_is_validated_before_replay() {
+        let (current, vg) = current_with_vg();
+        let baseline = current.clone();
+        let fragments: Vec<_> = ["data", "logs"]
+            .into_iter()
+            .map(|name| PlanFragment {
+                actions: vec![FragmentAction {
+                    id: LocalActionId::new(7),
+                    operation: ProviderAction::Lvm(LvmAction::CreateLv {
+                        vg,
+                        planned_node_id: NodeId::new(),
+                        name: name.to_owned(),
+                        size: Bytes::new(20),
+                        layout: LvmLvKind::Linear,
+                    }),
+                }],
+                dependencies: Vec::new(),
+                external_requirements: Vec::new(),
+                origin: origin(vg, "create LV"),
+                diagnostics: Vec::new(),
+            })
+            .collect();
+        let capacity = [CapacityEvidence {
+            domain: AllocationDomain::LvmVolumeGroup(vg),
+            available: AllocationQuantity::new(100),
+        }];
+        let first = FragmentActionRef {
+            fragment: FragmentId::new(0),
+            action: LocalActionId::new(7),
+        };
+        let second = FragmentActionRef {
+            fragment: FragmentId::new(1),
+            action: LocalActionId::new(7),
+        };
+        let edge = FragmentOrdering {
+            before: second,
+            after: first,
+            reason: DependencyReason::RequestedOrder,
+        };
+        assert!(matches!(
+            compose_plan_with_evidence(&current, fragments.clone(), &capacity),
+            Err(CompositionError::AmbiguousResourceOrder { .. }),
+        ));
+        let plan =
+            compose_plan_with_ordering(&current, fragments.clone(), &[edge.clone()], &capacity)
+                .unwrap_or_else(|error| panic!("compose ordered LVs: {error}"));
+        assert_eq!(
+            plan.ordered_actions()
+                .iter()
+                .map(|action| action.id)
+                .collect::<Vec<_>>(),
+            vec![ActionId::new(1), ActionId::new(0)]
+        );
+        let json =
+            serde_json::to_string(&edge).unwrap_or_else(|error| panic!("encode edge: {error}"));
+        assert_eq!(
+            serde_json::from_str::<FragmentOrdering>(&json)
+                .unwrap_or_else(|error| panic!("decode edge: {error}")),
+            edge
+        );
+        for missing in [
+            FragmentActionRef {
+                fragment: FragmentId::new(2),
+                ..first
+            },
+            FragmentActionRef {
+                action: LocalActionId::new(0),
+                ..first
+            },
+        ] {
+            assert_eq!(
+                compose_plan_with_ordering(
+                    &current,
+                    fragments.clone(),
+                    &[FragmentOrdering {
+                        before: missing,
+                        ..edge.clone()
+                    }],
+                    &capacity
+                ),
+                Err(CompositionError::UnknownOrderingAction(missing))
+            );
+        }
+        assert_eq!(
+            compose_plan_with_ordering(
+                &current,
+                fragments.clone(),
+                &[FragmentOrdering {
+                    before: first,
+                    ..edge.clone()
+                }],
+                &capacity
+            ),
+            Err(CompositionError::SelfDependency(ActionId::new(0)))
+        );
+        assert_eq!(
+            compose_plan_with_ordering(
+                &current,
+                fragments,
+                &[
+                    edge.clone(),
+                    FragmentOrdering {
+                        before: first,
+                        after: second,
+                        ..edge
+                    }
+                ],
+                &capacity
+            ),
+            Err(CompositionError::DependencyCycle)
+        );
+        assert_eq!(current, baseline);
+    }
+
+    /// User ordering cannot place a consumer before its mandatory planned input.
+    #[test]
+    fn cross_fragment_ordering_cannot_reverse_creation() {
+        let (current, vg) = current_with_vg();
+        let lv = NodeId::new();
+        let fragments = vec![
+            PlanFragment {
+                actions: vec![FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Lvm(LvmAction::CreateLv {
+                        vg,
+                        planned_node_id: lv,
+                        name: "data".to_owned(),
+                        size: Bytes::new(20),
+                        layout: LvmLvKind::Linear,
+                    }),
+                }],
+                dependencies: Vec::new(),
+                external_requirements: Vec::new(),
+                origin: origin(lv, "create LV"),
+                diagnostics: Vec::new(),
+            },
+            PlanFragment {
+                actions: vec![FragmentAction {
+                    id: LocalActionId::new(0),
+                    operation: ProviderAction::Lvm(LvmAction::SetActivation {
+                        target: lv,
+                        active: true,
+                    }),
+                }],
+                dependencies: Vec::new(),
+                external_requirements: Vec::new(),
+                origin: origin(lv, "activate LV"),
+                diagnostics: Vec::new(),
+            },
+        ];
+        let edge = FragmentOrdering {
+            before: FragmentActionRef {
+                fragment: FragmentId::new(1),
+                action: LocalActionId::new(0),
+            },
+            after: FragmentActionRef {
+                fragment: FragmentId::new(0),
+                action: LocalActionId::new(0),
+            },
+            reason: DependencyReason::RequestedOrder,
+        };
+        assert_eq!(
+            compose_plan_with_ordering(&current, fragments, &[edge], &[]),
+            Err(CompositionError::DependencyCycle)
+        );
     }
 
     /// Partition mutations conflict with creation in their shared metadata domain.
