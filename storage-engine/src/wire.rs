@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// Supported plan document schema, independent of provider semantics and transport.
-pub const PLAN_SCHEMA_VERSION: u32 = 2;
+pub const PLAN_SCHEMA_VERSION: u32 = 3;
 
 /// Saved observations and provider evidence used only for historical analysis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,7 +467,6 @@ pub(crate) mod tests {
             source: MountSource::Filesystem(filesystem),
             target: PathBuf::from("/data"),
             options: vec!["rw".to_owned()],
-            persistent: false,
             context: MountContext::Host,
         };
         let goal = DesiredState {
@@ -561,6 +560,14 @@ pub(crate) mod tests {
         assert!(matches!(
             PlanDocument::from_json(&value.to_string()),
             Err(PlanDocumentError::SchemaVersion(1))
+        ));
+        value["schema_version"] = serde_json::json!(2);
+        value["requested_goal"]["mounts"] = serde_json::json!({
+            "runtime": [{"persistent": false}], "persistent": [],
+        });
+        assert!(matches!(
+            PlanDocument::from_json(&value.to_string()),
+            Err(PlanDocumentError::SchemaVersion(2))
         ));
     }
 

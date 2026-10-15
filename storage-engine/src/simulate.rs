@@ -30,7 +30,7 @@ pub struct SimulatedStep {
     pub invalidated_facts: Vec<FactInvalidation>,
 }
 
-/// Conditional projection produced without mutating the observed baseline.
+/// Conditional desired configuration produced without mutating the observed baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulationResult {
     /// Predicted configuration; retained node facts are historical, not fresh observations.
@@ -76,7 +76,7 @@ pub enum SimulationObligation {
 /// Goal-aware analysis; a prediction never grants live execution permission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulationReport {
-    /// Conditional projection and the ordered prerequisite trace.
+    /// Predicted DesiredState, its evidence summary, and the ordered prerequisite trace.
     pub simulation: SimulationResult,
     /// Three-valued comparisons against the requested final state.
     pub goal_checks: Vec<GoalCheck>,
@@ -302,7 +302,7 @@ pub(crate) fn replay_plan(
     ))
 }
 
-/// Requested aspect evaluated against a final projection.
+/// Requested aspect evaluated against the predicted DesiredState.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalAspect {
     /// Complete semantic storage graph.
@@ -328,9 +328,9 @@ pub enum GoalAspect {
 /// Three-valued result of comparing one goal aspect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalStatus {
-    /// The final projection establishes the requested value.
+    /// The predicted configuration establishes the requested value.
     Satisfied,
-    /// The final projection contradicts the requested value.
+    /// The predicted configuration contradicts the requested value.
     Violated {
         /// Explanation of the known mismatch.
         reason: String,
@@ -540,7 +540,6 @@ mod tests {
                 source: MountSource::Tmpfs,
                 target: PathBuf::from("/data"),
                 options: vec!["ro".to_owned(), "rw".to_owned()],
-                persistent: true,
                 context: MountContext::Host,
             };
             let mut actual_entry = entry.clone();
@@ -607,7 +606,6 @@ mod tests {
             source: MountSource::Tmpfs,
             target: PathBuf::from("/data"),
             options: vec!["rw".to_owned()],
-            persistent: true,
             context: MountContext::Host,
         };
         let current = CurrentState {
@@ -667,7 +665,7 @@ mod tests {
         )));
     }
 
-    /// MountSpec membership controls each goal independently of the provider persistence flag.
+    /// MountSpec membership controls runtime and persistent goals independently.
     #[test]
     fn independent_mount_goals_follow_effects_and_keep_unknown_baselines() {
         let current = CurrentState {
@@ -683,7 +681,6 @@ mod tests {
             source: MountSource::Tmpfs,
             target: PathBuf::from("/data"),
             options: vec!["rw".to_owned()],
-            persistent: false,
             context: MountContext::Host,
         };
         let mut goal = DesiredState::from_current(&current);
@@ -791,7 +788,6 @@ mod tests {
             source: MountSource::Tmpfs,
             target: PathBuf::from("/missing"),
             options: Vec::new(),
-            persistent: false,
             context: MountContext::Host,
         });
         let report = simulate_plan_for_goal(&current, &plan, &goal)

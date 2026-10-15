@@ -272,6 +272,32 @@ mod tests {
 
     use super::*;
 
+    /// The Persist operation selects persistence without an additional entry-level flag.
+    #[test]
+    fn persistent_mount_action_round_trips_without_entry_flag() {
+        let action = ProviderAction::Mount(MountAction::Persist {
+            entry: MountEntry {
+                source: MountSource::Tmpfs,
+                target: PathBuf::from("/data"),
+                options: vec!["rw".to_owned()],
+                context: MountContext::Host,
+            },
+        });
+        let mut json = serde_json::to_value(&action)
+            .unwrap_or_else(|error| panic!("encode mount action: {error}"));
+        assert!(
+            json["operation"]["persist"]["entry"]
+                .get("persistent")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderAction>(json.clone()).ok(),
+            Some(action)
+        );
+        json["operation"]["persist"]["entry"]["persistent"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ProviderAction>(json).is_err());
+    }
+
     /// Ensures the closed provider tag and typed operation survive JSON round-trip.
     #[test]
     fn lvm_create_lv_round_trips_as_provider_data() {

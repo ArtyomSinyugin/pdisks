@@ -25,7 +25,7 @@ pub use simulate::{
 };
 pub use simulation_evidence::{
     ActionSimulationError, CapacityEvidence, CapacityEvidenceError, CheckEvidence, CheckStatus,
-    EffectApplicationError, PrerequisiteCheck, SimulatedAction, SimulationEvidenceSummary,
+    EffectApplicationError, PrerequisiteCheck, SimulationEvidenceSummary,
 };
 
 pub use validate::{ProtectedAspect, ProtectedMount, ProtectedScope, ProtectionViolation};

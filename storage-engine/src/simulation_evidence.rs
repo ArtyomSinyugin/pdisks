@@ -330,18 +330,19 @@ pub enum CapacityEvidenceError {
 
 /// Trusted contract and checks produced while simulating one action.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SimulatedAction {
-    /// Contract recalculated against the projection before the action.
-    pub contract: ActionContract,
+pub(crate) struct SimulatedAction {
+    /// Contract recalculated against DesiredState before the action.
+    pub(crate) contract: ActionContract,
     /// Results of evaluating every prerequisite in that contract.
-    pub checks: Vec<PrerequisiteCheck>,
+    pub(crate) checks: Vec<PrerequisiteCheck>,
     /// Observations invalidated at this step, including affected activation descendants.
-    pub invalidated_facts: Vec<FactInvalidation>,
+    pub(crate) invalidated_facts: Vec<FactInvalidation>,
 }
 
+#[cfg(test)]
 impl SimulatedAction {
-    /// Reports whether the projection depends on evidence deferred to runtime.
-    pub fn is_conditional(&self) -> bool {
+    /// Reports whether the action depends on evidence deferred to runtime.
+    pub(crate) fn is_conditional(&self) -> bool {
         self.checks
             .iter()
             .any(|check| matches!(check.status, CheckStatus::Unknown { .. }))
@@ -363,12 +364,12 @@ pub enum ActionSimulationError {
         /// Complete check report, including satisfied and unknown conditions.
         checks: Vec<PrerequisiteCheck>,
     },
-    /// The trusted effect could not be applied to the projection.
+    /// The trusted effect could not be applied to DesiredState and its evidence.
     #[error(transparent)]
     Effect(#[from] EffectApplicationError),
 }
 
-/// Failure to apply a predicted effect to an isolated projection.
+/// Failure to apply a predicted effect atomically to DesiredState and its evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EffectApplicationError {
     /// The completed graph violates a shared representation invariant.

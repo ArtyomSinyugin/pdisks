@@ -249,7 +249,6 @@ fn apply_mount_effects(
                 }
                 evidence.projected_runtime_mounts = true;
                 desired.mounts.runtime.push(MountEntry {
-                    persistent: false,
                     source: source.clone(),
                     target: target.clone(),
                     options: options.clone(),
@@ -1232,7 +1231,6 @@ mod tests {
             source: MountSource::Filesystem(disk),
             target: target.clone(),
             options: vec!["defaults".to_owned()],
-            persistent: true,
             context: MountContext::Host,
         };
         let effect = PredictedEffect {

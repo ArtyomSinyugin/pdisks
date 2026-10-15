@@ -100,7 +100,9 @@ resize-переходы, общий расход ёмкости, доступн�
 `MountSpec.runtime` и `MountSpec.persistent` задают независимые аспекты цели.
 Начальное состояние копирует наблюдаемые runtime mounts; постоянная конфигурация
 остаётся неизвестной до соответствующих эффектов. Принадлежность записи списку
-определяет аспект цели; `MountEntry.persistent` сохранён для контрактов провайдеров.
+определяет аспект цели. `MountEntry` описывает источник, target, options и context;
+у записи нет флага persistence. В контрактах постоянную настройку выбирает
+`MountAction::Persist`, активное монтирование — `MountAction::Mount`.
 `SimulationResult.evidence` содержит invalidations исторических `NodeFacts` и
 перечень persistent targets, определённых планом. Для отдельного сравнения служит
 `compare_goal(&result.desired, &result.evidence, &goal)`.
@@ -139,10 +141,11 @@ resize-переходы, общий расход ёмкости, доступн�
 | Проверка фактического результата | [ExecutionRun](storage-engine/src/execution.rs): фактический снимок сохраняется и при ошибке, прогноз на него не накладывается; успешный backend и проверенные действия ещё требуют отдельной проверки конечной цели |
 
 В указанных модулях находятся регрессионные тесты этих сценариев. Формат плана
-имеет `PLAN_SCHEMA_VERSION = 2`, каталог контрактов — `ACTION_SEMANTICS_VERSION = 3`.
-В версии 2 `requested_goal.mounts` содержит отдельные массивы `runtime` и
-`persistent` вместо `entries`. `PlanDocument::from_json` явно отвергает версию 1
-до разбора старой формы монтирований; автоматической миграции нет.
+имеет `PLAN_SCHEMA_VERSION = 3`, каталог контрактов — `ACTION_SEMANTICS_VERSION = 4`.
+`requested_goal.mounts` содержит отдельные массивы `runtime` и `persistent`;
+`MountEntry` не содержит прежнего флага `persistent`. `PlanDocument::from_json`
+явно отвергает версии 1 и 2 до разбора старой формы монтирований. Устаревшие поля
+в `MountSpec` и `MountEntry` отклоняются; автоматической миграции нет.
 
 Следующая работа — реализация доверенных live-checkers, корреляции устройств,
 блокировок ОС и write-dispatch. Сейчас `LiveExecutionChecks` задаёт их контракт,

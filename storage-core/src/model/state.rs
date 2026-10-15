@@ -19,16 +19,16 @@ pub struct CurrentState {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Requested storage state used as planner input.
+/// Requested or simulated future storage configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredState {
-    /// Requested canonical storage graph.
+    /// Canonical future storage graph, which may retain historical observation facts.
     pub graph: NodeGraph,
-    /// Requested mount configuration.
+    /// Future runtime mounts and persistent configuration, managed independently.
     pub mounts: MountSpec,
-    /// Requested boot configuration.
+    /// Managed boot configuration; simulations leave unsupported boot changes unmanaged.
     pub boot: BootSpec,
-    /// Operations that cannot be inferred from the final graph alone.
+    /// Explicit requests not inferable from the graph; retaining them does not prove coverage.
     pub intents: Vec<OperationIntent>,
 }
 
@@ -47,7 +47,6 @@ impl DesiredState {
                         source: entry.source.clone(),
                         target: entry.target.clone(),
                         options: entry.options.clone(),
-                        persistent: false,
                         context: entry.context.clone(),
                     })
                     .collect(),
@@ -62,6 +61,37 @@ impl DesiredState {
 #[cfg(test)]
 mod desired_state_tests {
     use super::*;
+
+    /// Mount aspect comes from list membership; stale persistence flags cannot be silently ignored.
+    #[test]
+    fn mount_spec_serializes_independent_lists_without_entry_flags() {
+        let entry = MountEntry {
+            source: MountSource::Tmpfs,
+            target: PathBuf::from("/data"),
+            options: vec!["rw".to_owned()],
+            context: MountContext::Host,
+        };
+        let mounts = MountSpec {
+            runtime: vec![entry.clone()],
+            persistent: vec![entry],
+        };
+        let mut json =
+            serde_json::to_value(&mounts).unwrap_or_else(|error| panic!("encode mounts: {error}"));
+        assert_eq!(json["runtime"], json["persistent"]);
+        assert!(json["runtime"][0].get("persistent").is_none());
+        assert_eq!(
+            serde_json::from_value::<MountSpec>(json.clone()).ok(),
+            Some(mounts)
+        );
+        json["runtime"][0]["persistent"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<MountSpec>(json).is_err());
+        assert!(
+            serde_json::from_value::<MountSpec>(serde_json::json!({
+                "runtime": [], "persistent": [], "entries": [],
+            }))
+            .is_err()
+        );
+    }
 
     /// Initial goals copy runtime observations independently and leave unobserved aspects unmanaged.
     #[test]
@@ -92,7 +122,6 @@ mod desired_state_tests {
             desired.mounts.runtime[0].options,
             current.mounts.entries[0].options
         );
-        assert!(!desired.mounts.runtime[0].persistent);
         assert!(desired.mounts.persistent.is_empty());
         assert_eq!(desired.boot, BootSpec::Unmanaged);
         assert!(desired.intents.is_empty());
@@ -121,17 +150,20 @@ pub struct ObservedMount {
     pub context: MountContext,
 }
 
-/// Requested mount configuration.
+/// Requested or predicted mount configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MountSpec {
-    /// Mounts requested to be active in their runtime namespaces.
+    /// Mounts requested or predicted to be active in their runtime namespaces.
     pub runtime: Vec<MountEntry>,
     /// Requested persistent configuration; baseline knowledge is tracked separately.
     pub persistent: Vec<MountEntry>,
 }
 
-/// A requested mount and its persistence policy.
+/// Mount configuration shared by runtime goals and persistent configuration.
+/// MountSpec membership or the provider action determines which aspect is managed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MountEntry {
     /// Storage object or non-block source to mount.
     pub source: MountSource,
@@ -139,8 +171,6 @@ pub struct MountEntry {
     pub target: PathBuf,
     /// Mount options to apply.
     pub options: Vec<String>,
-    /// Persistence policy used by provider actions; MountSpec membership selects the goal aspect.
-    pub persistent: bool,
     /// Context in which the mount must exist.
     pub context: MountContext,
 }

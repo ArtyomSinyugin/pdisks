@@ -91,9 +91,14 @@ plan identity, the original goal, protection policy, saved `HistoricalBaseline`,
 capacity evidence, actions, and dependencies. `PLAN_SCHEMA_VERSION` describes
 the outer format; `ACTION_SEMANTICS_VERSION` describes the shared provider
 catalogue independently of provider transport and backend-manifest versions.
+Plan schema 3 uses separate runtime and persistent mount lists. Action semantics 4
+removes the redundant `MountEntry.persistent` flag: `MountAction::Persist` and
+`MountEffect::SetPersistent` select persistent configuration themselves. Stale
+entry flags are rejected during deserialization.
 There are no run statuses, library handles, authorizations, or credential contents.
 
-`capture` validates the description before saving. `from_json` only parses;
+`capture` validates the description before saving. `from_json` checks the document
+schema version before typed parsing;
 `analyse_historical` validates IDs, fragment provenance, references, graph edges,
 and the DAG before replay. It reuses the same predecessor-state interpreter and
 imported-contract verifier, retains trusted recalculated contracts, then checks

@@ -298,7 +298,6 @@ mod tests {
                 source: MountSource::Tmpfs,
                 target: target.clone(),
                 options: Vec::new(),
-                persistent: true,
                 context: MountContext::Host,
             };
             for action in [

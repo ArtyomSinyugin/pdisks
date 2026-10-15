@@ -3266,7 +3266,6 @@ mod tests {
                     source: MountSource::Tmpfs,
                     target: PathBuf::from("/other"),
                     options: Vec::new(),
-                    persistent: true,
                     context: MountContext::Host,
                 },
             }],
