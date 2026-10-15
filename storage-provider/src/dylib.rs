@@ -55,25 +55,26 @@ impl LoadedLibrary {
         let Ok(library) = (unsafe { Library::new(&requirement.path) }) else {
             return None;
         };
-        if !has_symbols(&library, &requirement.required_symbols) {
+        // Loader hooks may already have registered global state, even if validation fails.
+        let mut loaded = Self {
+            handle: ManuallyDrop::new(library),
+            auxiliary: ManuallyDrop::new(Vec::with_capacity(requirement.auxiliary.len())),
+        };
+        if !has_symbols(&loaded.handle, &requirement.required_symbols) {
             return None;
         }
-        let mut auxiliary = Vec::with_capacity(requirement.auxiliary.len());
         for dependency in &requirement.auxiliary {
             // SAFETY: auxiliary paths are absolute and package-owned; handles
-            // are retained for the process lifetime after successful loading.
+            // are retained for the process lifetime even if later validation fails.
             let Ok(handle) = (unsafe { Library::new(&dependency.path) }) else {
                 return None;
             };
-            if !has_symbols(&handle, &dependency.required_symbols) {
+            loaded.auxiliary.push(handle);
+            if !has_symbols(loaded.auxiliary.last()?, &dependency.required_symbols) {
                 return None;
             }
-            auxiliary.push(handle);
         }
-        Some(Self {
-            handle: ManuallyDrop::new(library),
-            auxiliary: ManuallyDrop::new(auxiliary),
-        })
+        Some(loaded)
     }
 
     /// Reads `/proc/self/mountinfo` through libmount.
@@ -242,6 +243,83 @@ fn symbol_name(name: &'static [u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::LoadedLibrary;
+
+    /// Even rejected libraries may register global hooks, so every successful dlopen must stay live.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_library_sets_remain_loaded() {
+        use crate::{AuxiliaryLibrary, BackendLibrary};
+        use std::{collections::BTreeSet, fs, process::Command};
+
+        let root = std::env::temp_dir().join(format!(
+            "disksgraph-library-retention-{}",
+            uuid::Uuid::now_v7(),
+        ));
+        fs::create_dir(&root).unwrap_or_else(|error| panic!("create loader fixture: {error}"));
+        let source = root.join("fixture.rs");
+        let library = root.join("fixture.so");
+        fs::write(
+            &source,
+            "/// Empty native loader fixture.\npub fn fixture() {}\n",
+        )
+        .unwrap_or_else(|error| panic!("write loader fixture: {error}"));
+        let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .args(["--crate-type=cdylib", "--crate-name=loader_fixture"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .unwrap_or_else(|error| panic!("compile loader fixture: {error}"));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for failure in 0..3 {
+            let main = root.join(format!("main-{failure}.so"));
+            let auxiliary = root.join(format!("aux-{failure}.so"));
+            fs::copy(&library, &main).unwrap_or_else(|error| panic!("copy main fixture: {error}"));
+            fs::copy(&library, &auxiliary)
+                .unwrap_or_else(|error| panic!("copy aux fixture: {error}"));
+            let missing_symbol = BTreeSet::from(["disksgraph_missing_fixture_symbol".to_owned()]);
+            let mut requirement = BackendLibrary {
+                path: main.clone(),
+                required_symbols: if failure == 0 {
+                    missing_symbol.clone()
+                } else {
+                    BTreeSet::new()
+                },
+                auxiliary: vec![AuxiliaryLibrary {
+                    path: auxiliary.clone(),
+                    required_symbols: if failure == 1 {
+                        missing_symbol
+                    } else {
+                        BTreeSet::new()
+                    },
+                }],
+            };
+            if failure == 2 {
+                requirement.auxiliary.push(AuxiliaryLibrary {
+                    path: root.join("absent.so"),
+                    required_symbols: BTreeSet::new(),
+                });
+            }
+            assert!(LoadedLibrary::load(&requirement).is_none());
+            let maps = fs::read_to_string("/proc/self/maps")
+                .unwrap_or_else(|error| panic!("read loaded libraries: {error}"));
+            assert!(
+                maps.contains(main.to_string_lossy().as_ref()),
+                "main unloaded on failure {failure}"
+            );
+            if failure > 0 {
+                assert!(
+                    maps.contains(auxiliary.to_string_lossy().as_ref()),
+                    "aux unloaded on failure {failure}"
+                );
+            }
+        }
+        fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove loader fixture: {error}"));
+    }
 
     #[test]
     /// Guards the process-lifetime handle required by libraries with global registries.
