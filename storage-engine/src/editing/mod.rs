@@ -4,6 +4,7 @@
 //! writes; request lowering and session editing will use the existing engine checks.
 
 mod build;
+mod coverage;
 mod draft;
 mod lower;
 mod request;
@@ -16,3 +17,5 @@ pub use lower::lower_operation;
 pub use build::{
     DraftBuildError, OperationActions, OperationDiagnostic, PlanPreview, build_preview,
 };
+
+pub use coverage::RequestCoverage;

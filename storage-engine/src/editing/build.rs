@@ -12,7 +12,10 @@ use crate::{
     compose_plan_with_ordering,
 };
 
-use super::{OperationId, PlanDraft, PlanRequest, lower::diagnostic, lower_operation};
+use super::{
+    OperationId, PlanDraft, PlanRequest, RequestCoverage, coverage::request_coverage,
+    lower::diagnostic, lower_operation,
+};
 
 /// Per-build links between a stable user request and its generated actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,8 @@ pub struct PlanPreview {
     pub report: SimulationReport,
     /// Action ownership, retained separately from human-readable origin descriptions.
     pub source_map: Vec<OperationActions>,
+    /// Exact per-request action coverage, independent of the simulated final state.
+    pub request_coverage: Vec<RequestCoverage>,
     /// Nonfatal diagnostics produced while lowering requests.
     pub diagnostics: Vec<OperationDiagnostic>,
 }
@@ -84,7 +89,6 @@ pub fn build_preview(
     validate_draft(baseline, draft)?;
     let mut intents: Vec<OperationIntent> = Vec::new();
     let mut fragments = Vec::new();
-    let mut diagnostics = Vec::new();
     for operation in &draft.operations {
         let index = if let PlanRequest::Maintenance(intent) = &operation.request {
             intents.push(intent.clone());
@@ -103,16 +107,9 @@ pub fn build_preview(
                     })
                     .collect(),
             })?;
-        diagnostics.extend(fragment.diagnostics.iter().cloned().map(|diagnostic| {
-            OperationDiagnostic {
-                operation: Some(operation.id),
-                diagnostic,
-                checks: Vec::new(),
-            }
-        }));
         fragments.push(fragment);
     }
-    build_fragments(baseline, draft, fragments, &intents, diagnostics)
+    build_fragments(baseline, draft, fragments, &intents)
 }
 
 /// Composes lowered fragments with exact input identities, retaining ownership on failure.
@@ -121,8 +118,23 @@ fn build_fragments(
     draft: &PlanDraft,
     fragments: Vec<PlanFragment>,
     intents: &[OperationIntent],
-    diagnostics: Vec<OperationDiagnostic>,
 ) -> Result<PlanPreview, DraftBuildError> {
+    let diagnostics = draft
+        .operations
+        .iter()
+        .zip(&fragments)
+        .flat_map(|(operation, fragment)| {
+            fragment
+                .diagnostics
+                .iter()
+                .cloned()
+                .map(|diagnostic| OperationDiagnostic {
+                    operation: Some(operation.id),
+                    diagnostic,
+                    checks: Vec::new(),
+                })
+        })
+        .collect();
     let ids = crate::compose::fragment_action_ids(&fragments).map_err(|source| {
         DraftBuildError::Composition {
             source: Box::new(source),
@@ -211,10 +223,24 @@ fn build_fragments(
         source: Box::new(source),
         source_map: source_map.clone(),
     })?;
+    let request_coverage = draft
+        .operations
+        .iter()
+        .zip(&source_map)
+        .map(|(operation, mapping)| {
+            let actions: Vec<_> = mapping
+                .actions
+                .iter()
+                .map(|id| &plan.actions()[id.get() as usize].operation)
+                .collect();
+            request_coverage(operation, &actions)
+        })
+        .collect();
     Ok(PlanPreview {
         plan,
         report,
         source_map,
+        request_coverage,
         diagnostics,
     })
 }
@@ -377,6 +403,67 @@ pub(super) mod tests {
         assert!(!preview.report.is_complete());
         assert_eq!(build_preview(&baseline, &draft), Ok(preview));
         assert_eq!(baseline, before);
+    }
+
+    /// Simulatable omissions still fail coverage, and nonfatal fragment warnings survive.
+    #[test]
+    fn coverage_detects_a_silently_skipped_filesystem_request() {
+        let baseline = baseline();
+        let mut draft = workflow();
+        draft.operations.truncate(2);
+        let mut fragments: Vec<_> = draft
+            .operations
+            .iter()
+            .map(|operation| {
+                lower_operation(operation, None)
+                    .unwrap_or_else(|error| panic!("lower fixture: {error:?}"))
+            })
+            .collect();
+        fragments[1].actions.clear();
+        fragments[1].external_requirements.clear();
+        let mut warning = diagnostic("fixture.warning", "retain this warning");
+        warning.severity = storage_core::model::DiagnosticSeverity::Warning;
+        fragments[0].diagnostics.push(warning.clone());
+        let preview = build_fragments(&baseline, &draft, fragments, &[])
+            .unwrap_or_else(|error| panic!("simulate incomplete recipe: {error}"));
+        assert!(preview.request_coverage[0].covered);
+        assert!(!preview.request_coverage[1].covered);
+        assert_eq!(
+            preview.diagnostics,
+            vec![OperationDiagnostic {
+                operation: Some(draft.operations[0].id),
+                diagnostic: warning,
+                checks: Vec::new(),
+            }]
+        );
+        assert_eq!(preview.plan.actions().len(), 2);
+    }
+
+    /// Coverage describes transitions, allowing a later label request to supersede an earlier one.
+    #[test]
+    fn coverage_does_not_require_intermediate_labels_to_remain_final() {
+        let baseline = baseline();
+        let mut draft = workflow();
+        draft.operations.truncate(2);
+        let filesystem = draft.operations[1]
+            .created_node
+            .unwrap_or_else(|| panic!("filesystem ID"));
+        for label in ["old", "new"] {
+            draft
+                .operations
+                .push(PlanOperation::new(PlanRequest::SetFilesystemLabel {
+                    filesystem,
+                    label: Some(label.to_owned()),
+                }));
+        }
+        let preview = build_preview(&baseline, &draft)
+            .unwrap_or_else(|error| panic!("label transitions: {error}"));
+        assert!(
+            preview
+                .request_coverage
+                .iter()
+                .all(|coverage| coverage.covered)
+        );
     }
 
     /// User order must not reverse mandatory creation; failed builds retain action ownership.
