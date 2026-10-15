@@ -320,13 +320,13 @@ pub(super) mod tests {
     use storage_provider::{AllocationDomain, LvmAction, ProviderAction};
 
     /// Loads the same immutable historical context as the offline integration tests.
-    pub(super) fn baseline() -> HistoricalBaseline {
+    pub(in crate::editing) fn baseline() -> HistoricalBaseline {
         serde_json::from_str(include_str!("../../tests/fixtures/editing_baseline.json"))
             .unwrap_or_else(|error| panic!("decode baseline: {error}"))
     }
 
     /// Creates one active linear volume request within the fixture capacity.
-    pub(super) fn lv_request() -> PlanRequest {
+    pub(in crate::editing) fn lv_request() -> PlanRequest {
         let AllocationDomain::LvmVolumeGroup(vg) = baseline().capacity_evidence[0].domain;
         PlanRequest::CreateLv {
             vg,
@@ -338,7 +338,7 @@ pub(super) mod tests {
     }
 
     /// Assembles LV, filesystem, check, and independent runtime/persistent mount requests.
-    pub(super) fn workflow() -> PlanDraft {
+    pub(in crate::editing) fn workflow() -> PlanDraft {
         let lv = PlanOperation::new(lv_request());
         let node = lv.created_node.unwrap_or_else(|| panic!("LV output"));
         let filesystem = PlanOperation::new(PlanRequest::CreateFilesystem {

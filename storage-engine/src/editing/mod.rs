@@ -7,6 +7,7 @@ mod build;
 mod coverage;
 mod draft;
 mod lower;
+mod preview;
 mod request;
 
 pub use draft::{DraftRevision, OperationId, PlanDraft, PlanOperation};
@@ -19,3 +20,5 @@ pub use build::{
 };
 
 pub use coverage::RequestCoverage;
+
+pub use preview::{PreviewState, PreviewStatus};
