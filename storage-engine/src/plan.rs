@@ -100,30 +100,10 @@ impl ExecutionPlan {
 
     /// Returns actions in the deterministic topological order used for validation.
     pub fn ordered_actions(&self) -> Vec<&PlannedAction> {
-        let mut indegree = vec![0_usize; self.actions.len()];
-        for dependency in &self.dependencies {
-            indegree[dependency.after.get() as usize] += 1;
-        }
-        let mut emitted = vec![false; self.actions.len()];
-        let mut ordered = Vec::with_capacity(self.actions.len());
-        while ordered.len() < self.actions.len() {
-            let Some(next) = indegree
-                .iter()
-                .enumerate()
-                .find_map(|(index, degree)| (!emitted[index] && *degree == 0).then_some(index))
-            else {
-                break;
-            };
-            emitted[next] = true;
-            ordered.push(&self.actions[next]);
-            for dependency in self
-                .dependencies
-                .iter()
-                .filter(|dependency| dependency.before.get() as usize == next)
-            {
-                indegree[dependency.after.get() as usize] -= 1;
-            }
-        }
-        ordered
+        crate::compose::topological_order(self.actions.len(), &self.dependencies)
+            .unwrap_or_else(|error| unreachable!("frozen plan was structurally validated: {error}"))
+            .into_iter()
+            .map(|id| &self.actions[id.get() as usize])
+            .collect()
     }
 }
