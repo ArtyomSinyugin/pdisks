@@ -25,7 +25,7 @@ pub use coverage::RequestCoverage;
 
 pub use preview::{PreviewState, PreviewStatus};
 
-pub use session::{EditError, EditReceipt, PlanEdit, PlanSession};
+pub use session::{DEFAULT_HISTORY_LIMIT, EditError, EditReceipt, PlanEdit, PlanSession};
 
 pub use document::{
     DRAFT_SCHEMA_VERSION, DraftDocument, DraftDocumentError, MAX_DRAFT_JSON_BYTES,

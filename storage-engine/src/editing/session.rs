@@ -9,9 +9,12 @@ use uuid::Uuid;
 use crate::{HistoricalBaseline, ProtectedScope};
 
 use super::{
-    DraftBuildError, DraftDocument, DraftDocumentError, DraftRevision, OperationId, PlanDraft,
-    PlanOperation, PlanRequest, PreviewState, build_preview,
+    DraftBuildError, DraftDocument, DraftDocumentError, DraftRevision, MAX_DRAFT_OPERATIONS,
+    OperationId, PlanDraft, PlanOperation, PlanRequest, PreviewState, build_preview,
 };
+
+/// Default number of draft snapshots retained on each side of undo/redo history.
+pub const DEFAULT_HISTORY_LIMIT: usize = 64;
 
 /// One user command; valid edits may deliberately leave an invalid, editable plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +89,9 @@ pub enum EditError {
     /// The monotonic revision counter cannot advance safely.
     #[error("draft revision exhausted")]
     RevisionExhausted,
+    /// Adding another request would exceed the bounded editor input size.
+    #[error("draft contains the maximum {MAX_DRAFT_OPERATIONS} operations")]
+    OperationLimit,
     /// A programming/contract failure prevented publishing the candidate draft.
     #[error("internal preview build failure: {0}")]
     InternalBuild(Box<DraftBuildError>),
@@ -104,6 +110,8 @@ pub struct PlanSession {
     draft: PlanDraft,
     /// Current result only; never an older successful result after an invalid edit.
     preview: PreviewState,
+    /// Configurable snapshot bound; zero disables undo/redo retention.
+    history_limit: usize,
     /// Prior user drafts, without inverse predicted effects.
     undo: Vec<PlanDraft>,
     /// Drafts removed by undo, cleared by a new edit.
@@ -121,6 +129,7 @@ impl PlanSession {
             baseline: Arc::new(baseline),
             draft,
             preview,
+            history_limit: DEFAULT_HISTORY_LIMIT,
             undo: Vec::new(),
             redo: Vec::new(),
         })
@@ -142,6 +151,7 @@ impl PlanSession {
             baseline: Arc::new(document.baseline),
             draft: document.draft,
             preview: result.into(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
             undo: Vec::new(),
             redo: Vec::new(),
         })
@@ -172,6 +182,20 @@ impl PlanSession {
         &self.preview
     }
 
+    /// Returns the maximum snapshots retained in each history stack.
+    pub fn history_limit(&self) -> usize {
+        self.history_limit
+    }
+
+    /// Changes retention without changing the draft/revision; zero discards all history.
+    pub fn set_history_limit(&mut self, limit: usize) {
+        self.history_limit = limit;
+        for history in [&mut self.undo, &mut self.redo] {
+            let discard = history.len().saturating_sub(limit);
+            drop(history.drain(..discard));
+        }
+    }
+
     /// Applies a command atomically and recalculates from the same baseline.
     pub fn edit(
         &mut self,
@@ -187,6 +211,9 @@ impl PlanSession {
         };
         match edit {
             PlanEdit::Add(request) => {
+                if candidate.operations.len() >= MAX_DRAFT_OPERATIONS {
+                    return Err(EditError::OperationLimit);
+                }
                 let operation = PlanOperation::new(request);
                 receipt.added_operation = Some(operation.id);
                 receipt.created_node = operation.created_node;
@@ -227,8 +254,11 @@ impl PlanSession {
             PlanEdit::Clear => candidate.operations.clear(),
         }
         let preview = self.build_candidate(&candidate)?;
-        self.undo
-            .push(std::mem::replace(&mut self.draft, candidate));
+        push_history(
+            &mut self.undo,
+            std::mem::replace(&mut self.draft, candidate),
+            self.history_limit,
+        );
         self.redo.clear();
         self.preview = preview;
         self.revision = revision;
@@ -241,8 +271,11 @@ impl PlanSession {
         let candidate = self.undo.last().ok_or(EditError::NoUndo)?.clone();
         let preview = self.build_candidate(&candidate)?;
         let _ = self.undo.pop();
-        self.redo
-            .push(std::mem::replace(&mut self.draft, candidate));
+        push_history(
+            &mut self.redo,
+            std::mem::replace(&mut self.draft, candidate),
+            self.history_limit,
+        );
         self.preview = preview;
         self.revision = revision;
         Ok(revision)
@@ -254,8 +287,11 @@ impl PlanSession {
         let candidate = self.redo.last().ok_or(EditError::NoRedo)?.clone();
         let preview = self.build_candidate(&candidate)?;
         let _ = self.redo.pop();
-        self.undo
-            .push(std::mem::replace(&mut self.draft, candidate));
+        push_history(
+            &mut self.undo,
+            std::mem::replace(&mut self.draft, candidate),
+            self.history_limit,
+        );
         self.preview = preview;
         self.revision = revision;
         Ok(revision)
@@ -282,6 +318,17 @@ impl PlanSession {
         }
         Ok(result.into())
     }
+}
+
+/// Retains the newest snapshots without growing the bounded history indefinitely.
+fn push_history(history: &mut Vec<PlanDraft>, draft: PlanDraft, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if history.len() >= limit {
+        history.remove(0);
+    }
+    history.push(draft);
 }
 
 /// Resolves a stable operation identity before changing a candidate draft.
@@ -660,6 +707,74 @@ mod tests {
             Err(EditError::RevisionExhausted)
         );
         assert_eq!(session.draft(), &draft);
+    }
+
+    /// History keeps the nearest drafts, supports resizing, and can be disabled entirely.
+    #[test]
+    fn bounded_history_retains_nearest_undo_and_redo_states() {
+        let mut session = workflow_session();
+        session.set_history_limit(2);
+        assert_eq!(session.history_limit(), 2);
+        assert_eq!(session.undo.len(), 2);
+        let latest = session.draft().clone();
+        session
+            .undo(session.revision())
+            .unwrap_or_else(|error| panic!("undo: {error}"));
+        session
+            .undo(session.revision())
+            .unwrap_or_else(|error| panic!("undo: {error}"));
+        assert_eq!(session.undo(session.revision()), Err(EditError::NoUndo));
+        assert_eq!(session.draft().operations.len(), 3);
+        session
+            .redo(session.revision())
+            .unwrap_or_else(|error| panic!("redo: {error}"));
+        session
+            .redo(session.revision())
+            .unwrap_or_else(|error| panic!("redo: {error}"));
+        assert_eq!(session.draft(), &latest);
+        let revision = session.revision();
+        session.set_history_limit(0);
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.draft(), &latest);
+        apply(&mut session, PlanEdit::Clear);
+        assert!(session.undo.is_empty());
+        assert!(session.redo.is_empty());
+        assert_eq!(session.undo(session.revision()), Err(EditError::NoUndo));
+        session.set_history_limit(1);
+        apply(&mut session, PlanEdit::Add(lv_request()));
+        apply(&mut session, PlanEdit::Clear);
+        assert_eq!(session.undo.len(), 1);
+        session
+            .undo(session.revision())
+            .unwrap_or_else(|error| panic!("undo: {error}"));
+        assert_eq!(session.draft().operations.len(), 1);
+        session.set_history_limit(0);
+        assert_eq!(session.redo(session.revision()), Err(EditError::NoRedo));
+    }
+
+    /// The editor cannot grow a resumed maximum-size draft beyond the import/export bound.
+    #[test]
+    fn operation_limit_rejects_add_without_changing_state() {
+        let mut document = PlanSession::new(baseline())
+            .unwrap_or_else(|error| panic!("new: {error}"))
+            .draft_document();
+        let request = lv_request();
+        document.draft.operations = (0..MAX_DRAFT_OPERATIONS)
+            .map(|_| PlanOperation::new(request.clone()))
+            .collect();
+        let mut session = PlanSession::from_document(document)
+            .unwrap_or_else(|error| panic!("resume maximum draft: {error}"));
+        let draft = session.draft.clone();
+        let preview = session.preview.clone();
+        let revision = session.revision();
+        assert_eq!(
+            session.edit(revision, PlanEdit::Add(lv_request())),
+            Err(EditError::OperationLimit)
+        );
+        assert_eq!(session.draft(), &draft);
+        assert_eq!(session.preview(), &preview);
+        assert_eq!(session.revision(), revision);
+        assert!(session.undo.is_empty());
     }
 
     /// Malformed baseline evidence prevents opening a session instead of creating a broken editor.
