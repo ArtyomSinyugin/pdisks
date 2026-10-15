@@ -16,6 +16,7 @@
 //! Udev · libfdisk · libblkid
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
@@ -43,7 +44,8 @@ use crate::{
 /// Linux current-state probe backed by provider-specific adapters.
 pub struct LinuxProbe {
     providers: Vec<Box<dyn StateProvider>>,
-    generation: u64,
+    /// Last published generation; interior mutation preserves the read-only probe API.
+    generation: Cell<u64>,
 }
 
 /// Native libmount adapter responsible only for runtime mount discovery.
@@ -1934,7 +1936,7 @@ impl LinuxProbe {
     pub fn from_providers(providers: Vec<Box<dyn StateProvider>>) -> Self {
         Self {
             providers,
-            generation: 1,
+            generation: Cell::new(0),
         }
     }
 
@@ -1950,17 +1952,19 @@ impl LinuxProbe {
         ))])
     }
 
-    /// Calls providers and publishes one assembled current state.
+    /// Calls providers and publishes one assembled state with a fresh generation.
+    /// Panics on counter exhaustion rather than reusing an observation identity.
     pub fn probe(&self) -> ProbeSnapshot {
         let providers = self
             .providers
             .iter()
             .map(|provider| provider.as_ref())
             .collect::<Vec<_>>();
-        ProbeSnapshot {
-            generation: self.generation,
-            current: assemble::probe(&providers),
-        }
+        let current = assemble::probe(&providers);
+        let generation = self.generation.get().checked_add(1)
+            .unwrap_or_else(|| panic!("probe publication generation exhausted"));
+        self.generation.set(generation);
+        ProbeSnapshot { generation, current }
     }
 }
 
@@ -2493,6 +2497,26 @@ mod tests {
         NvmeSubsystemEntry, ZfsDatasetEntry, ZfsDatasetKind, ZfsEntry, ZfsPoolEntry,
         ZfsVdevClass as ProviderZfsVdevClass, ZfsVdevEntry, ZfsVdevKind as ProviderZfsVdevKind,
     };
+
+    /// Repeated probes publish distinct identities without changing retained snapshots.
+    #[test]
+    fn probe_generation_advances_for_each_publication() {
+        let probe = LinuxProbe::from_providers(Vec::new());
+        let first = probe.probe();
+        assert_eq!(first.generation, 1);
+        assert_eq!(probe.probe().generation, 2);
+        assert_eq!(probe.probe().generation, 3);
+        assert_eq!(first.generation, 1);
+    }
+
+    /// Exhaustion must not wrap to an identity already used by an earlier snapshot.
+    #[test]
+    #[should_panic(expected = "probe publication generation exhausted")]
+    fn probe_generation_never_wraps() {
+        let probe = LinuxProbe::from_providers(Vec::new());
+        probe.generation.set(u64::MAX);
+        let _ = probe.probe();
+    }
 
     /// Ensures mapper aliases resolve to the canonical filesystem content node.
     #[test]
