@@ -730,8 +730,8 @@ fn simulate_order(
                         diagnostics,
                     });
                 }
-                Err(ActionSimulationError::PrerequisitesViolated { .. }) => {
-                    return Err(CompositionError::ActionRejected(id));
+                Err(ActionSimulationError::PrerequisitesViolated { checks }) => {
+                    return Err(CompositionError::ActionRejected { action: id, checks });
                 }
                 Err(ActionSimulationError::Effect(error)) => {
                     return Err(CompositionError::Effect { action: id, error });
@@ -1001,8 +1001,13 @@ pub enum CompositionError {
     #[error("composed action dependencies contain a cycle")]
     DependencyCycle,
     /// An action has a known prerequisite violation in its predecessor state.
-    #[error("action {0:?} is rejected in the composed transition order")]
-    ActionRejected(ActionId),
+    #[error("action {action:?} is rejected in the composed transition order")]
+    ActionRejected {
+        /// Action rejected in its predecessor state.
+        action: ActionId,
+        /// Complete prerequisite results, including violated, satisfied, and unknown checks.
+        checks: Vec<PrerequisiteCheck>,
+    },
     /// A trusted effect failed while analysing one action.
     #[error("action {action:?} effect is invalid: {error}")]
     Effect {
@@ -1368,7 +1373,7 @@ mod tests {
             });
             assert!(matches!(
                 compose_plan(&current, vec![fragment]),
-                Err(CompositionError::ActionRejected(_))
+                Err(CompositionError::ActionRejected { .. })
             ));
             assert_eq!(current, baseline);
         }
@@ -1976,7 +1981,7 @@ mod tests {
             };
             assert!(matches!(
                 compose_plan(&current, vec![fragment.clone()]),
-                Err(CompositionError::ActionRejected(_))
+                Err(CompositionError::ActionRejected { .. })
             ));
             fragment.actions[0].operation = ProviderAction::Lvm(LvmAction::SetActivation {
                 target: lv,
@@ -2008,7 +2013,7 @@ mod tests {
 
         assert!(matches!(
             compose_plan(&current, vec![fragment]),
-            Err(CompositionError::ActionRejected(_))
+            Err(CompositionError::ActionRejected { .. })
         ));
     }
 
@@ -2262,7 +2267,10 @@ mod tests {
                 crate::simulate_plan_with_evidence(&current, &plan, &evidence)
                     .unwrap_or_else(|error| panic!("replay balanced grow and create: {error}"));
             } else {
-                assert!(matches!(result, Err(CompositionError::ActionRejected(_))));
+                assert!(matches!(
+                    result,
+                    Err(CompositionError::ActionRejected { .. })
+                ));
             }
         }
     }
@@ -2345,7 +2353,7 @@ mod tests {
             fragment.dependencies[0].after = LocalActionId::new(0);
             assert!(matches!(
                 compose_plan_with_evidence(&current, vec![fragment], &evidence),
-                Err(CompositionError::ActionRejected(_))
+                Err(CompositionError::ActionRejected { .. })
             ));
             assert_eq!(current, baseline);
         }
@@ -2581,10 +2589,25 @@ mod tests {
             available: AllocationQuantity::new(100),
         }];
 
-        assert!(matches!(
-            compose_plan_with_evidence(&current, vec![fragment], &evidence),
-            Err(CompositionError::ActionRejected(_))
-        ));
+        let error = compose_plan_with_evidence(&current, vec![fragment], &evidence)
+            .err()
+            .unwrap_or_else(|| panic!("over-allocation must fail"));
+        let CompositionError::ActionRejected { action, checks } = error else {
+            panic!("expected prerequisite rejection, got {error:?}");
+        };
+        assert_eq!(action, ActionId::new(1));
+        assert!(checks.iter().any(|check| matches!(
+            (&check.prerequisite, &check.status),
+            (
+                ActionPrerequisite::CapacityAvailable { .. },
+                crate::CheckStatus::Violated { .. }
+            ),
+        )));
+        assert!(
+            checks
+                .iter()
+                .any(|check| matches!(check.status, crate::CheckStatus::Satisfied(_)))
+        );
     }
 
     /// Conflicting writes need a provider- or recipe-owned semantic order.
@@ -3108,7 +3131,7 @@ mod tests {
         });
         assert!(matches!(
             compose_plan(&current, vec![fragment.clone()]),
-            Err(CompositionError::ActionRejected(_))
+            Err(CompositionError::ActionRejected { .. })
         ));
         fragment.actions[1].operation = ProviderAction::Filesystem(FilesystemAction::Check {
             filesystem,
@@ -3121,7 +3144,7 @@ mod tests {
         });
         assert!(matches!(
             compose_plan(&current, vec![fragment.clone()]),
-            Err(CompositionError::ActionRejected(_))
+            Err(CompositionError::ActionRejected { .. })
         ));
         fragment.dependencies.clear();
         fragment.actions.push(FragmentAction {
@@ -3689,10 +3712,10 @@ mod tests {
             after: LocalActionId::new(3),
             reason: DependencyReason::RequestedOrder,
         });
-        assert_eq!(
+        assert!(matches!(
             compose_plan(&current, vec![stale]),
-            Err(CompositionError::ActionRejected(ActionId::new(3)))
-        );
+            Err(CompositionError::ActionRejected { action, .. }) if action == ActionId::new(3)
+        ));
         fragment.dependencies.push(FragmentDependency {
             before: LocalActionId::new(0),
             after: LocalActionId::new(2),
@@ -3700,7 +3723,7 @@ mod tests {
         });
         assert!(matches!(
             compose_plan(&current, vec![fragment]),
-            Err(CompositionError::ActionRejected(_))
+            Err(CompositionError::ActionRejected { .. })
         ));
     }
     /// An empty action list cannot bypass storage structure checks on in-memory snapshots.
