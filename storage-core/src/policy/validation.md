@@ -7,7 +7,7 @@ LVM RAID
 Btrfs native RAID
 ```
 
-Но стандартная policy создания PDisks должна:
+Но стандартная policy создания DisksGraph должна:
 
 - запрещать создание LVM поверх mdraid;
 - предлагать native LVM RAID для LVM-сценариев;

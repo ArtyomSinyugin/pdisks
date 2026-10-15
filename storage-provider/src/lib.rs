@@ -58,11 +58,11 @@ pub const BACKEND_MANIFEST_VERSION: u16 = 1;
 
 /// Environment variable overriding the backend manifest file.
 ///
-/// The variable name is retained for compatibility with existing deployments.
-pub const BACKEND_MANIFEST_ENV: &str = "PDISKS_PROVIDER_MANIFEST";
+/// The variable name is part of the DisksGraph provider configuration contract.
+pub const BACKEND_MANIFEST_ENV: &str = "DISKSGRAPH_PROVIDER_MANIFEST";
 
 /// Provider manifest file used when no environment override is set.
-pub const DEFAULT_BACKEND_MANIFEST: &str = "/usr/share/pdisks/providers.json";
+pub const DEFAULT_BACKEND_MANIFEST: &str = "/usr/share/disksgraph/providers.json";
 
 /// Stable identity of a concrete system backend integration.
 #[repr(transparent)]
@@ -117,7 +117,7 @@ pub enum BackendCapability {
 pub struct BackendLibrary {
     /// Absolute path supplied by the target package build.
     pub path: PathBuf,
-    /// Symbols required by the compiled pdisks adapter.
+    /// Symbols required by the compiled disksgraph adapter.
     #[serde(default)]
     pub required_symbols: BTreeSet<String>,
     /// Additional libraries consumed by the same typed adapter.
@@ -142,7 +142,7 @@ pub struct AuxiliaryLibrary {
 pub struct BackendManifests {
     /// Version of this JSON structure, not of any native library.
     pub manifest_version: u16,
-    /// Optional backend integrations known to this pdisks build.
+    /// Optional backend integrations known to this disksgraph build.
     #[serde(rename = "providers")]
     pub backends: Vec<BackendManifest>,
 }
@@ -1354,7 +1354,7 @@ mod tests {
     /// Creates an isolated directory for one registry fixture.
     fn fixture_dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "pdisks-provider-{}-{}",
+            "disksgraph-provider-{}-{}",
             std::process::id(),
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));

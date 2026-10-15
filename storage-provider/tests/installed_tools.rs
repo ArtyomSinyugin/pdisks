@@ -109,11 +109,11 @@ fn available_machine_readable_probes_return_valid_json() {
 }
 
 #[test]
-#[ignore = "enabled explicitly by an RPM build with PDISKS_PROVIDER_MANIFEST"]
+#[ignore = "enabled explicitly by an RPM build with DISKSGRAPH_PROVIDER_MANIFEST"]
 /// Verifies opt-in manifests against dependencies installed by BuildRequires.
 fn installed_provider_manifests_match_host() {
-    let path = std::env::var_os("PDISKS_PROVIDER_MANIFEST")
-        .unwrap_or_else(|| panic!("PDISKS_PROVIDER_MANIFEST is required"));
+    let path = std::env::var_os("DISKSGRAPH_PROVIDER_MANIFEST")
+        .unwrap_or_else(|| panic!("DISKSGRAPH_PROVIDER_MANIFEST is required"));
     let path = PathBuf::from(path);
     BackendRegistry::validate_dependencies(path)
         .unwrap_or_else(|error| panic!("provider dependency validation failed: {error}"));

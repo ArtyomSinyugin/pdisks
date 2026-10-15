@@ -44,7 +44,7 @@ impl ProviderProbeError {
 
 /// Provider-specific adapter capable of a read-only probe.
 ///
-/// The connection describes how PDisks reaches this logical provider. Concrete
+/// The connection describes how DisksGraph reaches this logical provider. Concrete
 /// C libraries and executables used behind it remain backend implementation
 /// details. The assembler never substitutes one provider for another.
 pub trait StateProvider {
@@ -54,7 +54,7 @@ pub trait StateProvider {
     /// Exclusive area of current state owned by this adapter.
     fn responsibility(&self) -> &str;
 
-    /// PDisks attachment mechanism used by this provider.
+    /// DisksGraph attachment mechanism used by this provider.
     fn connection_kind(&self) -> ProviderConnectionKind;
 
     /// Reads current state without performing storage mutations.

@@ -2300,7 +2300,7 @@ fn external_mount_source(source: &str, fstype: &str) -> MountSource {
 
 /// Returns a deterministic graph identity for provider-observed objects.
 fn stable_node_id(kind: &str, identity: &str) -> NodeId {
-    let value = format!("pdisks:{kind}:{identity}");
+    let value = format!("disksgraph:{kind}:{identity}");
     let high = fnv1a(0xcbf2_9ce4_8422_2325, value.as_bytes());
     let low = fnv1a(0x8422_2325_cbf2_9ce4, value.as_bytes());
     NodeId::from_uuid(Uuid::from_u128((u128::from(high) << 64) | u128::from(low)))

@@ -1,12 +1,12 @@
 # Providers, backends, and connections
 
-PDisks treats three independently evolving concepts as separate contracts:
+DisksGraph treats three independently evolving concepts as separate contracts:
 
 | Concept | Examples | Responsibility |
 |---|---|---|
-| Logical provider | `luks`, `lvm`, `partition`, `filesystem` | Object semantics, typed actions, constraints, validation and translation into the PDisks model |
+| Logical provider | `luks`, `lvm`, `partition`, `filesystem` | Object semantics, typed actions, constraints, validation and translation into the DisksGraph model |
 | Technology backend | `libcryptsetup`, `libfdisk`, `libbd_lvm` | Concrete calls to the operating system and native APIs |
-| Provider connection | built-in Rust, `.so` through Stabby, separate process | Delivery of PDisks provider requests and responses |
+| Provider connection | built-in Rust, `.so` through Stabby, separate process | Delivery of DisksGraph provider requests and responses |
 
 For example, the built-in `LuksProvider` owns `LuksAction::{Format, Open,
 Close, Resize}`, validates those actions against `NodeGraph`, and translates
@@ -16,14 +16,14 @@ implemented by a registered `libcryptsetup` backend.
 There are two unrelated ABI boundaries:
 
 ```text
-PDisks host     <-> PDisks provider plugin   future project-owned Stabby ABI
-PDisks provider <-> libcryptsetup            existing upstream C ABI
+DisksGraph host     <-> DisksGraph provider plugin   future project-owned Stabby ABI
+DisksGraph provider <-> libcryptsetup            existing upstream C ABI
 ```
 
 Stabby must not wrap or redefine libcryptsetup. It will only connect the host
 to a separately built logical provider. A provider action remains, for example,
 `LuksAction::Open` regardless of whether the provider is built in, loaded as a
-PDisks plugin, or hosted in another process.
+DisksGraph plugin, or hosted in another process.
 
 ## Provider actions and contracts
 
@@ -260,7 +260,7 @@ starts a new projection with its own observations.
 
 ## Backend manifests
 
-Backend manifests belong to pdisks. Third-party packages such as `libzfs`,
+Backend manifests belong to disksgraph. Third-party packages such as `libzfs`,
 LVM, and libfdisk do not contain or maintain them.
 
 Each manifest describes one system backend integration and the native symbols
@@ -270,19 +270,19 @@ API requirements differ between integrations and are expressed by
 is still named `providers` for schema-version-1 compatibility; Rust code exposes
 these records as `BackendManifest` through `BackendRegistry`.
 
-At runtime pdisks reads one manifest file and registers capabilities only when
+At runtime disksgraph reads one manifest file and registers capabilities only when
 the declared library loads with every required symbol, or when the declared
 command exists. A missing optional package is therefore normal and does not
-prevent pdisks from starting.
+prevent disksgraph from starting.
 
-The file is `/usr/share/pdisks/providers.json` by default. Set
-`PDISKS_PROVIDER_MANIFEST` to replace it.
+The file is `/usr/share/disksgraph/providers.json` by default. Set
+`DISKSGRAPH_PROVIDER_MANIFEST` to replace it.
 
-The pdisks RPM build should:
+The disksgraph RPM build should:
 
 1. generate one architecture-specific manifest from a project-owned template,
    expanding `%_libdir` into an absolute library path;
-2. install it as `%_datadir/pdisks/providers.json`;
+2. install it as `%_datadir/disksgraph/providers.json`;
 3. add runtime `Requires` selected by the package maintainer;
 4. add matching `BuildRequires` when native integration tests are enabled.
 
@@ -306,14 +306,14 @@ Example generated manifest:
 }
 ```
 
-Set `PDISKS_PROVIDER_MANIFEST` when running tests to make
+Set `DISKSGRAPH_PROVIDER_MANIFEST` when running tests to make
 `installed_provider_manifests_match_host` verify every selected manifest
 against the libraries and commands installed by `BuildRequires`.
 
 RPM `%check` example:
 
 ```sh
-PDISKS_PROVIDER_MANIFEST="$PWD/providers.json" \
+DISKSGRAPH_PROVIDER_MANIFEST="$PWD/providers.json" \
   cargo test -p storage-provider --test installed_tools \
   installed_provider_manifests_match_host -- --ignored --exact
 ```
@@ -338,7 +338,7 @@ but it must not become an alternative executor for the same action.
 | NVMe and NVMe-oF | `libnvme` | udev supplies block endpoint facts |
 | Runtime and persistent mounts | `libmount` | Filesystem providers supply source facts |
 
-Consequently pdisks does not plan parallel adapters for `libbd_part`,
+Consequently disksgraph does not plan parallel adapters for `libbd_part`,
 `libbd_crypto`, `libbd_dm`, or `libbd_nvme` while their selected native owner
 covers the required operation. The generic mount and Btrfs entrypoints in
 `libbd_fs` are also not used: those responsibilities belong to `libmount` and
@@ -346,7 +346,7 @@ covers the required operation. The generic mount and Btrfs entrypoints in
 
 `libbd_fs` presents a library API, but many calls intentionally execute a
 filesystem-specific system utility. Its `bd_fs_can_*` API reports that runtime
-dependency. pdisks exposes the missing utility as an environment capability; it
+dependency. disksgraph exposes the missing utility as an environment capability; it
 does not create a second CLI fallback backend.
 
 ## Implemented coverage and TODO

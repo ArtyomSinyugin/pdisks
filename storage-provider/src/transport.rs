@@ -1,6 +1,6 @@
 //! Request delivery boundary for built-in and external logical providers.
 //!
-//! This protocol belongs to PDisks. It is deliberately independent from the C
+//! This protocol belongs to DisksGraph. It is deliberately independent from the C
 //! ABI used by system backends such as libcryptsetup.
 
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::ProviderId;
 
-/// Current serialized PDisks provider protocol version.
+/// Current serialized DisksGraph provider protocol version.
 pub const PROVIDER_PROTOCOL_VERSION: u16 = 1;
 
 /// Coarse provider attachment mechanism used in diagnostics and policy.
@@ -19,7 +19,7 @@ pub const PROVIDER_PROTOCOL_VERSION: u16 = 1;
 pub enum ProviderConnectionKind {
     /// Provider implementation linked into the host process.
     BuiltIn,
-    /// Separately built provider loaded through the future PDisks Stabby ABI.
+    /// Separately built provider loaded through the future DisksGraph Stabby ABI.
     StabbyDynamicLibrary,
     /// Provider served by a separately supervised process.
     Process,
@@ -31,11 +31,11 @@ pub enum ProviderConnectionKind {
 pub enum ProviderConnection {
     /// Provider implementation linked into the host process.
     BuiltIn,
-    /// PDisks provider plugin loaded through the project-owned Stabby ABI.
+    /// DisksGraph provider plugin loaded through the project-owned Stabby ABI.
     StabbyDynamicLibrary {
-        /// Absolute path to the PDisks provider plugin, not to a system C library.
+        /// Absolute path to the DisksGraph provider plugin, not to a system C library.
         library: PathBuf,
-        /// Versioned PDisks plugin entrypoint exported through Stabby.
+        /// Versioned DisksGraph plugin entrypoint exported through Stabby.
         entrypoint: String,
     },
     /// Provider reached through a separately supervised process.
@@ -61,11 +61,11 @@ impl ProviderConnection {
 pub struct ProviderBinding {
     /// Logical technology provider receiving requests.
     pub provider: ProviderId,
-    /// Mechanism used to deliver PDisks requests and responses.
+    /// Mechanism used to deliver DisksGraph requests and responses.
     pub connection: ProviderConnection,
 }
 
-/// Transport-neutral request envelope owned and versioned by PDisks.
+/// Transport-neutral request envelope owned and versioned by DisksGraph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequest {
     /// Provider protocol schema used by this envelope.
@@ -209,16 +209,16 @@ pub enum ProviderTransportError {
 mod tests {
     use super::*;
 
-    /// Ensures plugin paths describe PDisks attachment rather than a C backend ABI.
+    /// Ensures plugin paths describe DisksGraph attachment rather than a C backend ABI.
     #[test]
     fn connection_kinds_remain_distinct() {
         let builtin = ProviderConnection::BuiltIn;
         let plugin = ProviderConnection::StabbyDynamicLibrary {
-            library: PathBuf::from("/usr/lib64/pdisks/providers/libpdisks_luks.so"),
-            entrypoint: "pdisks_provider_v1".to_owned(),
+            library: PathBuf::from("/usr/lib64/disksgraph/providers/libdisksgraph_luks.so"),
+            entrypoint: "disksgraph_provider_v1".to_owned(),
         };
         let process = ProviderConnection::Process {
-            executable: PathBuf::from("/usr/libexec/pdisks-zfs-provider"),
+            executable: PathBuf::from("/usr/libexec/disksgraph-zfs-provider"),
         };
 
         assert_eq!(builtin.kind(), ProviderConnectionKind::BuiltIn);

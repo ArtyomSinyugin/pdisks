@@ -120,9 +120,9 @@ const EXPECTED_PROVIDERS: &[ExpectedProvider] = &[
 
 /// Returns the real provider manifest selected by the test environment.
 fn manifest_path() -> PathBuf {
-    env::var_os("PDISKS_PROVIDER_MANIFEST")
+    env::var_os("DISKSGRAPH_PROVIDER_MANIFEST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("PDISKS_PROVIDER_MANIFEST must name the installed manifest"))
+        .unwrap_or_else(|| panic!("DISKSGRAPH_PROVIDER_MANIFEST must name the installed manifest"))
 }
 
 /// Loads the real provider registry selected by the test environment.
@@ -140,7 +140,7 @@ fn provider<'a>(registry: &'a BackendRegistry, id: &str) -> &'a RegisteredBacken
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST and installed native provider libraries"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST and installed native provider libraries"]
 /// Resolves every required `.so` and prints its model responsibility.
 fn installed_native_provider_abi_matrix_matches_manifest() {
     let path = manifest_path();
@@ -186,7 +186,7 @@ fn installed_native_provider_abi_matrix_matches_manifest() {
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST and installed native provider libraries"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST and installed native provider libraries"]
 /// Requires every native integration to feed live data into CurrentState.
 fn native_current_state_adapter_matrix_is_complete() {
     let registry = registry();
@@ -234,7 +234,7 @@ fn native_current_state_adapter_matrix_is_complete() {
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST and installed libblockdev-fs"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST and installed libblockdev-fs"]
 /// Reports ordinary filesystem capabilities and their runtime utility dependencies.
 fn native_filesystem_capability_matrix_is_available() {
     let registry = registry();
@@ -273,7 +273,7 @@ fn native_filesystem_capability_matrix_is_available() {
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST and installed libblockdev-btrfs"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST and installed libblockdev-btrfs"]
 /// Reports Btrfs operation groups exposed by the native backend.
 fn native_btrfs_capabilities_are_available() {
     let registry = registry();
@@ -311,7 +311,7 @@ fn availability_summary(
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST and installed libmount"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST and installed libmount"]
 /// Runs libmount through FFI and prints the resulting CurrentState mount summary.
 fn native_libmount_populates_current_state() {
     let registry = registry();
@@ -382,7 +382,7 @@ fn native_libmount_populates_current_state() {
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST, root, and installed udev/fdisk/blkid/libmount"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST, root, and installed udev/fdisk/blkid/libmount"]
 /// Runs the complete native block read-path and reports graph/mount correlation.
 fn native_block_stack_populates_connected_current_state() {
     let registry = registry();
@@ -480,7 +480,7 @@ fn native_block_stack_populates_connected_current_state() {
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST, root, and installed block/dm/LUKS libraries"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST, root, and installed block/dm/LUKS libraries"]
 /// Runs libdevmapper and libcryptsetup over the native block graph.
 fn native_mapper_stack_populates_current_state() {
     let registry = registry();
@@ -549,7 +549,7 @@ fn native_mapper_stack_populates_current_state() {
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST, root, and all implemented native providers"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST, root, and all implemented native providers"]
 /// Runs the complete currently implemented local-storage provider stack.
 fn native_local_storage_stack_populates_current_state() {
     let registry = registry();
@@ -621,7 +621,7 @@ fn native_local_storage_stack_populates_current_state() {
 }
 
 #[test]
-#[ignore = "requires PDISKS_PROVIDER_MANIFEST, root, and every CurrentState native provider"]
+#[ignore = "requires DISKSGRAPH_PROVIDER_MANIFEST, root, and every CurrentState native provider"]
 /// Runs every native CurrentState adapter as one connected provider.
 fn native_system_storage_stack_populates_current_state() {
     let registry = registry();
