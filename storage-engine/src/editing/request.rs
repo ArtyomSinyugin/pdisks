@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use storage_core::model::{
-    Bytes, FilesystemKind, LvmLvKind, MountContext, MountEntry, NodeId, OperationIntent,
+    Bytes, FilesystemKind, LvmLvKind, MountContext, MountEntry, MountSource, NodeId,
+    OperationIntent,
 };
 
 /// User-level parameters retained for editing instead of mutating a frozen action DAG.
@@ -61,4 +62,38 @@ pub enum PlanRequest {
     },
     /// Retains an explicit maintenance intent; unsupported variants must fail lowering.
     Maintenance(OperationIntent),
+}
+
+impl PlanRequest {
+    /// Whether this request reserves exactly one new storage node.
+    pub(crate) fn creates_node(&self) -> bool {
+        matches!(self, Self::CreateLv { .. } | Self::CreateFilesystem { .. })
+    }
+
+    /// Storage identities used as inputs; ordering and shared resources are not ownership.
+    pub fn referenced_nodes(&self) -> Vec<NodeId> {
+        match self {
+            Self::CreateLv { vg, .. } => vec![*vg],
+            Self::CreateFilesystem { backing, .. } => vec![*backing],
+            Self::SetFilesystemLabel { filesystem, .. } => vec![*filesystem],
+            Self::Mount(entry) | Self::PersistMount(entry) => match &entry.source {
+                MountSource::Filesystem(node)
+                | MountSource::BtrfsSubvolume(node)
+                | MountSource::ZfsDataset(node) => vec![*node],
+                MountSource::Bind(_)
+                | MountSource::Tmpfs
+                | MountSource::Network(_)
+                | MountSource::Other(_) => Vec::new(),
+            },
+            Self::Unmount { .. } | Self::RemovePersistentMount { .. } => Vec::new(),
+            Self::Maintenance(intent) => match intent {
+                OperationIntent::Reformat { target, .. }
+                | OperationIntent::Check { target, .. }
+                | OperationIntent::Repair { target, .. }
+                | OperationIntent::SetActivation { target, .. } => vec![*target],
+                OperationIntent::ReplaceMember { group, old, new } => vec![*group, *old, *new],
+                OperationIntent::ConvertBtrfsProfiles { filesystem, .. } => vec![*filesystem],
+            },
+        }
+    }
 }

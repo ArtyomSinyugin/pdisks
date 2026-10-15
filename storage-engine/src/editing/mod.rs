@@ -4,7 +4,10 @@
 //! writes; request lowering and session editing will use the existing engine checks.
 
 mod draft;
+mod lower;
 mod request;
 
 pub use draft::{DraftRevision, OperationId, PlanDraft, PlanOperation};
 pub use request::PlanRequest;
+
+pub use lower::lower_operation;

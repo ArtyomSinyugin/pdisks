@@ -59,12 +59,7 @@ pub struct PlanOperation {
 impl PlanOperation {
     /// Allocates operation and output identities once, before any preview calculation.
     pub fn new(request: PlanRequest) -> Self {
-        let created_node = match &request {
-            PlanRequest::CreateLv { .. } | PlanRequest::CreateFilesystem { .. } => {
-                Some(NodeId::new())
-            }
-            _ => None,
-        };
+        let created_node = request.creates_node().then(NodeId::new);
         Self {
             id: OperationId::new(),
             request,

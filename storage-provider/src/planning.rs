@@ -1,7 +1,7 @@
 //! Provider-owned fragments used to compose a cross-technology plan.
 
 use serde::{Deserialize, Serialize};
-use storage_core::model::{Diagnostic, NodeId};
+use storage_core::model::{Diagnostic, MountContext, NodeId};
 
 use crate::{ActionPrerequisite, ProviderAction};
 
@@ -80,6 +80,13 @@ pub enum FragmentOrigin {
         subject: NodeId,
         /// Short provider-owned description suitable for review output.
         description: String,
+    },
+    /// A mount change, including sources that have no storage graph node.
+    Mount {
+        /// Absolute runtime or persistent mount target.
+        target: std::path::PathBuf,
+        /// Namespace or configuration context containing the target.
+        context: MountContext,
     },
     /// An explicit operation from `DesiredState::intents`.
     Intent {
