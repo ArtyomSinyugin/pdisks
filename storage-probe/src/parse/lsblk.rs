@@ -13,28 +13,10 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 pub struct SizeParseError(String);
 
 /// Raw lsblk JSON structure (реальная схема `lsblk --json`).
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 pub struct LsblkOutput {
     /// Все top-level устройства в порядке вывода lsblk.
     pub blockdevices: Vec<LsblkDevice>,
-}
-
-impl<'de> Deserialize<'de> for LsblkOutput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw {
-            #[serde(default)]
-            blockdevices: Vec<LsblkDevice>,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        Ok(Self {
-            blockdevices: raw.blockdevices,
-        })
-    }
 }
 
 /// Одно устройство в выводе lsblk. Nullable поля — `Option` (P0-01).
@@ -204,8 +186,18 @@ mod tests {
             }
         }"#;
 
-        let output: LsblkOutput = serde_json::from_str(json).expect("empty blockdevices ok");
+        assert!(serde_json::from_str::<LsblkOutput>(json).is_err());
+    }
+
+    /// An explicit empty list is valid; a missing or wrong root indicates probe failure.
+    #[test]
+    fn empty_device_list_requires_the_expected_root() {
+        let output: LsblkOutput = serde_json::from_str(r#"{"blockdevices": []}"#)
+            .unwrap_or_else(|error| panic!("parse empty list: {error}"));
         assert!(output.blockdevices.is_empty());
+        for json in ["{}", r#"{"blockdevices": null}"#] {
+            assert!(serde_json::from_str::<LsblkOutput>(json).is_err());
+        }
     }
 
     /// Human-readable размер в live path — ошибка, а не 0.

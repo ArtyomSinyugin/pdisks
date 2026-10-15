@@ -3,8 +3,20 @@ use serde::Deserialize;
 /// Raw sysfs JSON structure.
 #[derive(Debug, Deserialize)]
 pub struct SysfsOutput {
-    #[serde(default)]
+    /// Explicit device records; a missing root indicates an incompatible response.
     pub devices: Vec<SysfsDevice>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SysfsOutput;
+
+    /// Missing sysfs records cannot silently become an empty observation.
+    #[test]
+    fn requires_explicit_devices_list() {
+        assert!(serde_json::from_str::<SysfsOutput>(r#"{"devices": []}"#).is_ok());
+        assert!(serde_json::from_str::<SysfsOutput>("{}").is_err());
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

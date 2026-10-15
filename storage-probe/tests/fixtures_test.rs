@@ -1,92 +1,46 @@
-#![allow(clippy::expect_used)]
+//! Smoke checks for recorded Linux probe inputs, including degraded storage.
+
 use std::path::PathBuf;
 
 use storage_probe::LinuxProbe;
 
+/// Returns the directory containing one recorded probe scenario.
 fn fixture_dir(name: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("../tests/fixtures");
-    path.push(name);
-    path
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/fixtures")
+        .join(name)
 }
 
+/// Fixtures must exercise actual assembly, rather than merely returning a snapshot counter.
 #[test]
-fn probe_empty_sata_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("empty-sata"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-    // CurrentState will be populated in future work
-}
-
-#[test]
-fn probe_nvme_gpt_ext4_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("nvme-gpt-ext4"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-}
-
-#[test]
-fn probe_mdraid1_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("mdraid1"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-}
-
-#[test]
-fn probe_lvm_simple_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("lvm-simple"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-}
-
-#[test]
-fn probe_luks_lvm_ext4_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("luks-lvm-ext4"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-}
-
-#[test]
-fn probe_btrfs_single_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("btrfs-single"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-}
-
-#[test]
-fn probe_btrfs_multidevice_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("btrfs-multidevice"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-}
-
-#[test]
-fn probe_btrfs_subvolumes_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("btrfs-subvolumes"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-}
-
-#[test]
-fn probe_mounted_root_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("mounted-root"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
-}
-
-#[test]
-fn probe_broken_fixture() {
-    let probe = LinuxProbe::with_fixtures(fixture_dir("broken"));
-    let snapshot = probe.probe();
-
-    assert_eq!(snapshot.generation, 1);
+fn recorded_fixtures_produce_storage_graphs() {
+    for name in [
+        "empty-sata",
+        "nvme-gpt-ext4",
+        "mdraid1",
+        "lvm-simple",
+        "luks-lvm-ext4",
+        "btrfs-single",
+        "btrfs-multidevice",
+        "btrfs-subvolumes",
+        "mounted-root",
+        "broken",
+    ] {
+        let snapshot = LinuxProbe::with_fixtures(fixture_dir(name)).probe();
+        assert_eq!(snapshot.generation, 1, "{name}");
+        assert!(
+            snapshot.current.diagnostics.is_empty(),
+            "{name}: {:?}",
+            snapshot.current.diagnostics
+        );
+        assert!(
+            snapshot.current.graph.nodes().len() > 0,
+            "{name}: missing storage graph"
+        );
+        snapshot
+            .current
+            .graph
+            .validate_structure()
+            .unwrap_or_else(|error| panic!("{name}: invalid assembled graph: {error}"));
+    }
 }
