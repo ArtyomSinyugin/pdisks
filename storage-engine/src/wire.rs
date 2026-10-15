@@ -114,15 +114,31 @@ impl PlanDocument {
         capacity_evidence: &[CapacityEvidence],
         protected_scope: &ProtectedScope,
     ) -> Result<Self, PlanDocumentError> {
-        let document = Self {
-            schema_version: PLAN_SCHEMA_VERSION,
-            action_semantics_version: ACTION_SEMANTICS_VERSION,
-            plan_id: Uuid::now_v7(),
-            baseline: HistoricalBaseline {
+        Self::capture_with_baseline(
+            plan,
+            &HistoricalBaseline {
                 id: Uuid::now_v7(),
                 snapshot: current.clone(),
                 capacity_evidence: capacity_evidence.to_vec(),
             },
+            goal,
+            protected_scope,
+        )
+    }
+
+    /// Captures a new plan document while retaining the caller's immutable baseline identity.
+    /// The supplied baseline and contracts are reanalysed; this never provides live admission.
+    pub fn capture_with_baseline(
+        plan: &ExecutionPlan,
+        baseline: &HistoricalBaseline,
+        goal: &DesiredState,
+        protected_scope: &ProtectedScope,
+    ) -> Result<Self, PlanDocumentError> {
+        let document = Self {
+            schema_version: PLAN_SCHEMA_VERSION,
+            action_semantics_version: ACTION_SEMANTICS_VERSION,
+            plan_id: Uuid::now_v7(),
+            baseline: baseline.clone(),
             requested_goal: goal.clone(),
             protected_scope: protected_scope.clone(),
             actions: plan.actions().to_vec(),

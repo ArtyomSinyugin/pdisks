@@ -458,3 +458,228 @@ mod draft_tests {
         ));
     }
 }
+
+/// A plan document and action ownership captured together from exactly one reviewed revision.
+/// Keep this instance for repeat exports; calling freeze again creates another plan identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenPlan {
+    /// Source editing session, separate from document and future execution identities.
+    session_id: Uuid,
+    /// Source revision; subsequent edits never update this captured context.
+    revision: DraftRevision,
+    /// Reanalysed document with its own stable identity and the original baseline identity.
+    document: crate::PlanDocument,
+    /// Action ownership for this document, rather than a later mutable draft.
+    source_map: Vec<OperationActions>,
+}
+
+impl FrozenPlan {
+    /// Returns the editing session that produced this frozen context.
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    /// Returns the reviewed revision retained by this frozen context.
+    pub fn revision(&self) -> DraftRevision {
+        self.revision
+    }
+
+    /// Returns the same document for every export, preserving its plan ID and canonical JSON.
+    pub fn document(&self) -> &crate::PlanDocument {
+        &self.document
+    }
+
+    /// Returns action ownership from the captured revision, unchanged by subsequent edits.
+    pub fn source_map(&self) -> &[OperationActions] {
+        &self.source_map
+    }
+}
+
+/// Failure to capture a revision for offline review; no write admission was attempted.
+#[derive(Debug, Error)]
+pub enum FreezeError {
+    /// The caller reviewed a different draft revision.
+    #[error("expected revision {expected:?}, actual revision {actual:?}")]
+    RevisionConflict {
+        /// Revision reviewed by the caller.
+        expected: DraftRevision,
+        /// Current session revision.
+        actual: DraftRevision,
+    },
+    /// No consistent, fully covered and protection-respecting plan is available.
+    #[error("cannot freeze preview with status {0:?}")]
+    Unavailable(PreviewStatus),
+    /// Reanalysis of the captured plan rejected its historical context or contracts.
+    #[error(transparent)]
+    Document(#[from] crate::PlanDocumentError),
+}
+
+impl PlanSession {
+    /// Captures one revision and its source map; unknown evidence remains conditional.
+    /// Repeat exports should use the returned instance, not create a fresh frozen plan.
+    pub fn freeze(&self, expected_revision: DraftRevision) -> Result<FrozenPlan, FreezeError> {
+        if expected_revision != self.revision() {
+            return Err(FreezeError::RevisionConflict {
+                expected: expected_revision,
+                actual: self.revision(),
+            });
+        }
+        let status = self.preview().status();
+        if !matches!(status, PreviewStatus::Complete | PreviewStatus::Conditional) {
+            return Err(FreezeError::Unavailable(status));
+        }
+        let preview = self
+            .preview()
+            .calculated()
+            .ok_or(FreezeError::Unavailable(status))?;
+        let document = crate::PlanDocument::capture_with_baseline(
+            &preview.plan,
+            self.baseline(),
+            &preview.report.simulation.desired,
+            &self.draft().protected_scope,
+        )?;
+        Ok(FrozenPlan {
+            session_id: self.id(),
+            revision: self.revision(),
+            document,
+            source_map: preview.source_map.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod freeze_tests {
+    use super::*;
+    use crate::editing::{
+        EditError, PlanEdit, PlanRequest,
+        build::tests::{baseline, workflow},
+    };
+    use crate::{PlanDocument, ProtectedMount, ProtectedScope};
+    use storage_core::model::{Bytes, MountContext};
+
+    /// Capturing retains the original baseline, qualifications, and ownership across later edits.
+    #[test]
+    fn frozen_plan_keeps_revision_baseline_identity_and_canonical_exports() {
+        let mut document = PlanSession::new(baseline())
+            .unwrap_or_else(|error| panic!("new: {error}"))
+            .draft_document();
+        document.draft = workflow();
+        let mut session =
+            PlanSession::from_document(document).unwrap_or_else(|error| panic!("open: {error}"));
+        let revision = session.revision();
+        let frozen = session
+            .freeze(revision)
+            .unwrap_or_else(|error| panic!("freeze: {error}"));
+        assert_eq!(frozen.session_id(), session.id());
+        assert_eq!(frozen.revision(), revision);
+        assert_eq!(frozen.document().baseline, *session.baseline());
+        assert_eq!(
+            Some(frozen.source_map()),
+            session
+                .preview()
+                .calculated()
+                .map(|preview| preview.source_map.as_slice())
+        );
+        let json = frozen
+            .document()
+            .canonical_json()
+            .unwrap_or_else(|error| panic!("export: {error}"));
+        assert_eq!(
+            frozen
+                .document()
+                .canonical_json()
+                .unwrap_or_else(|error| panic!("export again: {error}")),
+            json
+        );
+        let imported =
+            PlanDocument::from_json(&json).unwrap_or_else(|error| panic!("parse frozen: {error}"));
+        let analysis = imported
+            .analyse_against(session.baseline())
+            .unwrap_or_else(|error| panic!("analyse: {error}"));
+        assert_eq!(analysis.baseline_id, session.baseline().id);
+        assert!(!analysis.report.is_complete());
+        assert!(!analysis.report.unresolved_obligations.is_empty());
+        session
+            .edit(revision, PlanEdit::Clear)
+            .unwrap_or_else(|error| panic!("clear: {error}"));
+        assert!(!frozen.document().actions.is_empty());
+        assert!(!frozen.source_map().is_empty());
+        assert_eq!(
+            frozen
+                .document()
+                .canonical_json()
+                .unwrap_or_else(|error| panic!("old export: {error}")),
+            json
+        );
+        let empty = session
+            .freeze(session.revision())
+            .unwrap_or_else(|error| panic!("freeze empty: {error}"));
+        assert_ne!(empty.document().plan_id, frozen.document().plan_id);
+        assert!(empty.source_map().is_empty());
+        assert!(empty.document().actions.is_empty());
+    }
+
+    /// Revision conflicts, protection blockers, and failed transitions cannot be frozen.
+    #[test]
+    fn freeze_rejects_stale_blocked_and_invalid_revisions() {
+        let mut document = PlanSession::new(baseline())
+            .unwrap_or_else(|error| panic!("new: {error}"))
+            .draft_document();
+        document.draft = workflow();
+        let mut session =
+            PlanSession::from_document(document).unwrap_or_else(|error| panic!("open: {error}"));
+        let reviewed = session.revision();
+        session
+            .edit(
+                reviewed,
+                PlanEdit::SetProtection(ProtectedScope {
+                    runtime_mounts: vec![ProtectedMount {
+                        target: "/data".into(),
+                        context: MountContext::Host,
+                    }],
+                    ..ProtectedScope::default()
+                }),
+            )
+            .unwrap_or_else(|error| panic!("protect: {error}"));
+        assert!(
+            matches!(session.freeze(reviewed), Err(FreezeError::RevisionConflict { expected, actual }) if expected == reviewed && actual == session.revision())
+        );
+        assert!(matches!(
+            session.freeze(session.revision()),
+            Err(FreezeError::Unavailable(PreviewStatus::Blocked))
+        ));
+        let operation = session.draft().operations[0].id;
+        let mut request = session.draft().operations[0].request.clone();
+        if let PlanRequest::CreateLv { size, .. } = &mut request {
+            *size = Bytes::new(101 * 4 * 1024 * 1024);
+        }
+        session
+            .edit(session.revision(), PlanEdit::Replace { operation, request })
+            .unwrap_or_else(|error| panic!("over-allocate: {error}"));
+        assert!(matches!(
+            session.freeze(session.revision()),
+            Err(FreezeError::Unavailable(PreviewStatus::Invalid))
+        ));
+    }
+
+    /// Read-only freezing does not need to advance an already exhausted edit revision.
+    #[test]
+    fn freeze_does_not_increment_revision_or_mutate_the_session() {
+        let mut document = PlanSession::new(baseline())
+            .unwrap_or_else(|error| panic!("new: {error}"))
+            .draft_document();
+        document.revision = serde_json::from_value(serde_json::json!(u64::MAX))
+            .unwrap_or_else(|error| panic!("revision: {error}"));
+        let mut session =
+            PlanSession::from_document(document).unwrap_or_else(|error| panic!("open: {error}"));
+        let before = session.draft_document();
+        session
+            .freeze(session.revision())
+            .unwrap_or_else(|error| panic!("freeze: {error}"));
+        assert_eq!(session.draft_document(), before);
+        assert_eq!(
+            session.edit(session.revision(), PlanEdit::Clear),
+            Err(EditError::RevisionExhausted)
+        );
+    }
+}

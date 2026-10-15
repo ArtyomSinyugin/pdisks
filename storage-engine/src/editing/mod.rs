@@ -28,6 +28,6 @@ pub use preview::{PreviewState, PreviewStatus};
 pub use session::{DEFAULT_HISTORY_LIMIT, EditError, EditReceipt, PlanEdit, PlanSession};
 
 pub use document::{
-    DRAFT_SCHEMA_VERSION, DraftDocument, DraftDocumentError, MAX_DRAFT_JSON_BYTES,
-    MAX_DRAFT_OPERATIONS, PREVIEW_SCHEMA_VERSION, PreviewDocument,
+    DRAFT_SCHEMA_VERSION, DraftDocument, DraftDocumentError, FreezeError, FrozenPlan,
+    MAX_DRAFT_JSON_BYTES, MAX_DRAFT_OPERATIONS, PREVIEW_SCHEMA_VERSION, PreviewDocument,
 };
