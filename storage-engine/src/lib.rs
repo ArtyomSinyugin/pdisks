@@ -3,6 +3,7 @@
 //! Planning, validation, and simulation over trusted provider contracts.
 
 mod compose;
+pub mod editing;
 mod effects;
 mod execution;
 mod plan;

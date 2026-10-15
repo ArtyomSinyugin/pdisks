@@ -2697,9 +2697,13 @@ mod tests {
             compose_plan_with_evidence(&current, fragments.clone(), &capacity),
             Err(CompositionError::AmbiguousResourceOrder { .. }),
         ));
-        let plan =
-            compose_plan_with_ordering(&current, fragments.clone(), &[edge.clone()], &capacity)
-                .unwrap_or_else(|error| panic!("compose ordered LVs: {error}"));
+        let plan = compose_plan_with_ordering(
+            &current,
+            fragments.clone(),
+            std::slice::from_ref(&edge),
+            &capacity,
+        )
+        .unwrap_or_else(|error| panic!("compose ordered LVs: {error}"));
         assert_eq!(
             plan.ordered_actions()
                 .iter()
