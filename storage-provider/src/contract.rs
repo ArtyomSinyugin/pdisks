@@ -1474,6 +1474,12 @@ fn describe_mount(action: &MountAction, graph: &NodeGraph) -> ActionContract {
         }
         MountAction::Persist { entry } => {
             let mut result = contract(RestartPolicy::ReprobeThenRetry);
+            if let Some(node) = mount_source_node(&entry.source) {
+                result
+                    .prerequisites
+                    .push(ActionPrerequisite::NodeExists(node));
+                read(&mut result, ActionResource::Node(node));
+            }
             write(
                 &mut result,
                 ActionResource::PersistentMountConfig(entry.context.clone()),
@@ -1839,7 +1845,7 @@ pub(crate) fn lvm_volume_group(graph: &NodeGraph, lv: NodeId) -> Option<NodeId> 
 }
 
 /// Returns the graph node referenced by a mount source, when one exists.
-fn mount_source_node(source: &MountSource) -> Option<NodeId> {
+pub(crate) fn mount_source_node(source: &MountSource) -> Option<NodeId> {
     match source {
         MountSource::Filesystem(node)
         | MountSource::BtrfsSubvolume(node)

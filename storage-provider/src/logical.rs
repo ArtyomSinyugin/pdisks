@@ -22,7 +22,7 @@ pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> V
     match action {
         ProviderAction::Luks(action) => crate::luks::validate_action(action, graph),
         ProviderAction::Lvm(action) => validate_lvm_action(action, graph),
-        ProviderAction::Mount(action) => validate_mount_action(action),
+        ProviderAction::Mount(action) => validate_mount_action(action, graph),
         ProviderAction::Filesystem(FilesystemAction::Resize {
             filesystem,
             new_size,
@@ -77,7 +77,7 @@ pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> V
 }
 
 /// Rejects ambiguous lexical paths without resolving filesystem state or symbolic links.
-fn validate_mount_action(action: &MountAction) -> Vec<Diagnostic> {
+fn validate_mount_action(action: &MountAction, graph: &NodeGraph) -> Vec<Diagnostic> {
     let (target, context, source) = match action {
         MountAction::Mount {
             target,
@@ -96,7 +96,7 @@ fn validate_mount_action(action: &MountAction) -> Vec<Diagnostic> {
     if let Some(MountSource::Bind(source)) = source {
         paths.push((source.as_path(), "mount.source.bind"));
     }
-    paths
+    let mut diagnostics: Vec<_> = paths
         .into_iter()
         .filter(|(path, _)| !valid_mount_path(path))
         .map(|(path, field)| Diagnostic {
@@ -111,7 +111,31 @@ fn validate_mount_action(action: &MountAction) -> Vec<Diagnostic> {
             evidence: None,
             suggested_remedy: None,
         })
-        .collect()
+        .collect();
+    // Persistent entries need a compatible object, but do not require runtime activation.
+    if let MountAction::Persist { entry } = action
+        && let Some(node) = crate::contract::mount_source_node(&entry.source)
+        && let Some(value) = graph.node(&node)
+        && !matches!(
+            (&entry.source, &value.kind.kind),
+            (MountSource::Filesystem(_), NodeKind::Filesystem { .. })
+                | (
+                    MountSource::BtrfsSubvolume(_),
+                    NodeKind::BtrfsSubvolume { .. }
+                )
+                | (MountSource::ZfsDataset(_), NodeKind::ZfsDataset { .. })
+        )
+    {
+        diagnostics.push(Diagnostic {
+            code: "mount.action.incompatible_source".to_owned(),
+            severity: DiagnosticSeverity::Error,
+            subjects: vec![DiagnosticSubject::Node(node)],
+            message: "persistent mount source has an incompatible node kind".to_owned(),
+            evidence: None,
+            suggested_remedy: None,
+        });
+    }
+    diagnostics
 }
 
 /// Keeps mount resource identity independent of cwd, parent traversal, and invalid OS paths.

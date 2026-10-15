@@ -1179,6 +1179,60 @@ mod tests {
         assert_eq!(current.mounts.entries.len(), 0);
     }
 
+    /// Persistent configuration cannot refer to missing objects or objects of the wrong kind.
+    #[test]
+    fn persistent_mount_requires_an_existing_compatible_source() {
+        let (current, lv, filesystem) = current_with_lv_and_filesystem();
+        for source in [
+            MountSource::Filesystem(lv),
+            MountSource::Filesystem(NodeId::new()),
+            MountSource::BtrfsSubvolume(filesystem),
+            MountSource::ZfsDataset(filesystem),
+        ] {
+            let fragment = mount_fragment(
+                lv,
+                vec![MountAction::Persist {
+                    entry: storage_core::model::MountEntry {
+                        source,
+                        target: PathBuf::from("/data"),
+                        options: Vec::new(),
+                        context: MountContext::Host,
+                    },
+                }],
+            );
+            assert!(compose_plan(&current, vec![fragment]).is_err());
+        }
+        let fragment = mount_fragment(
+            lv,
+            vec![MountAction::Persist {
+                entry: storage_core::model::MountEntry {
+                    source: MountSource::Filesystem(filesystem),
+                    target: PathBuf::from("/data"),
+                    options: Vec::new(),
+                    context: MountContext::Host,
+                },
+            }],
+        );
+        let plan = compose_plan(&current, vec![fragment]).unwrap_or_else(|error| {
+            panic!("persist compatible source without activation: {error}")
+        });
+        assert!(
+            plan.actions()[0]
+                .informational_contract
+                .prerequisites
+                .contains(&ActionPrerequisite::NodeExists(filesystem))
+        );
+        assert!(
+            plan.actions()[0]
+                .informational_contract
+                .affected_resources
+                .iter()
+                .any(|access| access.resource
+                    == storage_provider::ActionResource::Node(filesystem)
+                    && access.mode == storage_provider::ResourceAccessMode::Read)
+        );
+    }
+
     /// Wraps runtime actions with stable local identities for mount-order scenarios.
     fn mount_fragment(subject: NodeId, operations: Vec<MountAction>) -> PlanFragment {
         PlanFragment {

@@ -95,6 +95,9 @@ Plan schema 3 uses separate runtime and persistent mount lists. Action semantics
 removes the redundant `MountEntry.persistent` flag: `MountAction::Persist` and
 `MountEffect::SetPersistent` select persistent configuration themselves. Stale
 entry flags are rejected during deserialization.
+Action semantics 5 requires typed persistent mount sources to exist and have a
+compatible node kind, with read access coordinated against source mutations.
+Persistence alone does not require the source to be active or mounted.
 There are no run statuses, library handles, authorizations, or credential contents.
 
 `capture` validates the description before saving. `from_json` checks the document
