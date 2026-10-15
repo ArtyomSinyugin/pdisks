@@ -151,8 +151,8 @@ fn installed_native_provider_abi_matrix_matches_manifest() {
     println!("\nNative provider ABI/model matrix");
     println!("manifest: {}", path.display());
     println!(
-        "{:<22} {:<9} {:<28} {:<8} {}",
-        "provider", "backend", "responsibility", "symbols", "model contract"
+        "{:<22} {:<9} {:<28} {:<8} model contract",
+        "provider", "backend", "responsibility", "symbols"
     );
     println!("{}", "-".repeat(120));
 
@@ -245,8 +245,8 @@ fn native_filesystem_capability_matrix_is_available() {
 
     println!("\nlibblockdev-fs capability matrix");
     println!(
-        "{:<10} {:<12} {:<12} {:<12} {:<12} {}",
-        "filesystem", "create", "check", "repair", "set-label", "resize"
+        "{:<10} {:<12} {:<12} {:<12} {:<12} resize",
+        "filesystem", "create", "check", "repair", "set-label"
     );
     println!("{}", "-".repeat(88));
     for fs in &capabilities {

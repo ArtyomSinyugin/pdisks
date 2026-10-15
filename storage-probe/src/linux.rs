@@ -67,6 +67,14 @@ pub struct NativeMapperProvider<'a> {
     cryptsetup: &'a RegisteredBackend,
 }
 
+/// Assembled state plus raw endpoints, content signatures, and mapper observations for upper layers.
+type NativeObservations = (
+    ProviderState,
+    Vec<UdevBlockEntry>,
+    Vec<storage_provider::BlkidEntry>,
+    Vec<storage_provider::DevmapperEntry>,
+);
+
 /// Native adapter extending mapper state with loop, swap, and multipath data.
 pub struct NativeRuntimeProvider<'a> {
     mapper: NativeMapperProvider<'a>,
@@ -235,15 +243,7 @@ impl NativeMapperProvider<'_> {
     /// Probes mapper sources and retains raw observations for upper layers.
     fn probe_with_observations(
         &self,
-    ) -> std::result::Result<
-        (
-            ProviderState,
-            Vec<UdevBlockEntry>,
-            Vec<storage_provider::BlkidEntry>,
-            Vec<storage_provider::DevmapperEntry>,
-        ),
-        ProviderProbeError,
-    > {
+    ) -> std::result::Result<NativeObservations, ProviderProbeError> {
         let (mut state, endpoints, signatures) = self.block.probe_with_observations()?;
         let luks_devices = signatures
             .iter()
@@ -295,15 +295,7 @@ impl NativeRuntimeProvider<'_> {
     /// Probes runtime sources and retains raw observations for storage layers.
     fn probe_with_observations(
         &self,
-    ) -> std::result::Result<
-        (
-            ProviderState,
-            Vec<UdevBlockEntry>,
-            Vec<storage_provider::BlkidEntry>,
-            Vec<storage_provider::DevmapperEntry>,
-        ),
-        ProviderProbeError,
-    > {
+    ) -> std::result::Result<NativeObservations, ProviderProbeError> {
         let (mut state, endpoints, signatures, mappings) = self.mapper.probe_with_observations()?;
         let loops = endpoints
             .iter()
