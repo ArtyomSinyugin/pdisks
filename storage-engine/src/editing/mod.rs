@@ -27,4 +27,7 @@ pub use preview::{PreviewState, PreviewStatus};
 
 pub use session::{EditError, EditReceipt, PlanEdit, PlanSession};
 
-pub use document::{PREVIEW_SCHEMA_VERSION, PreviewDocument};
+pub use document::{
+    DRAFT_SCHEMA_VERSION, DraftDocument, DraftDocumentError, MAX_DRAFT_JSON_BYTES,
+    MAX_DRAFT_OPERATIONS, PREVIEW_SCHEMA_VERSION, PreviewDocument,
+};

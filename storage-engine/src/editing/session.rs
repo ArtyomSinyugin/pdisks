@@ -9,8 +9,8 @@ use uuid::Uuid;
 use crate::{HistoricalBaseline, ProtectedScope};
 
 use super::{
-    DraftBuildError, DraftRevision, OperationId, PlanDraft, PlanOperation, PlanRequest,
-    PreviewState, build_preview,
+    DraftBuildError, DraftDocument, DraftDocumentError, DraftRevision, OperationId, PlanDraft,
+    PlanOperation, PlanRequest, PreviewState, build_preview,
 };
 
 /// One user command; valid edits may deliberately leave an invalid, editable plan.
@@ -121,6 +121,27 @@ impl PlanSession {
             baseline: Arc::new(baseline),
             draft,
             preview,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        })
+    }
+
+    /// Opens bounded editable inputs and recomputes the current preview, preserving stable IDs.
+    /// Semantic plan failures remain editable; persisted forecasts and history are never trusted.
+    pub fn from_document(document: DraftDocument) -> Result<Self, DraftDocumentError> {
+        document.validate()?;
+        let result = build_preview(&document.baseline, &document.draft);
+        if let Err(error) = &result
+            && error.is_internal()
+        {
+            return Err(DraftDocumentError::Inputs(Box::new(error.clone())));
+        }
+        Ok(Self {
+            id: document.session_id,
+            revision: document.revision,
+            baseline: Arc::new(document.baseline),
+            draft: document.draft,
+            preview: result.into(),
             undo: Vec::new(),
             redo: Vec::new(),
         })

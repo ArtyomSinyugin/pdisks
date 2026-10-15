@@ -248,7 +248,10 @@ fn build_fragments(
 }
 
 /// Validates untrusted draft identity and input references before lowering can allocate actions.
-fn validate_draft(baseline: &HistoricalBaseline, draft: &PlanDraft) -> Result<(), DraftBuildError> {
+pub(super) fn validate_draft(
+    baseline: &HistoricalBaseline,
+    draft: &PlanDraft,
+) -> Result<(), DraftBuildError> {
     let mut diagnostics = Vec::new();
     let mut issue = |operation, code, message| {
         diagnostics.push(OperationDiagnostic {
