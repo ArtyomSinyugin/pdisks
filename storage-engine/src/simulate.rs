@@ -480,6 +480,37 @@ mod tests {
 
     use super::*;
 
+    /// An empty plan preserves observations without inventing persistent configuration.
+    #[test]
+    fn empty_plan_preserves_observed_configuration() {
+        let current = CurrentState {
+            graph: NodeGraph::new(),
+            mounts: MountState {
+                entries: vec![ObservedMount {
+                    source: MountSource::Tmpfs,
+                    target: PathBuf::from("/run"),
+                    options: vec!["nosuid".to_owned()],
+                    context: MountContext::Host,
+                }],
+            },
+            environment: Environment {
+                host: SystemEnvironment::default(),
+                target: None,
+            },
+            diagnostics: Vec::new(),
+        };
+        let before = current.clone();
+        let plan = crate::compose_plan(&current, Vec::new())
+            .unwrap_or_else(|error| panic!("compose empty plan: {error}"));
+        let result = simulate_plan(&current, &plan)
+            .unwrap_or_else(|error| panic!("simulate empty plan: {error}"));
+        assert_eq!(result.projection.graph(), &current.graph);
+        assert_eq!(result.projection.runtime_mounts(), current.mounts.entries);
+        assert!(result.projection.persistent_mounts().is_empty());
+        assert!(result.steps.is_empty());
+        assert_eq!(current, before);
+    }
+
     /// Conflicting option order and repeated overrides must not prove the requested mount goal.
     #[test]
     fn mount_goals_preserve_option_order_and_multiplicity() {
