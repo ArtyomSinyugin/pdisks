@@ -20,8 +20,12 @@ use thiserror::Error;
 use crate::{
     ActionDependency, ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError,
     ExecutionPlan, FragmentId, GoalAspect, GoalStatus, PlanSimulationError, PlannedAction,
-    PrerequisiteCheck, Projection, ProtectedAspect, ProtectedScope,
-    simulate_plan_for_goal_with_policy,
+    PrerequisiteCheck, ProtectedAspect, ProtectedScope, simulate_plan_for_goal_with_policy,
+};
+
+use crate::{
+    effects::simulate_action, prerequisites::evaluate_prerequisites,
+    simulation_evidence::SimulationEvidence,
 };
 
 /// Mutable action retained only while a plan is being composed.
@@ -432,7 +436,8 @@ fn runtime_mount_target(action: &ProviderAction) -> Option<(&Path, &MountContext
 /// Binds a missing declared output in the consumer's current predecessor context.
 /// Already replayed actions cannot supply a revoked guarantee by being retried implicitly.
 fn bind_contextual_outputs(
-    projection: &Projection,
+    desired: &DesiredState,
+    evidence: &SimulationEvidence,
     action: &DraftAction,
     actions: &[DraftAction],
     emitted: &HashMap<ActionId, ActionContract>,
@@ -447,7 +452,7 @@ fn bind_contextual_outputs(
         return Ok(false);
     }
     let context = ActionDescriptionContext {
-        graph: projection.graph(),
+        graph: &desired.graph,
     };
     let contract = describe_action(&action.operation, context);
     let providers = actions
@@ -459,8 +464,11 @@ fn bind_contextual_outputs(
         if !contract.prerequisites.contains(&requirement.prerequisite) {
             return Err(CompositionError::RequirementNotInContract { action: action.id });
         }
-        let check =
-            projection.evaluate_prerequisites(std::slice::from_ref(&requirement.prerequisite));
+        let check = evaluate_prerequisites(
+            desired,
+            evidence,
+            std::slice::from_ref(&requirement.prerequisite),
+        );
         if matches!(check[0].status, crate::CheckStatus::Satisfied(_)) {
             continue;
         }
@@ -653,8 +661,8 @@ fn simulate_order(
 ) -> Result<AnalysedOrder, CompositionError> {
     loop {
         let order = topological_order(actions.len(), dependencies)?;
-        let mut projection = Projection::from_current(current)
-            .with_capacity_evidence(capacity_evidence)
+        let mut desired = DesiredState::from_current(current);
+        let mut evidence = SimulationEvidence::new(capacity_evidence)
             .map_err(CompositionError::CapacityEvidence)?;
         let mut contracts = HashMap::new();
         let mut checks = HashMap::new();
@@ -662,7 +670,8 @@ fn simulate_order(
         for id in order {
             let action = &actions[id.get() as usize];
             if bind_contextual_outputs(
-                &projection,
+                &desired,
+                &evidence,
                 action,
                 actions,
                 &contracts,
@@ -672,7 +681,7 @@ fn simulate_order(
                 rebound = true;
                 break;
             }
-            match projection.simulate_action(&action.operation) {
+            match simulate_action(&mut desired, &mut evidence, &action.operation) {
                 Ok(result) => {
                     contracts.insert(id, result.contract);
                     checks.insert(id, result.checks);
@@ -859,7 +868,7 @@ fn output_satisfies(output: &ActionOutput, prerequisite: &ActionPrerequisite) ->
     match (output, prerequisite) {
         (ActionOutput::Node { id, .. }, ActionPrerequisite::NodeExists(node)) => id == node,
         (ActionOutput::Node { id, spec }, ActionPrerequisite::NodeKind { node, expected }) => {
-            id == node && crate::projection::matches_kind(&spec.kind, *expected)
+            id == node && crate::prerequisites::matches_kind(&spec.kind, *expected)
         }
         (
             ActionOutput::FilesystemCheckPassed(filesystem),
@@ -1024,6 +1033,7 @@ pub enum CompositionError {
 
 #[cfg(test)]
 mod tests {
+    use crate::simulation_evidence::TestSimulation;
     use std::path::PathBuf;
 
     use storage_core::model::{
@@ -1113,7 +1123,7 @@ mod tests {
         }
     }
 
-    /// Step-local invalidations identify their action while the projection keeps one cumulative ledger.
+    /// Step-local invalidations identify their action while the result retains cumulative evidence.
     #[test]
     fn simulation_trace_retains_observation_invalidations() {
         let (current, subject) = current_with_vg();
@@ -1152,7 +1162,20 @@ mod tests {
         for step in &result.steps {
             assert_eq!(step.invalidated_facts, vec![invalidation.clone()]);
         }
-        assert_eq!(result.projection.invalidated_facts(), &[invalidation]);
+        assert!(
+            result
+                .evidence
+                .is_observation_stale(&invalidation.scope, invalidation.kind)
+        );
+        assert!(
+            !result
+                .evidence
+                .is_observation_stale(&invalidation.scope, storage_provider::FactKind::Geometry,)
+        );
+        assert_eq!(
+            result.evidence.invalidated_facts.as_slice(),
+            &[invalidation]
+        );
         assert_eq!(current.mounts.entries.len(), 0);
     }
 
@@ -1240,7 +1263,7 @@ mod tests {
             let simulation = crate::simulate_plan(&current, &plan)
                 .unwrap_or_else(|error| panic!("replay nested mount changes: {error}"));
             assert_eq!(
-                simulation.projection.runtime_mounts().len(),
+                simulation.desired.mounts.runtime.as_slice().len(),
                 if unmount { 0 } else { 2 }
             );
             fragment.dependencies.push(FragmentDependency {
@@ -1306,7 +1329,7 @@ mod tests {
             assert_eq!(ordered, if mount_parent { vec![1, 0] } else { vec![0, 1] });
             let simulation = crate::simulate_plan(&current, &plan)
                 .unwrap_or_else(|error| panic!("replay mixed mount changes: {error}"));
-            assert_eq!(simulation.projection.runtime_mounts().len(), 1);
+            assert_eq!(simulation.desired.mounts.runtime.as_slice().len(), 1);
         }
     }
 
@@ -1350,7 +1373,7 @@ mod tests {
         let simulation = crate::simulate_plan(&current, &plan)
             .unwrap_or_else(|error| panic!("replay repeated mount phases: {error}"));
         assert_eq!(simulation.steps.len(), 6);
-        assert_eq!(simulation.projection.runtime_mounts().len(), 2);
+        assert_eq!(simulation.desired.mounts.runtime.as_slice().len(), 2);
     }
 
     /// Lexical siblings and different namespaces do not acquire false parent/child edges.
@@ -1636,7 +1659,7 @@ mod tests {
         let simulation = crate::simulate_plan(&current, &plan)
             .unwrap_or_else(|error| panic!("simulate cross-provider plan: {error}"));
         let goal = DesiredState {
-            graph: simulation.projection.graph().clone(),
+            graph: simulation.desired.graph.clone(),
             mounts: MountSpec::default(),
             boot: BootSpec::Unmanaged,
             intents: Vec::new(),
@@ -1998,13 +2021,13 @@ mod tests {
         let simulation = crate::simulate_plan(&current, &plan)
             .unwrap_or_else(|error| panic!("replay mounted ext4 shrink: {error}"));
         assert_eq!(
-            simulation.projection.runtime_mounts(),
-            current.mounts.entries
+            simulation.desired.mounts.runtime.as_slice(),
+            DesiredState::from_current(&current).mounts.runtime
         );
         assert_eq!(
             simulation
-                .projection
-                .graph()
+                .desired
+                .graph
                 .node(&filesystem)
                 .map(|node| node.kind.size),
             Some(Some(Bytes::new(60)))
@@ -2205,12 +2228,20 @@ mod tests {
                 .unwrap_or_else(|error| panic!("compose released capacity reuse: {error}"));
             let simulation = crate::simulate_plan_with_evidence(&current, &plan, &evidence)
                 .unwrap_or_else(|error| panic!("replay released capacity reuse: {error}"));
-            let checks = simulation.projection.evaluate_prerequisites(&[
-                ActionPrerequisite::CapacityAvailable {
+            let mut replayed = TestSimulation::from_current(&current)
+                .with_capacity_evidence(&evidence)
+                .unwrap_or_else(|error| panic!("initialize replay evidence: {error}"));
+            for action in plan.ordered_actions() {
+                replayed
+                    .simulate_action(&action.operation)
+                    .unwrap_or_else(|error| panic!("replay allocation action: {error}"));
+            }
+            assert_eq!(replayed.desired, simulation.desired);
+            let checks =
+                replayed.evaluate_prerequisites(&[ActionPrerequisite::CapacityAvailable {
                     domain: AllocationDomain::LvmVolumeGroup(vg),
                     amount: Some(AllocationQuantity::new(1)),
-                },
-            ]);
+                }]);
             assert!(matches!(
                 checks[0].status,
                 crate::CheckStatus::Violated { .. }
@@ -2270,8 +2301,17 @@ mod tests {
             .unwrap_or_else(|error| panic!("compose temporary LV: {error}"));
         let simulation = crate::simulate_plan_with_evidence(&current, &plan, &evidence)
             .unwrap_or_else(|error| panic!("replay temporary LV: {error}"));
-        assert!(simulation.projection.graph().node(&lv).is_none());
-        let checks = simulation.projection.evaluate_prerequisites(&[
+        assert!(simulation.desired.graph.node(&lv).is_none());
+        let mut replayed = TestSimulation::from_current(&current)
+            .with_capacity_evidence(&evidence)
+            .unwrap_or_else(|error| panic!("initialize replay evidence: {error}"));
+        for action in plan.ordered_actions() {
+            replayed
+                .simulate_action(&action.operation)
+                .unwrap_or_else(|error| panic!("replay allocation action: {error}"));
+        }
+        assert_eq!(replayed.desired, simulation.desired);
+        let checks = replayed.evaluate_prerequisites(&[
             ActionPrerequisite::CapacityAvailable {
                 domain: AllocationDomain::LvmVolumeGroup(vg),
                 amount: Some(AllocationQuantity::new(100)),
@@ -2356,7 +2396,7 @@ mod tests {
                 });
             }
             for operation in operations {
-                let mut projection = Projection::from_current(&baseline)
+                let mut projection = TestSimulation::from_current(&baseline)
                     .with_capacity_evidence(&[CapacityEvidence {
                         domain: domain.clone(),
                         available: AllocationQuantity::new(100),
@@ -2401,7 +2441,7 @@ mod tests {
             .graph
             .replace_existing(lv, node)
             .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
-        let mut projection = Projection::from_current(&current)
+        let mut projection = TestSimulation::from_current(&current)
             .with_capacity_evidence(&[CapacityEvidence {
                 domain: AllocationDomain::LvmVolumeGroup(vg),
                 available: AllocationQuantity::new(1),

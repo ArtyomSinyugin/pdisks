@@ -1,611 +1,147 @@
-//! Pure projection of trusted provider effects.
+//! Atomic interpretation of provider effects on DesiredState.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+use crate::prerequisites::{evaluate_prerequisites, has_mounted_descendant, mount_at};
+use crate::simulation_evidence::{
+    ActionSimulationError, CheckStatus, EffectApplicationError, SimulatedAction,
+    SimulationEvidence, apply_allocation_effects, apply_outputs, invalidate_filesystem_checks,
+    invalidate_observations, mark_persistent_target,
 };
-
-use serde::{Deserialize, Serialize};
-
 use storage_core::model::{
-    CurrentState, DependencyKind, Diagnostic, DiagnosticSeverity, FilesystemKind, MountContext,
-    MountEntry, MountSource, Node, NodeFacts, NodeGraph, NodeId, NodeKind, ObservedMount,
+    DesiredState, DiagnosticSeverity, FilesystemKind, MountEntry, MountSource, Node, NodeFacts,
+    NodeId, NodeKind,
 };
 use storage_provider::{
-    ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite, AllocationDomain,
-    AllocationEffect, AllocationQuantity, BlockInterfaceAccess, FactInvalidation, FactKind,
-    FactScope, GraphEffect, MountEffect, NodeKindClass, PredictedEffect, ProviderAction,
-    describe_action, validate_provider_action,
+    ActionDescriptionContext, FactInvalidation, GraphEffect, MountEffect, PredictedEffect,
+    ProviderAction, describe_action, validate_provider_action,
 };
-use thiserror::Error;
 
-/// Mutable simulation state derived from an immutable observed snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Projection {
-    graph: NodeGraph,
-    runtime_mounts: Vec<ObservedMount>,
-    persistent_mounts: Vec<MountEntry>,
-    projected_persistent_targets: Vec<(PathBuf, MountContext)>,
-    activations: HashMap<NodeId, bool>,
-    block_interfaces: HashMap<NodeId, BlockInterfaceAccess>,
-    available_capacity: HashMap<AllocationDomain, AllocationQuantity>,
-    projected_allocations: HashSet<AllocationDomain>,
-    projected_graph_nodes: Vec<NodeId>,
-    /// Conditional clean-check guarantees supplied by preceding forced checks.
-    checked_filesystems: HashSet<NodeId>,
-    /// Whether runtime mount evidence includes effects rather than only the snapshot.
-    projected_runtime_mounts: bool,
-    /// Baseline observation aspects invalidated by successful projected actions.
-    invalidated_facts: Vec<FactInvalidation>,
+/// Describes, checks, and conditionally projects one typed provider action.
+///
+/// Unknown checks are retained in the result and permit a conditional
+/// projection. A known violation prevents the effect from being applied.
+pub(crate) fn simulate_action(
+    desired: &mut DesiredState,
+    evidence: &mut SimulationEvidence,
+    action: &ProviderAction,
+) -> Result<SimulatedAction, ActionSimulationError> {
+    let diagnostics = validate_provider_action(action, &desired.graph);
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    {
+        return Err(ActionSimulationError::Validation { diagnostics });
+    }
+    let contract = describe_action(
+        action,
+        ActionDescriptionContext {
+            graph: &desired.graph,
+        },
+    );
+    let checks = evaluate_prerequisites(desired, evidence, &contract.prerequisites);
+    if checks
+        .iter()
+        .any(|check| matches!(check.status, CheckStatus::Violated { .. }))
+    {
+        return Err(ActionSimulationError::PrerequisitesViolated { checks });
+    }
+    let invalidated_facts = apply_effect_with_invalidations(
+        desired,
+        evidence,
+        &contract.predicted_effect,
+        &contract.invalidated_facts,
+    )?;
+    apply_outputs(evidence, &contract.provided_outputs);
+    Ok(SimulatedAction {
+        contract,
+        checks,
+        invalidated_facts,
+    })
 }
 
-impl Projection {
-    /// Creates an isolated projection from observed state.
-    pub fn from_current(current: &CurrentState) -> Self {
-        Self {
-            graph: current.graph.clone(),
-            runtime_mounts: current.mounts.entries.clone(),
-            persistent_mounts: Vec::new(),
-            projected_persistent_targets: Vec::new(),
-            activations: HashMap::new(),
-            block_interfaces: HashMap::new(),
-            available_capacity: HashMap::new(),
-            projected_allocations: HashSet::new(),
-            projected_graph_nodes: Vec::new(),
-            checked_filesystems: HashSet::new(),
-            projected_runtime_mounts: false,
-            invalidated_facts: Vec::new(),
-        }
-    }
+/// Atomically applies one trusted effect to configuration and evidence for isolated tests.
+#[cfg(test)]
+pub(crate) fn apply_effect(
+    desired: &mut DesiredState,
+    evidence: &mut SimulationEvidence,
+    effect: &PredictedEffect,
+) -> Result<(), EffectApplicationError> {
+    apply_effect_with_invalidations(desired, evidence, effect, &[]).map(|_| ())
+}
 
-    /// Adds provider evidence about baseline free capacity.
-    pub fn with_capacity_evidence(
-        mut self,
-        evidence: &[CapacityEvidence],
-    ) -> Result<Self, CapacityEvidenceError> {
-        for item in evidence {
-            if self
-                .available_capacity
-                .insert(item.domain.clone(), item.available)
-                .is_some()
-            {
-                return Err(CapacityEvidenceError::DuplicateDomain(item.domain.clone()));
-            }
-        }
-        Ok(self)
-    }
+/// Publishes configuration and evidence only after every effect and invariant succeeds.
+fn apply_effect_with_invalidations(
+    desired: &mut DesiredState,
+    evidence: &mut SimulationEvidence,
+    effect: &PredictedEffect,
+    invalidations: &[FactInvalidation],
+) -> Result<Vec<FactInvalidation>, EffectApplicationError> {
+    let mut next_desired = desired.clone();
+    let mut next_evidence = evidence.clone();
+    let invalidated_facts =
+        invalidate_observations(&next_desired, &mut next_evidence, invalidations);
+    invalidate_filesystem_checks(&next_desired, &mut next_evidence, invalidations);
+    apply_graph_effects(&mut next_desired, &mut next_evidence, &effect.graph)?;
+    apply_mount_effects(&mut next_desired, &mut next_evidence, &effect.mounts)?;
+    apply_allocation_effects(&mut next_evidence, &effect.allocations)?;
+    next_desired.graph.validate_structure()?;
+    *desired = next_desired;
+    *evidence = next_evidence;
+    Ok(invalidated_facts)
+}
 
-    /// Returns the effective graph after all successfully applied effects.
-    /// Retained `NodeFacts` are historical observations qualified by `is_observation_stale`.
-    pub const fn graph(&self) -> &NodeGraph {
-        &self.graph
-    }
-
-    /// Returns observation aspects requiring fresh evidence, without duplicating historical facts.
-    pub fn invalidated_facts(&self) -> &[FactInvalidation] {
-        &self.invalidated_facts
-    }
-
-    /// Reports invalidation of an observation aspect; observation availability is checked separately.
-    pub fn is_observation_stale(&self, scope: &FactScope, kind: FactKind) -> bool {
-        self.invalidated_facts
-            .iter()
-            .any(|invalidation| invalidation.scope == *scope && invalidation.kind == kind)
-    }
-
-    /// Returns effective runtime mounts without mixing in persistent entries.
-    pub fn runtime_mounts(&self) -> &[ObservedMount] {
-        &self.runtime_mounts
-    }
-
-    /// Returns persistent entries explicitly established by simulated effects.
-    ///
-    /// The baseline is unknown because `CurrentState` does not currently carry
-    /// persistent mount configuration.
-    pub fn persistent_mounts(&self) -> &[MountEntry] {
-        &self.persistent_mounts
-    }
-
-    /// Reports whether a simulated effect established knowledge about one persistent target.
-    pub fn persistent_mount_was_projected(&self, target: &Path, context: &MountContext) -> bool {
-        self.projected_persistent_targets
-            .iter()
-            .any(|candidate| candidate.0 == target && candidate.1 == *context)
-    }
-
-    /// Returns a simulated activation request for a node, when one was applied.
-    pub fn activation(&self, node: &NodeId) -> Option<bool> {
-        self.activations.get(node).copied()
-    }
-
-    /// Returns a block interface guaranteed by a simulated predecessor.
-    pub fn block_interface(&self, node: &NodeId) -> Option<BlockInterfaceAccess> {
-        self.block_interfaces.get(node).copied()
-    }
-
-    /// Evaluates action prerequisites against the current read-only projection.
-    pub fn evaluate_prerequisites(
-        &self,
-        prerequisites: &[ActionPrerequisite],
-    ) -> Vec<PrerequisiteCheck> {
-        prerequisites
-            .iter()
-            .cloned()
-            .map(|prerequisite| PrerequisiteCheck {
-                status: self.evaluate_prerequisite(&prerequisite),
-                prerequisite,
-            })
-            .collect()
-    }
-
-    /// Describes, checks, and conditionally projects one typed provider action.
-    ///
-    /// Unknown checks are retained in the result and permit a conditional
-    /// projection. A known violation prevents the effect from being applied.
-    pub fn simulate_action(
-        &mut self,
-        action: &ProviderAction,
-    ) -> Result<SimulatedAction, ActionSimulationError> {
-        let diagnostics = validate_provider_action(action, &self.graph);
-        if diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
-        {
-            return Err(ActionSimulationError::Validation { diagnostics });
-        }
-        let contract = describe_action(action, ActionDescriptionContext { graph: &self.graph });
-        let checks = self.evaluate_prerequisites(&contract.prerequisites);
-        if checks
-            .iter()
-            .any(|check| matches!(check.status, CheckStatus::Violated { .. }))
-        {
-            return Err(ActionSimulationError::PrerequisitesViolated { checks });
-        }
-        let invalidated_facts = self.apply_effect_with_invalidations(
-            &contract.predicted_effect,
-            &contract.invalidated_facts,
-        )?;
-        self.apply_outputs(&contract.provided_outputs);
-        Ok(SimulatedAction {
-            contract,
-            checks,
-            invalidated_facts,
-        })
-    }
-
-    /// Atomically applies one trusted predicted effect to this projection.
-    pub fn apply_effect(&mut self, effect: &PredictedEffect) -> Result<(), EffectApplicationError> {
-        self.apply_effect_with_invalidations(effect, &[])
-            .map(|_| ())
-    }
-
-    /// Publishes effects and observation invalidations together only after every check succeeds.
-    fn apply_effect_with_invalidations(
-        &mut self,
-        effect: &PredictedEffect,
-        invalidations: &[FactInvalidation],
-    ) -> Result<Vec<FactInvalidation>, EffectApplicationError> {
-        let mut candidate = self.clone();
-        let invalidated_facts = candidate.invalidate_observations(invalidations);
-        candidate.invalidate_filesystem_checks(invalidations);
-        candidate.apply_graph_effects(&effect.graph)?;
-        candidate.apply_mount_effects(&effect.mounts)?;
-        candidate.apply_allocation_effects(&effect.allocations)?;
-        candidate.graph.validate_structure()?;
-        *self = candidate;
-        Ok(invalidated_facts)
-    }
-
-    /// Evaluates one prerequisite without changing projected state.
-    fn evaluate_prerequisite(&self, prerequisite: &ActionPrerequisite) -> CheckStatus {
-        match prerequisite {
-            ActionPrerequisite::NodeExists(node) => match self.graph.node(node) {
-                Some(_) => self.satisfied_for_node(*node),
-                None => CheckStatus::Violated {
-                    reason: "referenced node is absent".to_owned(),
-                },
-            },
-            ActionPrerequisite::NodeKind { node, expected } => {
-                let Some(node_value) = self.graph.node(node) else {
-                    return CheckStatus::Violated {
-                        reason: "referenced node is absent".to_owned(),
-                    };
-                };
-                if matches_kind(&node_value.kind.kind, *expected) {
-                    self.satisfied_for_node(*node)
-                } else {
-                    CheckStatus::Violated {
-                        reason: "node kind does not satisfy the action contract".to_owned(),
-                    }
+/// Applies graph changes to an unpublished candidate desired state.
+fn apply_graph_effects(
+    desired: &mut DesiredState,
+    evidence: &mut SimulationEvidence,
+    effects: &[GraphEffect],
+) -> Result<(), EffectApplicationError> {
+    for effect in effects {
+        match effect {
+            GraphEffect::InsertNode { id, spec } => {
+                if desired.graph.node(id).is_some() {
+                    return Err(EffectApplicationError::DuplicateNode(*id));
                 }
+                desired.graph.insert_new(
+                    *id,
+                    Node {
+                        kind: spec.clone(),
+                        size: NodeFacts::default(),
+                    },
+                )?;
+                evidence.projected_graph_nodes.push(*id);
             }
-            ActionPrerequisite::NoUnexpectedConsumers(node) => {
-                if self.graph.node(node).is_none() {
-                    CheckStatus::Violated {
-                        reason: "referenced node is absent".to_owned(),
-                    }
-                } else if self
-                    .graph
-                    .dependencies()
-                    .any(|dependency| dependency.from == *node)
-                {
-                    CheckStatus::Violated {
-                        reason: "node still has an upper-layer consumer".to_owned(),
-                    }
-                } else {
-                    self.satisfied_for_node(*node)
+            GraphEffect::RemoveNode(node) => {
+                if desired.graph.remove_node(node).is_none() {
+                    return Err(EffectApplicationError::MissingNode(*node));
                 }
+                evidence
+                    .projected_graph_nodes
+                    .retain(|candidate| candidate != node);
+                evidence.activations.remove(node);
+                evidence.block_interfaces.remove(node);
             }
-            ActionPrerequisite::Writable(node) => self.evaluate_endpoint(*node, true),
-            ActionPrerequisite::MountSourceAvailable(source) => self.evaluate_mount_source(source),
-            ActionPrerequisite::FilesystemUnmounted(filesystem) => {
-                if self.graph.node(filesystem).is_none() {
-                    CheckStatus::Violated {
-                        reason: "referenced filesystem is absent".to_owned(),
-                    }
-                } else if self
-                    .runtime_mounts
-                    .iter()
-                    .any(|mount| mount.source == MountSource::Filesystem(*filesystem))
-                {
-                    CheckStatus::Violated {
-                        reason: "filesystem is still mounted in an observed namespace".to_owned(),
-                    }
-                } else if self.runtime_mounts.iter().any(|mount| {
-                    matches!(mount.source, MountSource::Bind(_) | MountSource::Other(_))
-                }) {
-                    CheckStatus::Unknown { required_evidence: "resolve bind and unsupported mount sources before offline filesystem work".to_owned() }
-                } else {
-                    CheckStatus::Satisfied(self.mount_evidence())
-                }
+            GraphEffect::SetNodeSize { node, size } => {
+                update_node(desired, evidence, *node, "set node size", |value| {
+                    value.kind.size = Some(*size);
+                    true
+                })?;
             }
-            ActionPrerequisite::FilesystemCheckPassed(filesystem) => {
-                if self.checked_filesystems.contains(filesystem) {
-                    CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
-                } else {
-                    CheckStatus::Violated {
-                        reason:
-                            "filesystem shrink requires a preceding fresh forced read-only check"
-                                .to_owned(),
-                    }
-                }
+            GraphEffect::InvalidateNodeSize(node) => {
+                update_node(desired, evidence, *node, "invalidate node size", |value| {
+                    value.kind.size = None;
+                    true
+                })?;
             }
-            ActionPrerequisite::FilesystemMinimumSize { .. } => CheckStatus::Unknown {
-                required_evidence:
-                    "provider evidence that filesystem content fits the requested shrink target"
-                        .to_owned(),
-            },
-            ActionPrerequisite::DestructiveApproval(_) => CheckStatus::Unknown {
-                required_evidence: "explicit destructive-scope approval".to_owned(),
-            },
-            ActionPrerequisite::ExtentAvailable { .. } => CheckStatus::Unknown {
-                required_evidence: "provider allocation and alignment evidence".to_owned(),
-            },
-            ActionPrerequisite::DistinctNodes(nodes) => {
-                let distinct = nodes.iter().copied().collect::<HashSet<_>>();
-                if distinct.len() == nodes.len() {
-                    CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
-                } else {
-                    CheckStatus::Violated {
-                        reason: "node list contains duplicate identities".to_owned(),
-                    }
-                }
-            }
-            ActionPrerequisite::DependentsFitWithin { node, size } => {
-                self.evaluate_dependent_sizes(*node, *size)
-            }
-            ActionPrerequisite::BackingSizeAtLeast { node, size } => {
-                self.evaluate_backing_size(*node, *size)
-            }
-            ActionPrerequisite::CapacityAvailable { domain, amount } => {
-                self.evaluate_capacity(domain, *amount)
-            }
-            ActionPrerequisite::MountTargetAvailable { target, context } => {
-                if self.mount_at(target, context).is_some() {
-                    CheckStatus::Violated {
-                        reason: "mount target is already occupied".to_owned(),
-                    }
-                } else {
-                    CheckStatus::Satisfied(self.mount_evidence())
-                }
-            }
-            ActionPrerequisite::MountDescendantsAbsent { target, context } => {
-                if self.has_mounted_descendant(target, context) {
-                    CheckStatus::Violated {
-                        reason: "mount target still contains an active descendant".to_owned(),
-                    }
-                } else {
-                    CheckStatus::Satisfied(self.mount_evidence())
-                }
-            }
-        }
-    }
-
-    /// Resolves endpoint availability and optional write access without trusting missing facts.
-    fn evaluate_endpoint(&self, node: NodeId, writable: bool) -> CheckStatus {
-        let Some(node_value) = self.graph.node(&node) else {
-            return CheckStatus::Violated {
-                reason: "referenced node is absent".to_owned(),
-            };
-        };
-        // An explicit deactivation supersedes endpoint observations from the baseline.
-        if self.activations.get(&node) == Some(&false) {
-            return CheckStatus::Violated {
-                reason: "projected block endpoint is inactive".to_owned(),
-            };
-        }
-        match self.block_interfaces.get(&node) {
-            Some(BlockInterfaceAccess::ReadWrite) => {
-                return CheckStatus::Satisfied(CheckEvidence::PredictedEffect);
-            }
-            Some(BlockInterfaceAccess::ReadOnly) if !writable => {
-                return CheckStatus::Satisfied(CheckEvidence::PredictedEffect);
-            }
-            Some(BlockInterfaceAccess::ReadOnly) => {
-                return CheckStatus::Violated {
-                    reason: "projected block interface is read-only".to_owned(),
-                };
-            }
-            None => {}
-        }
-        if self.is_observation_stale(&FactScope::Node(node), FactKind::Activation)
-            || self.is_observation_stale(&FactScope::Node(node), FactKind::Presence)
-        {
-            return CheckStatus::Unknown {
-                required_evidence: "fresh block endpoint observation after runtime invalidation"
-                    .to_owned(),
-            };
-        }
-        if !writable {
-            return if node_value.size.block.is_some() {
-                CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot)
-            } else {
-                CheckStatus::Unknown {
-                    required_evidence: "available block endpoint observation".to_owned(),
-                }
-            };
-        }
-        match node_value
-            .size
-            .block
-            .as_ref()
-            .and_then(|block| block.read_only)
-        {
-            Some(false) => CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot),
-            Some(true) => CheckStatus::Violated {
-                reason: "observed block endpoint is read-only".to_owned(),
-            },
-            None => CheckStatus::Unknown {
-                required_evidence: "writable block endpoint observation".to_owned(),
-            },
-        }
-    }
-
-    /// Checks simple filesystem backing; multi-device and dataset health need live evidence.
-    fn evaluate_mount_source(&self, source: &MountSource) -> CheckStatus {
-        let node = match source {
-            MountSource::Filesystem(node)
-            | MountSource::BtrfsSubvolume(node)
-            | MountSource::ZfsDataset(node) => *node,
-            _ => {
-                return CheckStatus::Unknown {
-                    required_evidence: "provider mount-source availability check".to_owned(),
-                };
-            }
-        };
-        let Some(value) = self.graph.node(&node) else {
-            return CheckStatus::Violated {
-                reason: "mount source is absent".to_owned(),
-            };
-        };
-        let compatible = matches!(
-            (source, &value.kind.kind),
-            (MountSource::Filesystem(_), NodeKind::Filesystem { .. })
-                | (
-                    MountSource::BtrfsSubvolume(_),
-                    NodeKind::BtrfsSubvolume { .. }
-                )
-                | (MountSource::ZfsDataset(_), NodeKind::ZfsDataset { .. })
-        );
-        if !compatible {
-            return CheckStatus::Violated {
-                reason: "mount source has an incompatible node kind".to_owned(),
-            };
-        }
-        if matches!(&value.kind.kind, NodeKind::Filesystem { kind, .. }
-            if !matches!(kind, FilesystemKind::Btrfs(_)))
-        {
-            let backing: Vec<_> = self
-                .graph
-                .dependencies()
-                .filter(|dependency| {
-                    dependency.to == node && matches!(dependency.kind, DependencyKind::Backs)
-                })
-                .map(|dependency| dependency.from)
-                .collect();
-            if let [backing] = backing.as_slice()
-                && self
-                    .graph
-                    .node(backing)
-                    .is_some_and(|value| matches_kind(&value.kind.kind, NodeKindClass::Block))
-            {
-                return self.evaluate_endpoint(*backing, false);
-            }
-        }
-        CheckStatus::Unknown {
-            required_evidence: "provider mount-source topology and availability check".to_owned(),
-        }
-    }
-
-    /// Checks direct block consumers against a proposed lower-layer capacity.
-    fn evaluate_dependent_sizes(
-        &self,
-        node: NodeId,
-        size: storage_core::model::Bytes,
-    ) -> CheckStatus {
-        if self.graph.node(&node).is_none() {
-            return CheckStatus::Violated {
-                reason: "referenced node is absent".to_owned(),
-            };
-        }
-        let mut found = false;
-        let mut predicted = self.projected_graph_nodes.contains(&node);
-        for dependency in self.graph.dependencies().filter(|dependency| {
-            dependency.from == node && matches!(dependency.kind, DependencyKind::Backs)
-        }) {
-            found = true;
-            predicted |= self.projected_graph_nodes.contains(&dependency.to);
-            let Some(dependent) = self.graph.node(&dependency.to) else {
-                return CheckStatus::Violated {
-                    reason: "dependent node is absent".to_owned(),
-                };
-            };
-            let Some(dependent_size) = dependent.kind.size else {
-                return CheckStatus::Unknown {
-                    required_evidence: "dependent capacity observation".to_owned(),
-                };
-            };
-            if dependent_size > size {
-                return CheckStatus::Violated {
-                    reason: "an upper layer exceeds the proposed backing capacity".to_owned(),
-                };
-            }
-        }
-        if found {
-            CheckStatus::Satisfied(if predicted {
-                CheckEvidence::PredictedEffect
-            } else {
-                CheckEvidence::ObservedSnapshot
-            })
-        } else {
-            self.satisfied_for_node(node)
-        }
-    }
-
-    /// Checks the direct block backing against a proposed upper-layer capacity.
-    fn evaluate_backing_size(&self, node: NodeId, size: storage_core::model::Bytes) -> CheckStatus {
-        if self.graph.node(&node).is_none() {
-            return CheckStatus::Violated {
-                reason: "referenced node is absent".to_owned(),
-            };
-        }
-        let Some(dependency) = self.graph.dependencies().find(|dependency| {
-            dependency.to == node && matches!(dependency.kind, DependencyKind::Backs)
-        }) else {
-            return CheckStatus::Unknown {
-                required_evidence: "direct backing relationship".to_owned(),
-            };
-        };
-        let Some(backing) = self.graph.node(&dependency.from) else {
-            return CheckStatus::Violated {
-                reason: "backing node is absent".to_owned(),
-            };
-        };
-        let Some(backing_size) = backing.kind.size else {
-            return CheckStatus::Unknown {
-                required_evidence: "backing capacity observation".to_owned(),
-            };
-        };
-        if backing_size < size {
-            CheckStatus::Violated {
-                reason: "backing capacity is smaller than the requested size".to_owned(),
-            }
-        } else {
-            CheckStatus::Satisfied(
-                if self.projected_graph_nodes.contains(&node)
-                    || self.projected_graph_nodes.contains(&dependency.from)
-                {
-                    CheckEvidence::PredictedEffect
-                } else {
-                    CheckEvidence::ObservedSnapshot
-                },
-            )
-        }
-    }
-
-    /// Checks cumulative free capacity in one provider allocation domain.
-    fn evaluate_capacity(
-        &self,
-        domain: &AllocationDomain,
-        amount: Option<AllocationQuantity>,
-    ) -> CheckStatus {
-        let Some(amount) = amount else {
-            return CheckStatus::Unknown {
-                required_evidence: "provider allocation calculation for this layout".to_owned(),
-            };
-        };
-        let Some(available) = self.available_capacity.get(domain) else {
-            return CheckStatus::Unknown {
-                required_evidence: "provider allocation-capacity evidence".to_owned(),
-            };
-        };
-        if *available < amount {
-            CheckStatus::Violated {
-                reason: "allocation domain has insufficient free capacity".to_owned(),
-            }
-        } else if self.projected_allocations.contains(domain) {
-            CheckStatus::Satisfied(CheckEvidence::PredictedEffect)
-        } else {
-            CheckStatus::Satisfied(CheckEvidence::ObservedSnapshot)
-        }
-    }
-
-    /// Identifies whether a satisfied fact came from the snapshot or projection.
-    fn satisfied_for_node(&self, node: NodeId) -> CheckStatus {
-        let evidence = if self.projected_graph_nodes.contains(&node) {
-            CheckEvidence::PredictedEffect
-        } else {
-            CheckEvidence::ObservedSnapshot
-        };
-        CheckStatus::Satisfied(evidence)
-    }
-
-    /// Applies graph changes to an unpublished candidate projection.
-    fn apply_graph_effects(
-        &mut self,
-        effects: &[GraphEffect],
-    ) -> Result<(), EffectApplicationError> {
-        for effect in effects {
-            match effect {
-                GraphEffect::InsertNode { id, spec } => {
-                    if self.graph.node(id).is_some() {
-                        return Err(EffectApplicationError::DuplicateNode(*id));
-                    }
-                    self.graph.insert_new(
-                        *id,
-                        Node {
-                            kind: spec.clone(),
-                            size: NodeFacts::default(),
-                        },
-                    )?;
-                    self.projected_graph_nodes.push(*id);
-                }
-                GraphEffect::RemoveNode(node) => {
-                    if self.graph.remove_node(node).is_none() {
-                        return Err(EffectApplicationError::MissingNode(*node));
-                    }
-                    self.projected_graph_nodes
-                        .retain(|candidate| candidate != node);
-                    self.activations.remove(node);
-                    self.block_interfaces.remove(node);
-                }
-                GraphEffect::SetNodeSize { node, size } => {
-                    self.update_node(*node, "set node size", |value| {
-                        value.kind.size = Some(*size);
-                        true
-                    })?;
-                }
-                GraphEffect::InvalidateNodeSize(node) => {
-                    self.update_node(*node, "invalidate node size", |value| {
-                        value.kind.size = None;
-                        true
-                    })?;
-                }
-                GraphEffect::SetPartitionAttributes {
-                    partition,
-                    attributes,
-                } => {
-                    self.update_node(*partition, "set partition attributes", |value| {
+            GraphEffect::SetPartitionAttributes {
+                partition,
+                attributes,
+            } => {
+                update_node(
+                    desired,
+                    evidence,
+                    *partition,
+                    "set partition attributes",
+                    |value| {
                         let NodeKind::Partition {
                             attributes: current,
                             ..
@@ -615,23 +151,35 @@ impl Projection {
                         };
                         *current = *attributes;
                         true
-                    })?;
-                }
-                GraphEffect::SetFilesystemLabel { filesystem, label } => {
-                    self.update_node(*filesystem, "set filesystem label", |value| {
+                    },
+                )?;
+            }
+            GraphEffect::SetFilesystemLabel { filesystem, label } => {
+                update_node(
+                    desired,
+                    evidence,
+                    *filesystem,
+                    "set filesystem label",
+                    |value| {
                         let NodeKind::Filesystem { label: current, .. } = &mut value.kind.kind
                         else {
                             return false;
                         };
                         *current = label.clone();
                         true
-                    })?;
-                }
-                GraphEffect::SetBtrfsAllocation {
-                    filesystem,
-                    allocation,
-                } => {
-                    self.update_node(*filesystem, "set Btrfs allocation", |value| {
+                    },
+                )?;
+            }
+            GraphEffect::SetBtrfsAllocation {
+                filesystem,
+                allocation,
+            } => {
+                update_node(
+                    desired,
+                    evidence,
+                    *filesystem,
+                    "set Btrfs allocation",
+                    |value| {
                         let NodeKind::Filesystem {
                             kind: FilesystemKind::Btrfs(current),
                             ..
@@ -641,461 +189,137 @@ impl Projection {
                         };
                         *current = allocation.clone();
                         true
-                    })?;
+                    },
+                )?;
+            }
+            GraphEffect::InsertDependency(dependency) => {
+                desired.graph.insert_dependency(dependency.clone());
+            }
+            GraphEffect::RemoveDependency(dependency) => {
+                if !desired.graph.remove_dependency(dependency) {
+                    return Err(EffectApplicationError::MissingDependency);
                 }
-                GraphEffect::InsertDependency(dependency) => {
-                    self.graph.insert_dependency(dependency.clone());
+            }
+            GraphEffect::InsertRelation(relation) => {
+                desired.graph.insert_relation(relation.clone());
+            }
+            GraphEffect::RemoveRelation(relation) => {
+                if !desired.graph.remove_relation(relation) {
+                    return Err(EffectApplicationError::MissingRelation);
                 }
-                GraphEffect::RemoveDependency(dependency) => {
-                    if !self.graph.remove_dependency(dependency) {
-                        return Err(EffectApplicationError::MissingDependency);
-                    }
+            }
+            GraphEffect::SetActivation { node, active } => {
+                if desired.graph.node(node).is_none() {
+                    return Err(EffectApplicationError::MissingNode(*node));
                 }
-                GraphEffect::InsertRelation(relation) => {
-                    self.graph.insert_relation(relation.clone());
-                }
-                GraphEffect::RemoveRelation(relation) => {
-                    if !self.graph.remove_relation(relation) {
-                        return Err(EffectApplicationError::MissingRelation);
-                    }
-                }
-                GraphEffect::SetActivation { node, active } => {
-                    if self.graph.node(node).is_none() {
-                        return Err(EffectApplicationError::MissingNode(*node));
-                    }
-                    self.activations.insert(*node, *active);
-                    if !active {
-                        self.block_interfaces.remove(node);
-                    }
+                evidence.activations.insert(*node, *active);
+                if !active {
+                    evidence.block_interfaces.remove(node);
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
+}
 
-    /// Applies mount changes without conflating runtime and persistent state.
-    fn apply_mount_effects(
-        &mut self,
-        effects: &[MountEffect],
-    ) -> Result<(), EffectApplicationError> {
-        for effect in effects {
-            match effect {
-                MountEffect::AddRuntime {
-                    source,
-                    target,
-                    options,
-                    context,
-                } => {
-                    if self.mount_at(target, context).is_some() {
-                        return Err(EffectApplicationError::OccupiedMountTarget(target.clone()));
-                    }
-                    if self.has_mounted_descendant(target, context) {
-                        return Err(EffectApplicationError::MountedDescendant(target.clone()));
-                    }
-                    if let MountSource::Filesystem(filesystem) = source {
-                        self.checked_filesystems.remove(filesystem);
-                    } else if matches!(source, MountSource::Bind(_) | MountSource::Other(_)) {
-                        self.checked_filesystems.clear();
-                    }
-                    self.projected_runtime_mounts = true;
-                    self.runtime_mounts.push(ObservedMount {
-                        source: source.clone(),
-                        target: target.clone(),
-                        options: options.clone(),
-                        context: context.clone(),
-                    });
+/// Applies mount changes without conflating runtime and persistent state.
+fn apply_mount_effects(
+    desired: &mut DesiredState,
+    evidence: &mut SimulationEvidence,
+    effects: &[MountEffect],
+) -> Result<(), EffectApplicationError> {
+    for effect in effects {
+        match effect {
+            MountEffect::AddRuntime {
+                source,
+                target,
+                options,
+                context,
+            } => {
+                if mount_at(desired, target, context).is_some() {
+                    return Err(EffectApplicationError::OccupiedMountTarget(target.clone()));
                 }
-                MountEffect::RemoveRuntime { target, context } => {
-                    if self.has_mounted_descendant(target, context) {
-                        return Err(EffectApplicationError::MountedDescendant(target.clone()));
-                    }
-                    self.projected_runtime_mounts = true;
-                    self.runtime_mounts
-                        .retain(|mount| mount.target != *target || mount.context != *context);
+                if has_mounted_descendant(desired, target, context) {
+                    return Err(EffectApplicationError::MountedDescendant(target.clone()));
                 }
-                MountEffect::SetPersistent(entry) => {
-                    self.persistent_mounts.retain(|current| {
-                        current.target != entry.target || current.context != entry.context
-                    });
-                    self.persistent_mounts.push(entry.clone());
-                    self.mark_persistent_target(&entry.target, &entry.context);
+                if let MountSource::Filesystem(filesystem) = source {
+                    evidence.checked_filesystems.remove(filesystem);
+                } else if matches!(source, MountSource::Bind(_) | MountSource::Other(_)) {
+                    evidence.checked_filesystems.clear();
                 }
-                MountEffect::RemovePersistent { target, context } => {
-                    self.persistent_mounts
-                        .retain(|entry| entry.target != *target || entry.context != *context);
-                    self.mark_persistent_target(target, context);
-                }
+                evidence.projected_runtime_mounts = true;
+                desired.mounts.runtime.push(MountEntry {
+                    persistent: false,
+                    source: source.clone(),
+                    target: target.clone(),
+                    options: options.clone(),
+                    context: context.clone(),
+                });
             }
-        }
-        Ok(())
-    }
-
-    /// Marks a persistent mount target as determined by a predicted effect.
-    fn mark_persistent_target(&mut self, target: &Path, context: &MountContext) {
-        if !self.persistent_mount_was_projected(target, context) {
-            self.projected_persistent_targets
-                .push((target.to_path_buf(), context.clone()));
-        }
-    }
-
-    /// Records runtime guarantees exported by a successfully projected action.
-    fn apply_outputs(&mut self, outputs: &[ActionOutput]) {
-        for output in outputs {
-            match output {
-                ActionOutput::BlockInterface { node, access } => {
-                    self.block_interfaces.insert(*node, *access);
+            MountEffect::RemoveRuntime { target, context } => {
+                if has_mounted_descendant(desired, target, context) {
+                    return Err(EffectApplicationError::MountedDescendant(target.clone()));
                 }
-                ActionOutput::FilesystemCheckPassed(filesystem) => {
-                    self.checked_filesystems.insert(*filesystem);
-                }
-                _ => {}
+                evidence.projected_runtime_mounts = true;
+                desired
+                    .mounts
+                    .runtime
+                    .retain(|mount| mount.target != *target || mount.context != *context);
+            }
+            MountEffect::SetPersistent(entry) => {
+                desired.mounts.persistent.retain(|current| {
+                    current.target != entry.target || current.context != entry.context
+                });
+                desired.mounts.persistent.push(entry.clone());
+                mark_persistent_target(evidence, &entry.target, &entry.context);
+            }
+            MountEffect::RemovePersistent { target, context } => {
+                desired
+                    .mounts
+                    .persistent
+                    .retain(|entry| entry.target != *target || entry.context != *context);
+                mark_persistent_target(evidence, target, context);
             }
         }
     }
+    Ok(())
+}
 
-    /// Records stale baseline aspects and revokes runtime claims affected by activation changes.
-    fn invalidate_observations(
-        &mut self,
-        invalidations: &[FactInvalidation],
-    ) -> Vec<FactInvalidation> {
-        let mut expanded = invalidations.to_vec();
-        for invalidation in invalidations {
-            if let (FactScope::Node(node), FactKind::Activation) =
-                (&invalidation.scope, invalidation.kind)
-            {
-                let mut pending = vec![*node];
-                let mut visited = HashSet::new();
-                while let Some(node) = pending.pop() {
-                    if !visited.insert(node) {
-                        continue;
-                    }
-                    let propagated = FactInvalidation {
-                        scope: FactScope::Node(node),
-                        kind: FactKind::Activation,
-                    };
-                    if !expanded.contains(&propagated) {
-                        expanded.push(propagated);
-                    }
-                    let mut children = self
-                        .graph
-                        .dependencies()
-                        .filter(|dependency| dependency.from == node)
-                        .map(|dependency| dependency.to)
-                        .collect::<Vec<_>>();
-                    children.sort_unstable_by_key(|node| node.as_uuid());
-                    pending.extend(children);
-                }
-            }
-        }
-        for invalidation in &expanded {
-            if !self.invalidated_facts.contains(invalidation) {
-                self.invalidated_facts.push(invalidation.clone());
-            }
-            if let (FactScope::Node(node), FactKind::Activation | FactKind::Presence) =
-                (&invalidation.scope, invalidation.kind)
-            {
-                self.block_interfaces.remove(node);
-                self.activations.remove(node);
-            }
-        }
-        expanded
+/// Replaces one node only after a type-specific update succeeds.
+fn update_node(
+    desired: &mut DesiredState,
+    evidence: &mut SimulationEvidence,
+    id: NodeId,
+    effect: &'static str,
+    update: impl FnOnce(&mut Node) -> bool,
+) -> Result<(), EffectApplicationError> {
+    let Some(mut node) = desired.graph.node(&id).cloned() else {
+        return Err(EffectApplicationError::MissingNode(id));
+    };
+    if !update(&mut node) {
+        return Err(EffectApplicationError::WrongNodeKind { node: id, effect });
     }
-
-    /// Revokes clean-check guarantees when content or backing geometry changes.
-    fn invalidate_filesystem_checks(&mut self, invalidations: &[FactInvalidation]) {
-        let mut affected = invalidations
-            .iter()
-            .filter_map(
-                |invalidation| match (&invalidation.scope, invalidation.kind) {
-                    (
-                        FactScope::Node(node),
-                        FactKind::Content | FactKind::Geometry | FactKind::Presence,
-                    ) => Some(*node),
-                    _ => None,
-                },
-            )
-            .collect::<Vec<_>>();
-        let mut visited = HashSet::new();
-        while let Some(node) = affected.pop() {
-            if !visited.insert(node) {
-                continue;
-            }
-            self.checked_filesystems.remove(&node);
-            affected.extend(
-                self.graph
-                    .dependencies()
-                    .filter(|dependency| {
-                        dependency.from == node
-                            && matches!(
-                                dependency.kind,
-                                DependencyKind::Backs | DependencyKind::Contains { .. }
-                            )
-                    })
-                    .map(|dependency| dependency.to),
-            );
-        }
+    desired.graph.replace_existing(id, node)?;
+    if !evidence.projected_graph_nodes.contains(&id) {
+        evidence.projected_graph_nodes.push(id);
     }
-
-    /// Applies cumulative reserve and release effects to known capacity evidence.
-    fn apply_allocation_effects(
-        &mut self,
-        effects: &[AllocationEffect],
-    ) -> Result<(), EffectApplicationError> {
-        for effect in effects {
-            match effect {
-                AllocationEffect::Invalidate { domain } => {
-                    self.available_capacity.remove(domain);
-                    self.projected_allocations.insert(domain.clone());
-                }
-                AllocationEffect::Reserve { domain, amount } => {
-                    let Some(available) = self.available_capacity.get_mut(domain) else {
-                        continue;
-                    };
-                    let Some(remaining) = available.get().checked_sub(amount.get()) else {
-                        return Err(EffectApplicationError::InsufficientCapacity(domain.clone()));
-                    };
-                    *available = AllocationQuantity::new(remaining);
-                    self.projected_allocations.insert(domain.clone());
-                }
-                AllocationEffect::Release { domain, amount } => {
-                    let Some(available) = self.available_capacity.get_mut(domain) else {
-                        continue;
-                    };
-                    let Some(total) = available.get().checked_add(amount.get()) else {
-                        return Err(EffectApplicationError::CapacityOverflow(domain.clone()));
-                    };
-                    *available = AllocationQuantity::new(total);
-                    self.projected_allocations.insert(domain.clone());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Replaces one node only after a type-specific update succeeds.
-    fn update_node(
-        &mut self,
-        id: NodeId,
-        effect: &'static str,
-        update: impl FnOnce(&mut Node) -> bool,
-    ) -> Result<(), EffectApplicationError> {
-        let Some(mut node) = self.graph.node(&id).cloned() else {
-            return Err(EffectApplicationError::MissingNode(id));
-        };
-        if !update(&mut node) {
-            return Err(EffectApplicationError::WrongNodeKind { node: id, effect });
-        }
-        self.graph.replace_existing(id, node)?;
-        if !self.projected_graph_nodes.contains(&id) {
-            self.projected_graph_nodes.push(id);
-        }
-        Ok(())
-    }
-
-    /// Finds an effective runtime mount by namespace and target.
-    fn mount_at(&self, target: &PathBuf, context: &MountContext) -> Option<&ObservedMount> {
-        self.runtime_mounts
-            .iter()
-            .find(|mount| mount.target == *target && mount.context == *context)
-    }
-
-    /// Tests component-wise ancestry within one namespace, excluding the target itself.
-    fn has_mounted_descendant(&self, target: &Path, context: &MountContext) -> bool {
-        self.runtime_mounts.iter().any(|mount| {
-            mount.context == *context && mount.target != target && mount.target.starts_with(target)
-        })
-    }
-
-    /// Identifies whether effective mount evidence includes a projected transition.
-    fn mount_evidence(&self) -> CheckEvidence {
-        if self.projected_runtime_mounts {
-            CheckEvidence::PredictedEffect
-        } else {
-            CheckEvidence::ObservedSnapshot
-        }
-    }
-}
-
-/// Origin of evidence used to satisfy a prerequisite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckEvidence {
-    /// Fact copied from the observed baseline snapshot.
-    ObservedSnapshot,
-    /// Guarantee produced by an earlier simulated effect.
-    PredictedEffect,
-}
-
-/// Three-valued result of evaluating an action prerequisite.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CheckStatus {
-    /// The condition is established by the named evidence source.
-    Satisfied(CheckEvidence),
-    /// The condition is known to be false.
-    Violated {
-        /// Human-readable explanation of the contradiction.
-        reason: String,
-    },
-    /// The condition needs evidence unavailable to pure simulation.
-    Unknown {
-        /// Evidence that a later stage must obtain.
-        required_evidence: String,
-    },
-}
-
-/// Evaluation result tied to the exact prerequisite that produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrerequisiteCheck {
-    /// Evaluated contract condition.
-    pub prerequisite: ActionPrerequisite,
-    /// Current result and its evidence or diagnostic.
-    pub status: CheckStatus,
-}
-
-/// Read-only provider evidence about one allocation domain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapacityEvidence {
-    /// Domain to which the observation applies.
-    pub domain: AllocationDomain,
-    /// Free capacity observed for the planning baseline.
-    pub available: AllocationQuantity,
-}
-
-/// Invalid set of provider capacity evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum CapacityEvidenceError {
-    /// More than one observation was supplied for one domain.
-    #[error("duplicate capacity evidence for allocation domain {0:?}")]
-    DuplicateDomain(AllocationDomain),
-}
-
-/// Trusted contract and checks produced while simulating one action.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SimulatedAction {
-    /// Contract recalculated against the projection before the action.
-    pub contract: ActionContract,
-    /// Results of evaluating every prerequisite in that contract.
-    pub checks: Vec<PrerequisiteCheck>,
-    /// Observations invalidated at this step, including affected activation descendants.
-    pub invalidated_facts: Vec<FactInvalidation>,
-}
-
-impl SimulatedAction {
-    /// Reports whether the projection depends on evidence deferred to runtime.
-    pub fn is_conditional(&self) -> bool {
-        self.checks
-            .iter()
-            .any(|check| matches!(check.status, CheckStatus::Unknown { .. }))
-    }
-}
-
-/// Failure to simulate one typed provider action.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum ActionSimulationError {
-    /// Technology-specific validation rejected the action before effect application.
-    #[error("action failed technology-specific validation")]
-    Validation {
-        /// Provider diagnostics describing the invalid parameters or context.
-        diagnostics: Vec<Diagnostic>,
-    },
-    /// At least one trusted contract prerequisite is known to be false.
-    #[error("action has violated prerequisites")]
-    PrerequisitesViolated {
-        /// Complete check report, including satisfied and unknown conditions.
-        checks: Vec<PrerequisiteCheck>,
-    },
-    /// The trusted effect could not be applied to the projection.
-    #[error(transparent)]
-    Effect(#[from] EffectApplicationError),
-}
-
-/// Failure to apply a predicted effect to an isolated projection.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum EffectApplicationError {
-    /// The completed graph violates a shared representation invariant.
-    #[error(transparent)]
-    Structure(#[from] storage_core::model::GraphError),
-    /// An inserted planned identity already exists.
-    #[error("planned node {0:?} already exists")]
-    DuplicateNode(NodeId),
-    /// A graph mutation references an absent node.
-    #[error("graph effect references absent node {0:?}")]
-    MissingNode(NodeId),
-    /// A type-specific mutation references an incompatible node kind.
-    #[error("cannot {effect} on node {node:?} with its current kind")]
-    WrongNodeKind {
-        /// Node rejected by the mutation.
-        node: NodeId,
-        /// Mutation whose kind requirement failed.
-        effect: &'static str,
-    },
-    /// A requested dependency removal did not match the graph.
-    #[error("dependency selected for removal is absent")]
-    MissingDependency,
-    /// A requested relation removal did not match the graph.
-    #[error("relation selected for removal is absent")]
-    MissingRelation,
-    /// A runtime mount effect targets an occupied namespace path.
-    #[error("runtime mount target {0:?} is already occupied")]
-    OccupiedMountTarget(PathBuf),
-    /// A runtime mount change would hide or detach an active descendant of this target.
-    #[error("runtime mount target {0:?} still contains an active descendant")]
-    MountedDescendant(PathBuf),
-    /// A reserve effect exceeds known free capacity.
-    #[error("insufficient capacity in allocation domain {0:?}")]
-    InsufficientCapacity(AllocationDomain),
-    /// A release effect overflows the capacity representation.
-    #[error("capacity overflow in allocation domain {0:?}")]
-    CapacityOverflow(AllocationDomain),
-}
-
-/// Reports whether a node kind satisfies a coarse provider contract class.
-pub(crate) fn matches_kind(kind: &NodeKind, expected: NodeKindClass) -> bool {
-    match expected {
-        NodeKindClass::Block => matches!(
-            kind,
-            NodeKind::Disk
-                | NodeKind::NvmeNamespace(_)
-                | NodeKind::Loop { .. }
-                | NodeKind::Zram
-                | NodeKind::DmMultipath
-                | NodeKind::Partition { .. }
-                | NodeKind::LuksContainer { .. }
-                | NodeKind::DmCryptMapping { .. }
-                | NodeKind::DmIntegrity { .. }
-                | NodeKind::DmVerity { .. }
-                | NodeKind::MdArray(_)
-                | NodeKind::LvmPv
-                | NodeKind::LvmLv(_)
-                | NodeKind::Bcache { .. }
-                | NodeKind::DmCache { .. }
-                | NodeKind::DmWritecache { .. }
-                | NodeKind::ZfsVolume { .. }
-                | NodeKind::Drbd { .. }
-        ),
-        NodeKindClass::PartitionTable => matches!(kind, NodeKind::PartitionTable(_)),
-        NodeKindClass::Partition => matches!(kind, NodeKind::Partition { .. }),
-        NodeKindClass::LuksContainer => matches!(kind, NodeKind::LuksContainer { .. }),
-        NodeKindClass::DmCryptMapping => matches!(kind, NodeKind::DmCryptMapping { .. }),
-        NodeKindClass::LvmPv => matches!(kind, NodeKind::LvmPv),
-        NodeKindClass::LvmVg => matches!(kind, NodeKind::LvmVg { .. }),
-        NodeKindClass::LvmLv => matches!(kind, NodeKind::LvmLv(_)),
-        NodeKindClass::Filesystem => matches!(kind, NodeKind::Filesystem { .. }),
-        NodeKindClass::BtrfsFilesystem => matches!(
-            kind,
-            NodeKind::Filesystem {
-                kind: FilesystemKind::Btrfs(_),
-                ..
-            }
-        ),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::simulation_evidence::{CheckEvidence, PrerequisiteCheck, TestSimulation};
+    use std::path::PathBuf;
     use storage_core::model::{
         Bytes, Diagnostic, Environment, FilesystemKind, LvmLv, LvmLvKind, MountSource, MountState,
         NodeSpec, SystemEnvironment,
+    };
+    use storage_core::model::{
+        CurrentState, DependencyKind, MountContext, NodeGraph, ObservedMount,
+    };
+    use storage_provider::{
+        ActionContract, ActionDescriptionContext, ActionOutput, ActionPrerequisite,
+        AllocationDomain, AllocationQuantity, BlockInterfaceAccess, FactKind, FactScope,
     };
     use storage_provider::{FilesystemAction, LvmAction, ProviderAction};
 
@@ -1170,7 +394,7 @@ mod tests {
     fn automatic_luks_resize_invalidates_the_previous_size() {
         let (current, mapping, filesystem) = current_with_observed_mapping();
         let baseline = current.clone();
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let result = projection
             .simulate_action(&ProviderAction::Luks(
                 storage_provider::LuksAction::Resize {
@@ -1201,7 +425,7 @@ mod tests {
     fn predicted_size_does_not_fabricate_new_access_observations() {
         let (current, mapping, filesystem) = current_with_observed_mapping();
         let historical = current.graph.node(&mapping).map(|node| node.size.clone());
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         projection
             .simulate_action(&ProviderAction::Luks(
                 storage_provider::LuksAction::Resize {
@@ -1278,7 +502,7 @@ mod tests {
                 kind: DependencyKind::Provides,
             });
         let baseline = current.clone();
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let activate_lv = ProviderAction::Lvm(LvmAction::SetActivation {
             target: lv,
             active: true,
@@ -1354,7 +578,7 @@ mod tests {
                 },
             )
             .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let before = projection.clone();
         let result = projection.simulate_action(&ProviderAction::Lvm(LvmAction::CreateLv {
             vg,
@@ -1395,7 +619,7 @@ mod tests {
                 context: MountContext::Host,
             },
         ] {
-            let mut projection = Projection::from_current(&current);
+            let mut projection = TestSimulation::from_current(&current);
             let original = projection.clone();
             let operation = ProviderAction::Mount(action);
             assert!(projection.simulate_action(&operation).is_err());
@@ -1436,7 +660,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         for name in ["", "bad/name", "bad\0name"] {
-            let mut projection = Projection::from_current(&current);
+            let mut projection = TestSimulation::from_current(&current);
             let original = projection.clone();
             let result = projection.simulate_action(&ProviderAction::Luks(
                 storage_provider::LuksAction::Open {
@@ -1494,7 +718,7 @@ mod tests {
         let condition =
             ActionPrerequisite::MountSourceAvailable(MountSource::Filesystem(filesystem));
         let status = |current: &CurrentState| {
-            Projection::from_current(current)
+            TestSimulation::from_current(current)
                 .evaluate_prerequisites(std::slice::from_ref(&condition))[0]
                 .status
                 .clone()
@@ -1536,8 +760,9 @@ mod tests {
             status(&without_backing),
             CheckStatus::Unknown { .. }
         ));
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         projection
+            .evidence
             .block_interfaces
             .insert(backing, BlockInterfaceAccess::ReadOnly);
         assert_eq!(
@@ -1585,7 +810,7 @@ mod tests {
             filesystem,
             label: Some("new-label".to_owned()),
         });
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let original = projection.clone();
         assert!(matches!(
             projection.simulate_action(&action),
@@ -1686,7 +911,7 @@ mod tests {
             options: vec!["rw".to_owned()],
             context: MountContext::Host,
         });
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let original = projection.clone();
         let result =
             projection.simulate_action(&ProviderAction::Filesystem(FilesystemAction::Resize {
@@ -1714,7 +939,7 @@ mod tests {
             });
         }
         let baseline = current.clone();
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let forced_check = ProviderAction::Filesystem(FilesystemAction::Check {
             filesystem,
             force: true,
@@ -1821,7 +1046,7 @@ mod tests {
             filesystem,
             force: true,
         });
-        let mut checked = Projection::from_current(&current);
+        let mut checked = TestSimulation::from_current(&current);
         checked
             .simulate_action(&forced_check)
             .unwrap_or_else(|error| panic!("simulate forced check: {error}"));
@@ -1863,7 +1088,7 @@ mod tests {
             FilesystemKind::Other("custom".to_owned()),
         ] {
             let (current, _, filesystem) = current_with_filesystem(kind);
-            let mut projection = Projection::from_current(&current);
+            let mut projection = TestSimulation::from_current(&current);
             assert!(
                 matches!(projection.simulate_action(&ProviderAction::Filesystem(FilesystemAction::Resize {
                     filesystem, new_size: Bytes::new(60),
@@ -1873,7 +1098,7 @@ mod tests {
             );
         }
         let (mut current, _, filesystem) = current_with_filesystem(FilesystemKind::Ext4);
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         assert!(
             matches!(projection.simulate_action(&ProviderAction::Filesystem(FilesystemAction::Resize {
                 filesystem, new_size: Bytes::new(0),
@@ -1892,7 +1117,7 @@ mod tests {
             .replace_existing(filesystem, node)
             .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         assert!(
-            Projection::from_current(&current)
+            TestSimulation::from_current(&current)
                 .simulate_action(&ProviderAction::Filesystem(FilesystemAction::Resize {
                     filesystem,
                     new_size: Bytes::new(60),
@@ -1943,7 +1168,7 @@ mod tests {
             filesystem: FilesystemKind::Ext4,
             label: Some("data".to_owned()),
         });
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
 
         let result = projection
             .simulate_action(&action)
@@ -1968,7 +1193,7 @@ mod tests {
     #[test]
     fn effect_application_is_atomic() {
         let (current, _) = current_with_disk();
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let original = projection.clone();
         let inserted = NodeId::new();
         let missing = NodeId::new();
@@ -2001,7 +1226,7 @@ mod tests {
     #[test]
     fn mount_effects_keep_runtime_and_persistent_state_separate() {
         let (current, disk) = current_with_disk();
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let target = PathBuf::from("/data");
         let entry = MountEntry {
             source: MountSource::Filesystem(disk),
@@ -2025,7 +1250,7 @@ mod tests {
     #[test]
     fn writable_requires_observed_evidence() {
         let (current, disk) = current_with_disk();
-        let projection = Projection::from_current(&current);
+        let projection = TestSimulation::from_current(&current);
         let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::Writable(disk)]);
 
         assert!(matches!(
@@ -2046,7 +1271,7 @@ mod tests {
             target: missing,
             active: true,
         });
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let original = projection.clone();
 
         assert!(matches!(
@@ -2081,7 +1306,7 @@ mod tests {
             target: lv,
             active: true,
         });
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
 
         projection
             .simulate_action(&action)
@@ -2131,7 +1356,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("insert fixture node: {error}"));
         let baseline = current.clone();
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         for active in [true, false] {
             projection
                 .simulate_action(&ProviderAction::Lvm(LvmAction::SetActivation {
@@ -2174,7 +1399,7 @@ mod tests {
     #[test]
     fn read_only_output_rejects_writable_requirement() {
         let (current, disk) = current_with_disk();
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         projection.apply_outputs(&[ActionOutput::BlockInterface {
             node: disk,
             access: BlockInterfaceAccess::ReadOnly,
@@ -2195,7 +1420,7 @@ mod tests {
     #[test]
     fn capacity_is_unknown_without_provider_evidence() {
         let (current, disk) = current_with_disk();
-        let projection = Projection::from_current(&current);
+        let projection = TestSimulation::from_current(&current);
         let checks = projection.evaluate_prerequisites(&[ActionPrerequisite::CapacityAvailable {
             domain: AllocationDomain::LvmVolumeGroup(disk),
             amount: Some(AllocationQuantity::new(1)),
@@ -2218,7 +1443,7 @@ mod tests {
             to: filesystem,
             kind: DependencyKind::Backs,
         };
-        let mut projection = Projection::from_current(&current);
+        let mut projection = TestSimulation::from_current(&current);
         let original = projection.clone();
         let cycle = PredictedEffect {
             graph: vec![

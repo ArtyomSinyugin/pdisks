@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use storage_core::model::{
-    BootSpec, CurrentState, DesiredState, MountContext, MountEntry, NodeGraph, ObservedMount,
+    BootSpec, CurrentState, DesiredState, MountContext, MountEntry, NodeGraph,
 };
 use storage_provider::{
     ActionDescriptionContext, ActionPrerequisite, FactInvalidation, FragmentOrigin,
@@ -13,8 +13,11 @@ use thiserror::Error;
 
 use crate::{
     ActionId, ActionSimulationError, CapacityEvidence, CapacityEvidenceError, CheckStatus,
-    ExecutionPlan, PrerequisiteCheck, Projection, ProtectedScope, ProtectionViolation,
+    ExecutionPlan, PrerequisiteCheck, ProtectedScope, ProtectionViolation,
+    SimulationEvidenceSummary,
 };
+
+use crate::{effects::simulate_action, simulation_evidence::SimulationEvidence};
 
 /// One trusted action result in plan order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,8 +33,10 @@ pub struct SimulatedStep {
 /// Conditional projection produced without mutating the observed baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulationResult {
-    /// Final internal projection, including runtime-only guarantees.
-    pub projection: Projection,
+    /// Predicted configuration; retained node facts are historical, not fresh observations.
+    pub desired: DesiredState,
+    /// Qualifications needed to interpret the conditional prediction.
+    pub evidence: SimulationEvidenceSummary,
     /// Action-by-action prerequisite trace.
     pub steps: Vec<SimulatedStep>,
 }
@@ -142,10 +147,11 @@ pub fn simulate_plan_for_goal_with_policy(
             });
         }
     }
-    let simulation = simulate_plan_with_evidence(current, plan, capacity_evidence)?;
+    let mut simulation = simulate_plan_with_evidence(current, plan, capacity_evidence)?;
+    simulation.desired.intents = goal.intents.clone();
     let protection_violations =
         crate::validate::check_protected_scope(plan, &simulation, protected);
-    let goal_checks = compare_goal(&simulation.projection, goal);
+    let goal_checks = compare_goal(&simulation.desired, &simulation.evidence, goal);
     let ordered = plan.ordered_actions();
     let intent_coverage = goal
         .intents
@@ -256,8 +262,8 @@ pub(crate) fn replay_plan(
     capacity_evidence: &[CapacityEvidence],
 ) -> Result<(ExecutionPlan, SimulationResult), PlanSimulationError> {
     current.graph.validate_structure()?;
-    let mut projection =
-        Projection::from_current(current).with_capacity_evidence(capacity_evidence)?;
+    let mut desired = DesiredState::from_current(current);
+    let mut evidence = SimulationEvidence::new(capacity_evidence)?;
     let mut trusted_actions = Vec::with_capacity(plan.actions().len());
     let mut steps = Vec::with_capacity(plan.actions().len());
     for action in plan.ordered_actions() {
@@ -265,15 +271,16 @@ pub(crate) fn replay_plan(
             &action.operation,
             action.informational_contract.clone(),
             ActionDescriptionContext {
-                graph: projection.graph(),
+                graph: &desired.graph,
             },
         )
         .map_err(|_| PlanSimulationError::ContractMismatch(action.id))?;
-        let result = projection
-            .simulate_action(&action.operation)
-            .map_err(|source| PlanSimulationError::Action {
-                action: action.id,
-                source,
+        let result =
+            simulate_action(&mut desired, &mut evidence, &action.operation).map_err(|source| {
+                PlanSimulationError::Action {
+                    action: action.id,
+                    source,
+                }
             })?;
         let mut trusted_action = action.clone();
         trusted_action.informational_contract = result.contract;
@@ -287,7 +294,11 @@ pub(crate) fn replay_plan(
     trusted_actions.sort_by_key(|action| action.id);
     Ok((
         ExecutionPlan::new(trusted_actions, plan.dependencies().to_vec()),
-        SimulationResult { projection, steps },
+        SimulationResult {
+            desired,
+            evidence: SimulationEvidenceSummary::from(&evidence),
+            steps,
+        },
     ))
 }
 
@@ -340,19 +351,24 @@ pub struct GoalCheck {
     pub status: GoalStatus,
 }
 
-/// Compares the final projection with the requested semantic goal.
+/// Compares predicted configuration with the requested semantic goal using its evidence summary.
+/// Persistent targets not determined by effects retain an unknown baseline.
 /// Requested `NodeSpec.size == None` leaves only capacity unmanaged; kinds and topology are exact.
 /// An unknown projected capacity against an explicit requested size remains `Unknown`.
-pub fn compare_goal(projection: &Projection, goal: &DesiredState) -> Vec<GoalCheck> {
+pub fn compare_goal(
+    desired: &DesiredState,
+    evidence: &SimulationEvidenceSummary,
+    goal: &DesiredState,
+) -> Vec<GoalCheck> {
     let mut checks = vec![GoalCheck {
         aspect: GoalAspect::Graph,
-        status: compare_graph(projection.graph(), &goal.graph),
+        status: compare_graph(&desired.graph, &goal.graph),
     }];
     for entry in &goal.mounts.runtime {
-        checks.push(runtime_mount_check(projection.runtime_mounts(), entry));
+        checks.push(runtime_mount_check(&desired.mounts.runtime, entry));
     }
     for entry in &goal.mounts.persistent {
-        checks.push(persistent_mount_check(projection, entry));
+        checks.push(persistent_mount_check(desired, evidence, entry));
     }
     checks.push(GoalCheck {
         aspect: GoalAspect::Boot,
@@ -417,7 +433,7 @@ fn compare_graph(projected: &NodeGraph, requested: &NodeGraph) -> GoalStatus {
 }
 
 /// Checks one requested runtime mount relation.
-fn runtime_mount_check(mounts: &[ObservedMount], entry: &MountEntry) -> GoalCheck {
+fn runtime_mount_check(mounts: &[MountEntry], entry: &MountEntry) -> GoalCheck {
     let present = mounts.iter().any(|mount| {
         mount.source == entry.source
             && mount.target == entry.target
@@ -440,8 +456,12 @@ fn runtime_mount_check(mounts: &[ObservedMount], entry: &MountEntry) -> GoalChec
 }
 
 /// Checks a persistent entry without treating an unread baseline as empty.
-fn persistent_mount_check(projection: &Projection, requested: &MountEntry) -> GoalCheck {
-    let present = projection.persistent_mounts().iter().any(|entry| {
+fn persistent_mount_check(
+    desired: &DesiredState,
+    evidence: &SimulationEvidenceSummary,
+    requested: &MountEntry,
+) -> GoalCheck {
+    let present = desired.mounts.persistent.iter().any(|entry| {
         entry.source == requested.source
             && entry.target == requested.target
             && entry.context == requested.context
@@ -454,7 +474,7 @@ fn persistent_mount_check(projection: &Projection, requested: &MountEntry) -> Go
         },
         status: if present {
             GoalStatus::Satisfied
-        } else if projection.persistent_mount_was_projected(&requested.target, &requested.context) {
+        } else if evidence.persistent_mount_was_projected(&requested.target, &requested.context) {
             GoalStatus::Violated {
                 reason: "planned persistent mount entry does not match the request".to_owned(),
             }
@@ -474,8 +494,10 @@ fn options_match(left: &[String], right: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::simulation_evidence::TestSimulation;
     use storage_core::model::{
-        Environment, MountSource, MountSpec, MountState, NodeGraph, SystemEnvironment,
+        Environment, MountSource, MountSpec, MountState, NodeGraph, ObservedMount,
+        SystemEnvironment,
     };
 
     use super::*;
@@ -504,9 +526,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("compose empty plan: {error}"));
         let result = simulate_plan(&current, &plan)
             .unwrap_or_else(|error| panic!("simulate empty plan: {error}"));
-        assert_eq!(result.projection.graph(), &current.graph);
-        assert_eq!(result.projection.runtime_mounts(), current.mounts.entries);
-        assert!(result.projection.persistent_mounts().is_empty());
+        assert_eq!(result.desired, DesiredState::from_current(&current));
+        assert_eq!(result.evidence, SimulationEvidenceSummary::default());
         assert!(result.steps.is_empty());
         assert_eq!(current, before);
     }
@@ -540,7 +561,7 @@ mod tests {
                 },
                 diagnostics: Vec::new(),
             };
-            let mut projection = Projection::from_current(&current);
+            let mut projection = TestSimulation::from_current(&current);
             projection
                 .apply_effect(&storage_provider::PredictedEffect {
                     graph: Vec::new(),
@@ -555,7 +576,12 @@ mod tests {
                 GoalStatus::Violated { .. }
             ));
             assert!(matches!(
-                persistent_mount_check(&projection, &entry).status,
+                persistent_mount_check(
+                    &projection.desired,
+                    &SimulationEvidenceSummary::from(&projection.evidence),
+                    &entry
+                )
+                .status,
                 GoalStatus::Violated { .. }
             ));
             assert_eq!(
@@ -563,7 +589,12 @@ mod tests {
                 GoalStatus::Satisfied
             );
             assert_eq!(
-                persistent_mount_check(&projection, &actual_entry).status,
+                persistent_mount_check(
+                    &projection.desired,
+                    &SimulationEvidenceSummary::from(&projection.evidence),
+                    &actual_entry
+                )
+                .status,
                 GoalStatus::Satisfied
             );
         }
@@ -636,6 +667,82 @@ mod tests {
         )));
     }
 
+    /// MountSpec membership controls each goal independently of the provider persistence flag.
+    #[test]
+    fn independent_mount_goals_follow_effects_and_keep_unknown_baselines() {
+        let current = CurrentState {
+            graph: NodeGraph::new(),
+            mounts: MountState::default(),
+            environment: Environment {
+                host: SystemEnvironment::default(),
+                target: None,
+            },
+            diagnostics: Vec::new(),
+        };
+        let entry = MountEntry {
+            source: MountSource::Tmpfs,
+            target: PathBuf::from("/data"),
+            options: vec!["rw".to_owned()],
+            persistent: false,
+            context: MountContext::Host,
+        };
+        let mut goal = DesiredState::from_current(&current);
+        goal.mounts.persistent.push(entry.clone());
+        let mut simulation = TestSimulation::from_current(&current);
+        let checks = compare_goal(
+            &simulation.desired,
+            &SimulationEvidenceSummary::default(),
+            &goal,
+        );
+        assert!(matches!(checks[1].status, GoalStatus::Unknown { .. }));
+        assert!(
+            !checks
+                .iter()
+                .any(|check| matches!(check.aspect, GoalAspect::RuntimeMount { .. }))
+        );
+        simulation
+            .apply_effect(&storage_provider::PredictedEffect {
+                mounts: vec![storage_provider::MountEffect::SetPersistent(entry.clone())],
+                ..Default::default()
+            })
+            .unwrap_or_else(|error| panic!("set persistent entry: {error}"));
+        let checks = compare_goal(
+            &simulation.desired,
+            &SimulationEvidenceSummary::from(&simulation.evidence),
+            &goal,
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|check| check.status == GoalStatus::Satisfied)
+        );
+        assert!(simulation.desired.mounts.runtime.is_empty());
+
+        goal.mounts.runtime.push(entry.clone());
+        let checks = compare_goal(
+            &simulation.desired,
+            &SimulationEvidenceSummary::from(&simulation.evidence),
+            &goal,
+        );
+        assert!(matches!(checks[1].status, GoalStatus::Violated { .. }));
+        simulation
+            .apply_effect(&storage_provider::PredictedEffect {
+                mounts: vec![storage_provider::MountEffect::RemovePersistent {
+                    target: entry.target.clone(),
+                    context: entry.context.clone(),
+                }],
+                ..Default::default()
+            })
+            .unwrap_or_else(|error| panic!("remove persistent entry: {error}"));
+        goal.mounts.runtime.clear();
+        let checks = compare_goal(
+            &simulation.desired,
+            &SimulationEvidenceSummary::from(&simulation.evidence),
+            &goal,
+        );
+        assert!(matches!(checks[1].status, GoalStatus::Violated { .. }));
+    }
+
     /// A matching graph cannot cover an explicit operation, and mismatches remain visible.
     #[test]
     fn report_distinguishes_complete_uncovered_and_violated_goals() {
@@ -671,6 +778,14 @@ mod tests {
         assert!(!report.is_complete());
         assert!(!report.intent_coverage[0].covered);
         assert!(report.intent_coverage[0].actions.is_empty());
+        assert_eq!(report.simulation.desired.intents, goal.intents);
+        assert!(
+            simulate_plan(&current, &plan)
+                .unwrap_or_else(|error| panic!("simulate without intents: {error}"))
+                .desired
+                .intents
+                .is_empty()
+        );
         goal.intents.clear();
         goal.mounts.runtime.push(MountEntry {
             source: MountSource::Tmpfs,
@@ -689,6 +804,46 @@ mod tests {
                 .iter()
                 .any(|check| matches!(check.status, GoalStatus::Violated { .. }))
         );
+    }
+
+    /// Requested boot settings cannot become predicted configuration without boot effects.
+    #[test]
+    fn requested_boot_configuration_is_not_copied_into_prediction() {
+        let current = CurrentState {
+            graph: NodeGraph::new(),
+            mounts: MountState::default(),
+            environment: Environment {
+                host: SystemEnvironment::default(),
+                target: None,
+            },
+            diagnostics: Vec::new(),
+        };
+        let mut goal = DesiredState::from_current(&current);
+        goal.boot = BootSpec::Bios(storage_core::model::BiosBootSpec {
+            root: storage_core::model::NodeId::new(),
+            install_targets: Vec::new(),
+            bios_boot_partition: None,
+            bootloader: storage_core::model::Bootloader::Grub,
+            initramfs: Default::default(),
+        });
+        let plan = crate::compose_plan(&current, Vec::new())
+            .unwrap_or_else(|error| panic!("compose empty plan: {error}"));
+        let report = simulate_plan_for_goal(&current, &plan, &goal)
+            .unwrap_or_else(|error| panic!("simulate boot request: {error}"));
+        assert_eq!(report.simulation.desired.boot, BootSpec::Unmanaged);
+        assert!(
+            report
+                .unresolved_obligations
+                .iter()
+                .any(|obligation| matches!(
+                    obligation,
+                    SimulationObligation::Goal {
+                        aspect: GoalAspect::Boot,
+                        ..
+                    }
+                ))
+        );
+        assert!(!report.is_complete());
     }
     /// Capacity has an explicit unmanaged rule; unknown values never conceal other mismatches.
     #[test]
