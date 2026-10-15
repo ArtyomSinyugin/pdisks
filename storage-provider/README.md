@@ -245,8 +245,9 @@ describes physical extent allocation and virtual sizes.
 
 Simulation keeps a cumulative invalidation ledger alongside the graph and lists
 invalidated observation aspects on each action step. Historical `NodeFacts` stay
-unchanged; consumers check `Projection::is_observation_stale` for the relevant
-scope and `FactKind`. A new prediction is not a new measurement. Preserved access
+unchanged inside `SimulationResult.desired.graph`; consumers check
+`SimulationResult.evidence.is_observation_stale` for the relevant scope and
+`FactKind`. A new prediction is not a new measurement. Preserved access
 observations retain `ObservedSnapshot` provenance even after a size prediction.
 
 Activation changes revoke prior endpoint claims, including dependent nodes such
