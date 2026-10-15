@@ -132,9 +132,6 @@ impl FilesystemKind {
     }
 }
 
-/// Compatibility name used by the legacy backend during migration.
-pub use FilesystemKind as Fs;
-
 /// LVM logical volume properties.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LvmLv {
