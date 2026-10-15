@@ -1,5 +1,7 @@
 //! Whole-plan simulation and semantic goal comparison.
 
+use serde::Serialize;
+
 use std::path::PathBuf;
 
 use storage_core::model::{
@@ -20,7 +22,7 @@ use crate::{
 use crate::{effects::simulate_action, simulation_evidence::SimulationEvidence};
 
 /// One trusted action result in plan order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SimulatedStep {
     /// Global identity of the simulated action.
     pub action: ActionId,
@@ -31,7 +33,7 @@ pub struct SimulatedStep {
 }
 
 /// Conditional desired configuration produced without mutating the observed baseline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SimulationResult {
     /// Predicted configuration; retained node facts are historical, not fresh observations.
     pub desired: DesiredState,
@@ -42,7 +44,7 @@ pub struct SimulationResult {
 }
 
 /// Coverage of an explicit request by typed actions, without claiming execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntentCoverage {
     /// Index in the immutable requested goal.
     pub index: usize,
@@ -53,7 +55,8 @@ pub struct IntentCoverage {
 }
 
 /// Evidence missing from a successful but conditional simulation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SimulationObligation {
     /// Condition that must hold before a particular action.
     Prerequisite {
@@ -74,7 +77,7 @@ pub enum SimulationObligation {
 }
 
 /// Plan analysis with optional goal comparison; never grants live execution permission.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SimulationReport {
     /// Predicted DesiredState, its evidence summary, and the ordered prerequisite trace.
     pub simulation: SimulationResult,
@@ -321,7 +324,8 @@ pub(crate) fn replay_plan(
 }
 
 /// Requested aspect evaluated against the predicted DesiredState.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GoalAspect {
     /// Complete semantic storage graph.
     Graph,
@@ -344,7 +348,8 @@ pub enum GoalAspect {
 }
 
 /// Three-valued result of comparing one goal aspect.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
     /// The predicted configuration establishes the requested value.
     Satisfied,
@@ -361,7 +366,7 @@ pub enum GoalStatus {
 }
 
 /// Goal-comparison result tied to one requested aspect.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalCheck {
     /// Requested aspect being checked.
     pub aspect: GoalAspect,

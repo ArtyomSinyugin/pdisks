@@ -5,6 +5,7 @@
 
 mod build;
 mod coverage;
+mod document;
 mod draft;
 mod lower;
 mod preview;
@@ -25,3 +26,5 @@ pub use coverage::RequestCoverage;
 pub use preview::{PreviewState, PreviewStatus};
 
 pub use session::{EditError, EditReceipt, PlanEdit, PlanSession};
+
+pub use document::{PREVIEW_SCHEMA_VERSION, PreviewDocument};

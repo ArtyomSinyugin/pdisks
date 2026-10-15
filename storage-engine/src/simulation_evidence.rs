@@ -65,7 +65,7 @@ impl SimulationEvidence {
 }
 
 /// Public qualifications of a prediction; excludes internal allocation and runtime guarantees.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SimulationEvidenceSummary {
     /// Baseline observations invalidated by planned effects, including activation descendants.
     pub invalidated_facts: Vec<FactInvalidation>,
@@ -276,7 +276,8 @@ pub(crate) fn apply_allocation_effects(
 }
 
 /// Origin of evidence used to satisfy a prerequisite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckEvidence {
     /// Fact copied from the observed baseline snapshot.
     ObservedSnapshot,
@@ -285,7 +286,8 @@ pub enum CheckEvidence {
 }
 
 /// Three-valued result of evaluating an action prerequisite.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     /// The condition is established by the named evidence source.
     Satisfied(CheckEvidence),
@@ -302,7 +304,7 @@ pub enum CheckStatus {
 }
 
 /// Evaluation result tied to the exact prerequisite that produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrerequisiteCheck {
     /// Evaluated contract condition.
     pub prerequisite: ActionPrerequisite,

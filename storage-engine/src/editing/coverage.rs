@@ -1,12 +1,14 @@
 //! Independent request-to-action checks, without repeating storage simulation or arithmetic.
 
+use serde::Serialize;
+
 use storage_core::model::{Diagnostic, FilesystemKind, LvmLvKind, OperationIntent};
 use storage_provider::{FilesystemAction, LvmAction, MountAction, ProviderAction};
 
 use super::{OperationId, PlanOperation, PlanRequest, lower::diagnostic};
 
 /// Whether exactly the allowed recipe implements one user request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RequestCoverage {
     /// User request checked independently of its resulting graph.
     pub operation: OperationId,

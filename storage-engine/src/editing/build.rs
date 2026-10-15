@@ -1,5 +1,7 @@
 //! Rebuilds a user draft against one historical baseline through the existing engine.
 
+use serde::Serialize;
+
 use std::collections::HashSet;
 
 use storage_core::model::{Diagnostic, OperationIntent};
@@ -18,7 +20,7 @@ use super::{
 };
 
 /// Per-build links between a stable user request and its generated actions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationActions {
     /// Stable identity retained across draft revisions.
     pub operation: OperationId,
@@ -29,7 +31,7 @@ pub struct OperationActions {
 }
 
 /// Existing storage diagnostic attributed to the request that produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationDiagnostic {
     /// Owning request, or no request for a baseline or whole-plan issue.
     pub operation: Option<OperationId>,

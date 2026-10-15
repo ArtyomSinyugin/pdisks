@@ -34,7 +34,8 @@ pub struct ProtectedMount {
 }
 
 /// Protected object touched by a planned change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProtectedAspect {
     /// Canonical node, including its contents, runtime state, and incident topology.
     Node(NodeId),
@@ -45,7 +46,7 @@ pub enum ProtectedAspect {
 }
 
 /// A planned action that intersects an explicitly protected object.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProtectionViolation {
     /// Action responsible for the change, even if a later action restores the baseline.
     pub action: ActionId,

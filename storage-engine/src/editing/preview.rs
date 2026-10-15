@@ -1,5 +1,7 @@
 //! Current preview state and UI diagnostics; none of these states grants live admission.
 
+use serde::Serialize;
+
 use storage_core::model::DiagnosticSeverity;
 
 use crate::{ActionId, ActionSimulationError, CompositionError, GoalStatus, PlanSimulationError};
@@ -10,7 +12,8 @@ use super::{
 };
 
 /// Planning status computed from the current build rather than stored independently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PreviewStatus {
     /// No current DAG or predicted state could be calculated.
     Invalid,
