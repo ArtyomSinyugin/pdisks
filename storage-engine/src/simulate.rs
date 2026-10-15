@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use storage_core::model::{
-    BootSpec, CurrentState, DesiredState, MountContext, MountEntry, NodeGraph,
+    BootSpec, CurrentState, DesiredState, MountContext, MountEntry, NodeGraph, OperationIntent,
 };
 use storage_provider::{
     ActionDescriptionContext, ActionPrerequisite, FactInvalidation, FragmentOrigin,
@@ -73,7 +73,7 @@ pub enum SimulationObligation {
     },
 }
 
-/// Goal-aware analysis; a prediction never grants live execution permission.
+/// Plan analysis with optional goal comparison; never grants live execution permission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulationReport {
     /// Predicted DesiredState, its evidence summary, and the ordered prerequisite trace.
@@ -136,10 +136,38 @@ pub fn simulate_plan_for_goal_with_policy(
     protected: &ProtectedScope,
 ) -> Result<SimulationReport, PlanSimulationError> {
     goal.graph.validate_structure()?;
+    let mut report = analyse_plan(current, plan, &goal.intents, capacity_evidence, protected)?;
+    report.goal_checks = compare_goal(
+        &report.simulation.desired,
+        &report.simulation.evidence,
+        goal,
+    );
+    for check in &report.goal_checks {
+        if let GoalStatus::Unknown { required_evidence } = &check.status {
+            report
+                .unresolved_obligations
+                .push(SimulationObligation::Goal {
+                    aspect: check.aspect.clone(),
+                    required_evidence: required_evidence.clone(),
+                });
+        }
+    }
+    Ok(report)
+}
+
+/// Analyses requests and protected scope without requiring an independently supplied goal.
+/// Unknown conditions remain obligations; the prediction never authorizes live writes.
+pub fn analyse_plan(
+    current: &CurrentState,
+    plan: &ExecutionPlan,
+    intents: &[OperationIntent],
+    capacity_evidence: &[CapacityEvidence],
+    protected: &ProtectedScope,
+) -> Result<SimulationReport, PlanSimulationError> {
     crate::validate::validate_protected_scope(protected)?;
     for action in plan.actions() {
         if let FragmentOrigin::Intent { index } = action.origin
-            && index >= goal.intents.len()
+            && index >= intents.len()
         {
             return Err(PlanSimulationError::UnknownIntentOrigin {
                 action: action.id,
@@ -148,13 +176,11 @@ pub fn simulate_plan_for_goal_with_policy(
         }
     }
     let mut simulation = simulate_plan_with_evidence(current, plan, capacity_evidence)?;
-    simulation.desired.intents = goal.intents.clone();
+    simulation.desired.intents = intents.to_vec();
     let protection_violations =
         crate::validate::check_protected_scope(plan, &simulation, protected);
-    let goal_checks = compare_goal(&simulation.desired, &simulation.evidence, goal);
     let ordered = plan.ordered_actions();
-    let intent_coverage = goal
-        .intents
+    let intent_coverage = intents
         .iter()
         .enumerate()
         .map(|(index, intent)| {
@@ -188,17 +214,9 @@ pub fn simulate_plan_for_goal_with_policy(
             }
         }
     }
-    for check in &goal_checks {
-        if let GoalStatus::Unknown { required_evidence } = &check.status {
-            unresolved_obligations.push(SimulationObligation::Goal {
-                aspect: check.aspect.clone(),
-                required_evidence: required_evidence.clone(),
-            });
-        }
-    }
     Ok(SimulationReport {
         simulation,
-        goal_checks,
+        goal_checks: Vec::new(),
         intent_coverage,
         unresolved_obligations,
         protection_violations,
@@ -529,6 +547,11 @@ mod tests {
         assert_eq!(result.desired, DesiredState::from_current(&current));
         assert_eq!(result.evidence, SimulationEvidenceSummary::default());
         assert!(result.steps.is_empty());
+        let report = analyse_plan(&current, &plan, &[], &[], &ProtectedScope::default())
+            .unwrap_or_else(|error| panic!("analyse empty plan: {error}"));
+        assert_eq!(report.simulation, result);
+        assert!(report.goal_checks.is_empty());
+        assert!(report.is_complete());
         assert_eq!(current, before);
     }
 

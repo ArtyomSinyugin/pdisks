@@ -19,8 +19,8 @@ pub use compose::{
 pub use plan::{ActionDependency, ActionId, ExecutionPlan, FragmentId, PlannedAction};
 pub use simulate::{
     GoalAspect, GoalCheck, GoalStatus, IntentCoverage, PlanSimulationError, SimulatedStep,
-    SimulationObligation, SimulationReport, SimulationResult, compare_goal, simulate_plan,
-    simulate_plan_for_goal, simulate_plan_for_goal_with_evidence,
+    SimulationObligation, SimulationReport, SimulationResult, analyse_plan, compare_goal,
+    simulate_plan, simulate_plan_for_goal, simulate_plan_for_goal_with_evidence,
     simulate_plan_for_goal_with_policy, simulate_plan_with_evidence,
 };
 pub use simulation_evidence::{

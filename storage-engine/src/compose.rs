@@ -2767,6 +2767,24 @@ mod tests {
             }]
         );
         assert!(report.is_complete());
+        let analysis = crate::analyse_plan(
+            &current,
+            &plan,
+            &goal.intents,
+            &[],
+            &ProtectedScope::default(),
+        )
+        .unwrap_or_else(|error| panic!("analyse explicit check: {error}"));
+        assert_eq!(analysis.simulation.desired.intents, goal.intents);
+        assert_eq!(analysis.intent_coverage, report.intent_coverage);
+        assert!(analysis.goal_checks.is_empty());
+        assert_eq!(
+            crate::analyse_plan(&current, &plan, &[], &[], &ProtectedScope::default()),
+            Err(PlanSimulationError::UnknownIntentOrigin {
+                action: ActionId::new(0),
+                index: 0
+            }),
+        );
         let mut wrong_goal = goal.clone();
         wrong_goal.intents = vec![OperationIntent::Repair {
             target: filesystem,
@@ -3111,6 +3129,14 @@ mod tests {
                 .all(|check| check.status == GoalStatus::Satisfied)
         );
         assert_eq!(report.protection_violations.len(), 4);
+        let analysis = crate::analyse_plan(&current, &plan, &[], &[], &protected)
+            .unwrap_or_else(|error| panic!("analyse protected labels: {error}"));
+        assert_eq!(analysis.protection_violations, report.protection_violations);
+        assert_eq!(
+            analysis.unresolved_obligations,
+            report.unresolved_obligations
+        );
+        assert!(!analysis.is_complete());
         for action in [ActionId::new(0), ActionId::new(1)] {
             for node in [filesystem, lv] {
                 assert!(
