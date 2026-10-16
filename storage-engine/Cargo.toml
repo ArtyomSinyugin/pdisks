@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 storage-core.workspace = true
 storage-provider.workspace = true
+storage-probe.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -18,6 +19,3 @@ uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", features = ["fs", "process"] }
-
-[dev-dependencies]
-storage-probe.workspace = true

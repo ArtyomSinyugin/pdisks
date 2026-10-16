@@ -10,6 +10,9 @@ use crate::{
     editing::correlate_nodes, prerequisites::matches_kind,
 };
 
+mod probe;
+pub use probe::{ProbeObservationError, ProbedObservation};
+
 /// Partial prerequisite evidence bound to one publication, without applicability or lease claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservedPrerequisites {
