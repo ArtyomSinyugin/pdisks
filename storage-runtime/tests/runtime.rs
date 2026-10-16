@@ -1075,4 +1075,145 @@ mod incidents {
         );
         Ok(())
     }
+    /// Explicit fixture policy checks fresh probe ordering and real lock lifetime during acknowledgment.
+    struct AckPolicy {
+        /// Root for verifying that the ordinary execution lock remains held.
+        root: std::path::PathBuf,
+        /// Synthetic principal/quiescence decision; no native operation is running in these tests.
+        status: storage_engine::LiveCheckStatus,
+        /// Optional fault injection replacing the marker after the safety check.
+        replace: bool,
+        /// Number of safety checks performed after confirmation and unchanged-state checks.
+        calls: usize,
+    }
+    impl storage_runtime::incident::IncidentAcknowledgmentPolicy for AckPolicy {
+        /// Never derives quiescence from the graph; the fixture explicitly supplies that evidence.
+        fn check(
+            &mut self,
+            reviewed: &storage_runtime::incident::IncidentInspection,
+            fresh: &storage_runtime::incident::IncidentInspection,
+        ) -> storage_engine::LiveCheckStatus {
+            self.calls += 1;
+            assert!(fresh.fresh_state.reference.epoch > reviewed.fresh_state.reference.epoch);
+            assert!(matches!(
+                ExecutionRoot::open(&self.root)
+                    .unwrap_or_else(|e| panic!("root: {e}"))
+                    .try_lock_host(),
+                Err(storage_runtime::lease::LeaseError::Busy)
+            ));
+            if self.replace {
+                let mut replacement = fresh.attempt.clone();
+                replacement.backend_id =
+                    BackendId::new("replacement-backend").unwrap_or_else(|| unreachable!());
+                std::fs::write(
+                    self.root.join("active-attempt.json"),
+                    replacement
+                        .to_bytes()
+                        .unwrap_or_else(|e| panic!("encode: {e}")),
+                )
+                .unwrap_or_else(|e| panic!("replace: {e}"));
+            }
+            self.status.clone()
+        }
+    }
+
+    /// Confirmation never marks the old run verified or resumes its action; unsafe evidence retains the marker.
+    #[test]
+    fn acknowledgment_requires_exact_confirmation_and_quiescence() -> Result<(), Box<dyn Error>> {
+        use storage_engine::{ActionRunState, LiveCheckStatus};
+        use storage_runtime::incident::{acknowledge_incident, review_incident};
+        for case in 0..5 {
+            let (state, frozen) = fixture()?;
+            let state = Rc::new(RefCell::new(state));
+            let scratch = Scratch::new()?;
+            let (_, run) = interrupted(&scratch, state.clone(), &frozen)?;
+            let root = ExecutionRoot::open(&scratch.0)?;
+            let probe = probe(state);
+            let review = review_incident(&root, &probe)?.ok_or("review")?;
+            let token = if case == 1 {
+                uuid::Uuid::now_v7()
+            } else {
+                review.confirmation_token()
+            };
+            let mut policy = AckPolicy {
+                root: scratch.0.clone(),
+                status: match case {
+                    2 => LiveCheckStatus::Unknown {
+                        required_evidence: "backend may still be running".into(),
+                    },
+                    3 => LiveCheckStatus::Violated {
+                        reason: "principal has no incident authorization".into(),
+                    },
+                    _ => LiveCheckStatus::Satisfied,
+                },
+                replace: case == 4,
+                calls: 0,
+            };
+            let result = acknowledge_incident(&root, &probe, review, token, &mut policy);
+            assert_eq!(result.is_ok(), case == 0);
+            assert_eq!(policy.calls, usize::from(case != 1));
+            assert_eq!(scratch.0.join("active-attempt.json").exists(), case != 0);
+            assert_eq!(run.state(ActionId::new(0))?, ActionRunState::OutcomeUnknown);
+            assert!(!run.is_verified());
+        }
+        Ok(())
+    }
+
+    /// Another root, marker replacement, or new observed state invalidates review before policy or clear.
+    #[test]
+    fn acknowledgment_rejects_changed_attempt_root_and_state() -> Result<(), Box<dyn Error>> {
+        use storage_runtime::incident::{acknowledge_incident, review_incident};
+        for case in 0..3 {
+            let (state, frozen) = fixture()?;
+            let state = Rc::new(RefCell::new(state));
+            let scratch = Scratch::new()?;
+            let (attempt, _) = interrupted(&scratch, state.clone(), &frozen)?;
+            let root = ExecutionRoot::open(&scratch.0)?;
+            let probe = probe(state.clone());
+            let review = review_incident(&root, &probe)?.ok_or("review")?;
+            let token = review.confirmation_token();
+            let other = Scratch::new()?;
+            let selected = if case == 0 { &other } else { &scratch };
+            if case == 0 {
+                let lock = ExecutionRoot::open(&other.0)?.try_lock_host()?;
+                CheckpointStore::new(&lock).arm(&attempt)?;
+            } else if case == 1 {
+                let mut replacement = attempt.clone();
+                replacement.plan_digest = "b".repeat(64);
+                std::fs::write(
+                    scratch.0.join("active-attempt.json"),
+                    replacement.to_bytes()?,
+                )?;
+            } else {
+                state.borrow_mut().current.mounts.entries.push(
+                    storage_core::model::ObservedMount {
+                        source: storage_core::model::MountSource::Tmpfs,
+                        target: "/new".into(),
+                        options: vec![],
+                        context: storage_core::model::MountContext::Host,
+                    },
+                );
+            }
+            let mut policy = AckPolicy {
+                root: selected.0.clone(),
+                status: storage_engine::LiveCheckStatus::Satisfied,
+                replace: false,
+                calls: 0,
+            };
+            assert!(
+                acknowledge_incident(
+                    &ExecutionRoot::open(&selected.0)?,
+                    &probe,
+                    review,
+                    token,
+                    &mut policy
+                )
+                .is_err()
+            );
+            assert_eq!(policy.calls, 0);
+            assert!(scratch.0.join("active-attempt.json").exists());
+            assert!(selected.0.join("active-attempt.json").exists());
+        }
+        Ok(())
+    }
 }
