@@ -1071,6 +1071,64 @@ mod tests {
         ));
     }
 
+    /// Completion and final checks reject malformed observations without dropping retained evidence.
+    #[test]
+    fn malformed_completion_and_goal_observations_leave_run_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let document = crate::wire::tests::document_fixture();
+        let instance = Uuid::now_v7();
+        let action = ActionId::new(0);
+        let mut run = ExecutionRun::new(&document)?;
+        run.begin_check(action)?;
+        run.record_admission(admission(&run, action, instance, 1))?;
+        let mut report = completion(&run, action, instance, 2, BackendOutcome::Succeeded);
+        report
+            .observation
+            .snapshot
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: NodeId::new(),
+                to: NodeId::new(),
+                kind: storage_core::model::DependencyKind::Backs,
+            });
+        let before = run.latest_observation().cloned();
+        let events = run.events_since(0).count();
+        assert!(matches!(
+            run.record_completion(report),
+            Err(ExecutionRunError::InvalidObservation(_))
+        ));
+        assert_eq!(run.state(action)?, ActionRunState::Running);
+        assert_eq!(run.latest_observation(), before.as_ref());
+        assert!(run.completion(action)?.is_none());
+        assert_eq!(run.events_since(0).count(), events);
+
+        let mut run = ExecutionRun::new(&document)?;
+        for id in 0..4 {
+            verify_one(&mut run, ActionId::new(id), instance, u64::from(id) * 2 + 1);
+        }
+        let mut report = goal_report(&run, instance, 9);
+        report
+            .observation
+            .snapshot
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: NodeId::new(),
+                to: NodeId::new(),
+                kind: storage_core::model::DependencyKind::Backs,
+            });
+        let before = run.latest_observation().cloned();
+        let events = run.events_since(0).count();
+        assert!(matches!(
+            run.record_goal_verification(report),
+            Err(ExecutionRunError::InvalidObservation(_))
+        ));
+        assert_eq!(run.latest_observation(), before.as_ref());
+        assert!(run.goal_verification().is_none());
+        assert!(!run.is_verified());
+        assert_eq!(run.events_since(0).count(), events);
+        Ok(())
+    }
+
     /// Backend failures retain actual partial state and never apply a predicted successful effect.
     #[test]
     fn failed_and_unknown_completion_publish_observation_and_forbid_retry() {

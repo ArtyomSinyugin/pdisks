@@ -282,10 +282,8 @@ impl JournalLog {
                     }
                     completion
                         .observation
-                        .snapshot
-                        .graph
-                        .validate_structure()
-                        .map_err(|_| JournalError::Structure("invalid completion graph"))?;
+                        .validate()
+                        .map_err(|_| JournalError::Structure("invalid completion observation"))?;
                     observation = Some(reference);
                 }
             }

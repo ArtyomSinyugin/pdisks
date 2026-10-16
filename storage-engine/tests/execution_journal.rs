@@ -117,6 +117,43 @@ fn journal_records_intent_before_completion_and_preserves_actual_snapshots()
             },
         };
         run.record_completion(completion.clone())?;
+        // Historical imports obey the same envelope checks as live runtime reports.
+        for case in 0..2 {
+            let mut invalid = completion.clone();
+            if case == 0 {
+                let (id, mut node) = invalid
+                    .observation
+                    .snapshot
+                    .graph
+                    .nodes()
+                    .next()
+                    .map(|(id, node)| (*id, node.clone()))
+                    .ok_or("fixture node")?;
+                node.size.observed_in = Some(ProbeEpoch::new(99));
+                invalid
+                    .observation
+                    .snapshot
+                    .graph
+                    .replace_existing(id, node)?;
+            } else {
+                invalid.observation.snapshot.mounts.entries.push(
+                    storage_core::model::ObservedMount {
+                        source: storage_core::model::MountSource::Filesystem(
+                            storage_core::model::NodeId::new(),
+                        ),
+                        target: "/dangling".into(),
+                        options: Vec::new(),
+                        context: storage_core::model::MountContext::Host,
+                    },
+                );
+            }
+            let mut bytes = before_completion.clone();
+            bytes.extend(serde_json::to_vec(&JournalRecord::Completion(Box::new(
+                invalid,
+            )))?);
+            bytes.push(b'\n');
+            assert!(JournalLog::from_bytes(&bytes).is_err());
+        }
         journal.record_completion(&run, action)?;
         let log = JournalLog::read(&path.0)?;
         let review = log.review()?;
