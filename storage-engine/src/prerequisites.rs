@@ -68,10 +68,31 @@ fn evaluate_prerequisite(
             } else if desired
                 .graph
                 .dependencies()
-                .any(|dependency| dependency.from == *node)
+                .any(|dependency| dependency.from == *node) || desired.mounts.runtime.iter().any(|mount| matches!(mount.source,
+                    MountSource::Filesystem(source) | MountSource::BtrfsSubvolume(source) | MountSource::ZfsDataset(source) if source == *node))
             {
                 CheckStatus::Violated {
                     reason: "node still has an upper-layer consumer".to_owned(),
+                }
+            } else if desired.mounts.runtime.iter().any(|mount| matches!(mount.source, MountSource::Bind(_) | MountSource::Other(_))) {
+                CheckStatus::Unknown { required_evidence: "resolve bind and unsupported mount sources before declaring the node unused".to_owned() }
+            } else {
+                satisfied_for_node(evidence, *node)
+            }
+        }
+        ActionPrerequisite::NoUnexpectedRelations(node) => {
+            if desired.graph.node(node).is_none() {
+                CheckStatus::Violated {
+                    reason: "referenced node is absent".to_owned(),
+                }
+            } else if desired
+                .graph
+                .relations()
+                .any(|relation| relation.from == *node || relation.to == *node)
+            {
+                CheckStatus::Violated {
+                    reason: "node still has a snapshot, replication, or other non-owning relation"
+                        .to_owned(),
                 }
             } else {
                 satisfied_for_node(evidence, *node)
@@ -626,6 +647,109 @@ mod resize_tests {
         });
         assert!(matches!(
             evaluate_prerequisite(&desired, &SimulationEvidence::default(), &check),
+            CheckStatus::Violated { .. }
+        ));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+    use storage_core::model::{Node, NodeFacts, NodeGraph, NodeSpec, Relation, RelationKind};
+
+    /// Known mounts block mutation and unresolved bind/other mounts cannot prove a node unused.
+    #[test]
+    fn consumer_checks_include_runtime_mount_references() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let baseline: crate::HistoricalBaseline =
+            serde_json::from_str(include_str!("../examples/fixtures/editing_baseline.json"))?;
+        let mut desired = DesiredState::from_current(&baseline.snapshot);
+        let target = *desired
+            .graph
+            .nodes()
+            .next()
+            .ok_or("missing fixture node")?
+            .0;
+        let condition = ActionPrerequisite::NoUnexpectedConsumers(target);
+        for source in [
+            MountSource::Filesystem(target),
+            MountSource::Bind("/data".into()),
+            MountSource::Other("/dev/example".to_owned()),
+        ] {
+            let known = matches!(source, MountSource::Filesystem(_));
+            desired.mounts.runtime = vec![MountEntry {
+                source,
+                target: "/mnt".into(),
+                options: vec![],
+                context: MountContext::Host,
+            }];
+            let status =
+                evaluate_prerequisite(&desired, &SimulationEvidence::default(), &condition);
+            assert!(if known {
+                matches!(status, CheckStatus::Violated { .. })
+            } else {
+                matches!(status, CheckStatus::Unknown { .. })
+            });
+        }
+        desired.mounts.runtime.clear();
+        assert!(matches!(
+            evaluate_prerequisite(&desired, &SimulationEvidence::default(), &condition),
+            CheckStatus::Satisfied(_)
+        ));
+        Ok(())
+    }
+
+    /// Every incident relation blocks a generic removal, including incoming snapshot/replication links.
+    #[test]
+    fn removal_does_not_forget_non_owning_relationships() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let baseline: crate::HistoricalBaseline =
+            serde_json::from_str(include_str!("../examples/fixtures/editing_baseline.json"))?;
+        let mut desired = DesiredState::from_current(&baseline.snapshot);
+        desired.graph = NodeGraph::new();
+        let target = NodeId::new();
+        let other = NodeId::new();
+        for node in [target, other] {
+            desired.graph.insert_new(
+                node,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
+                },
+            )?;
+        }
+        let prerequisite = ActionPrerequisite::NoUnexpectedRelations(target);
+        let evidence = SimulationEvidence::default();
+        for kind in [
+            RelationKind::SnapshotOf,
+            RelationKind::Replicates,
+            RelationKind::NvmeAttachedTo,
+        ] {
+            for incoming in [false, true] {
+                let relation = Relation {
+                    from: if incoming { other } else { target },
+                    to: if incoming { target } else { other },
+                    kind: kind.clone(),
+                };
+                desired.graph.insert_relation(relation.clone());
+                assert!(matches!(
+                    evaluate_prerequisite(&desired, &evidence, &prerequisite),
+                    CheckStatus::Violated { .. }
+                ));
+                desired.graph.remove_relation(&relation);
+                assert!(matches!(
+                    evaluate_prerequisite(&desired, &evidence, &prerequisite),
+                    CheckStatus::Satisfied(_)
+                ));
+            }
+        }
+        assert!(desired.graph.remove_node(&target).is_some());
+        assert!(matches!(
+            evaluate_prerequisite(&desired, &evidence, &prerequisite),
             CheckStatus::Violated { .. }
         ));
         Ok(())

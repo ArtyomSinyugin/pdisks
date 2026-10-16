@@ -53,8 +53,12 @@ pub enum ActionPrerequisite {
         /// Required semantic kind class.
         expected: NodeKindClass,
     },
-    /// No unplanned upper-layer consumer may depend on this node.
+    /// No upper-layer graph or runtime mount consumer may depend on this node.
+    /// Unresolved bind/other mount sources need fresh runtime evidence.
     NoUnexpectedConsumers(NodeId),
+    /// No snapshot, replication, or other non-owning relation may still reference this node.
+    /// Such links require an explicit technology-specific removal recipe.
+    NoUnexpectedRelations(NodeId),
     /// The backing endpoint must not be observed read-only.
     Writable(NodeId),
     /// The graph-backed mount source must expose an available backing endpoint.
@@ -558,6 +562,17 @@ pub fn describe_action(
         ProviderAction::Btrfs(action) => describe_btrfs(action, context),
         ProviderAction::Mount(action) => describe_mount(action, context.graph),
     };
+    if contract
+        .prerequisites
+        .iter()
+        .any(|condition| matches!(condition, ActionPrerequisite::NoUnexpectedConsumers(_)))
+        && !contract
+            .affected_resources
+            .iter()
+            .any(|access| access.resource == ActionResource::RuntimeMountState)
+    {
+        read(&mut contract, ActionResource::RuntimeMountState);
+    }
     let mut outputs = outputs_from_effect(&contract.predicted_effect);
     outputs.append(&mut contract.provided_outputs);
     contract.provided_outputs = outputs;
@@ -1633,9 +1648,10 @@ fn remove_node_contract(
     let mut result = contract(RestartPolicy::ReprobeThenRetry);
     require_kind(&mut result, node, expected);
     if require_no_consumers {
-        result
-            .prerequisites
-            .push(ActionPrerequisite::NoUnexpectedConsumers(node));
+        result.prerequisites.extend([
+            ActionPrerequisite::NoUnexpectedConsumers(node),
+            ActionPrerequisite::NoUnexpectedRelations(node),
+        ]);
     }
     write(&mut result, ActionResource::Node(node));
     result
@@ -1654,16 +1670,6 @@ fn remove_node_contract(
         result
             .postconditions
             .push(Postcondition::DependencyAbsent(dependency.clone()));
-    }
-    for relation in context
-        .graph
-        .relations()
-        .filter(|relation| relation.from == node || relation.to == node)
-    {
-        result
-            .predicted_effect
-            .graph
-            .push(GraphEffect::RemoveRelation(relation.clone()));
     }
     invalidate(&mut result, node, FactKind::Presence);
     result.postconditions.push(Postcondition::NodeAbsent(node));
@@ -2025,6 +2031,16 @@ mod tests {
                     .prerequisites
                     .contains(&ActionPrerequisite::NoUnexpectedConsumers(target))
             );
+            assert!(
+                contract
+                    .prerequisites
+                    .contains(&ActionPrerequisite::NoUnexpectedRelations(target))
+            );
+            let mut stripped = contract.clone();
+            stripped.prerequisites.retain(|condition| {
+                !matches!(condition, ActionPrerequisite::NoUnexpectedRelations(_))
+            });
+            assert!(verify_imported_contract(&action, stripped, context).is_err());
             assert_eq!(
                 contract
                     .predicted_effect
