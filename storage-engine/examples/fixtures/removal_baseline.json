@@ -1,0 +1,329 @@
+{
+  "id": "00000000-0000-7000-8000-000000000501",
+  "snapshot": {
+    "graph": {
+      "nodes": {
+        "00000000-0000-7000-8000-000000000002": {
+          "kind": {
+            "kind": {
+              "LvmVg": {
+                "name": "vg0",
+                "extent_size": 4194304
+              }
+            },
+            "size": 68719476736
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "LvmVgUuid": "example-vg-uuid"
+              }
+            ],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000012": {
+          "kind": {
+            "kind": {
+              "LvmLv": {
+                "name": "data",
+                "kind": "Linear"
+              }
+            },
+            "size": 134217728
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "LvmLvUuid": "example-resize-lv-uuid"
+              }
+            ],
+            "block": {
+              "paths": [
+                "/dev/example/data"
+              ],
+              "devno": {
+                "major": 253,
+                "minor": 0
+              },
+              "geometry": null,
+              "read_only": false
+            },
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000013": {
+          "kind": {
+            "kind": {
+              "Filesystem": {
+                "kind": "Ext4",
+                "label": "data"
+              }
+            },
+            "size": 134217728
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "Filesystem": {
+                  "fs_type": "ext4",
+                  "value": "example-resize-fs-uuid"
+                }
+              }
+            ],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000021": {
+          "kind": {
+            "kind": {
+              "LvmLv": {
+                "name": "spare",
+                "kind": "Linear"
+              }
+            },
+            "size": 16777216
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "LvmLvUuid": "example-spare-lv-uuid"
+              }
+            ],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000022": {
+          "kind": {
+            "kind": {
+              "LvmLv": {
+                "name": "keep",
+                "kind": "Linear"
+              }
+            },
+            "size": 33554432
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "LvmLvUuid": "example-keep-lv-uuid"
+              }
+            ],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000101": {
+          "kind": {
+            "kind": "Disk",
+            "size": 67108864
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000102": {
+          "kind": {
+            "kind": {
+              "PartitionTable": "GPT"
+            },
+            "size": 67108864
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000103": {
+          "kind": {
+            "kind": {
+              "Partition": {
+                "number": 1,
+                "offset": 1048576,
+                "role": null,
+                "attributes": {
+                  "gpt": null,
+                  "bootable": null
+                }
+              }
+            },
+            "size": 8388608
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000104": {
+          "kind": {
+            "kind": {
+              "Partition": {
+                "number": 2,
+                "offset": 16777216,
+                "role": null,
+                "attributes": {
+                  "gpt": null,
+                  "bootable": null
+                }
+              }
+            },
+            "size": 16777216
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000105": {
+          "kind": {
+            "kind": {
+              "LuksContainer": {
+                "version": "Luks2"
+              }
+            },
+            "size": 14680064
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000106": {
+          "kind": {
+            "kind": {
+              "DmCryptMapping": {
+                "name": "crypt-unused"
+              }
+            },
+            "size": 14680064
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        }
+      },
+      "dependencies": [
+        {
+          "from": "00000000-0000-7000-8000-000000000002",
+          "to": "00000000-0000-7000-8000-000000000012",
+          "kind": "Provides"
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000012",
+          "to": "00000000-0000-7000-8000-000000000013",
+          "kind": "Backs"
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000002",
+          "to": "00000000-0000-7000-8000-000000000021",
+          "kind": "Provides"
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000002",
+          "to": "00000000-0000-7000-8000-000000000022",
+          "kind": "Provides"
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000101",
+          "to": "00000000-0000-7000-8000-000000000102",
+          "kind": "Backs"
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000102",
+          "to": "00000000-0000-7000-8000-000000000103",
+          "kind": {
+            "Contains": {
+              "offset": 1048576
+            }
+          }
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000102",
+          "to": "00000000-0000-7000-8000-000000000104",
+          "kind": {
+            "Contains": {
+              "offset": 16777216
+            }
+          }
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000104",
+          "to": "00000000-0000-7000-8000-000000000105",
+          "kind": "Backs"
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000105",
+          "to": "00000000-0000-7000-8000-000000000106",
+          "kind": "Backs"
+        }
+      ],
+      "relations": []
+    },
+    "mounts": {
+      "entries": [
+        {
+          "source": {
+            "filesystem": "00000000-0000-7000-8000-000000000013"
+          },
+          "target": "/data",
+          "options": [
+            "rw"
+          ],
+          "context": "host"
+        }
+      ]
+    },
+    "environment": {
+      "host": {
+        "os_release": null,
+        "architecture": null,
+        "kernel_release": null,
+        "tools": [],
+        "kernel_modules": []
+      },
+      "target": null
+    },
+    "diagnostics": []
+  },
+  "capacity_evidence": [
+    {
+      "domain": {
+        "lvm_volume_group": "00000000-0000-7000-8000-000000000002"
+      },
+      "available": 16
+    }
+  ]
+}
