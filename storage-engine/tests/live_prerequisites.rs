@@ -157,3 +157,136 @@ fn correlation_gaps_and_external_permissions_remain_unknown() -> Result<(), Box<
     );
     Ok(())
 }
+
+/// Present consumers and relations veto removal; incomplete absence never proves exclusivity.
+#[test]
+fn observed_consumers_relations_and_mounts_block_offline_work() -> Result<(), Box<dyn Error>> {
+    use storage_core::model::{MountSource, Relation, RelationKind};
+    let (mut baseline, mut observation, old_lv, new_lv) = fixture()?;
+    let old_fs = *baseline
+        .snapshot
+        .graph
+        .nodes()
+        .find(|(_, node)| matches!(node.kind.kind, NodeKind::Filesystem { .. }))
+        .ok_or("filesystem fixture")?
+        .0;
+    let new_fs = NodeId::new();
+    observation.snapshot = serde_json::from_str(
+        &serde_json::to_string(&observation.snapshot)?
+            .replace(&old_fs.as_uuid().to_string(), &new_fs.as_uuid().to_string()),
+    )?;
+    let original_edge = baseline
+        .snapshot
+        .graph
+        .dependencies()
+        .find(|edge| edge.from == old_lv)
+        .ok_or("backing edge")?
+        .clone();
+    baseline.snapshot.graph.remove_dependency(&original_edge);
+    let conditions = [
+        ActionPrerequisite::NoUnexpectedConsumers(old_lv),
+        ActionPrerequisite::NoUnexpectedConsumers(old_fs),
+        ActionPrerequisite::FilesystemUnmounted(old_fs),
+        ActionPrerequisite::NoUnexpectedRelations(old_lv),
+    ];
+    let report = check_observed_prerequisites(&baseline, &observation, &conditions)?;
+    assert!(
+        report.checks[..3]
+            .iter()
+            .all(|check| matches!(check.status, LiveCheckStatus::Violated { .. }))
+    );
+    assert!(matches!(
+        report.checks[3].status,
+        LiveCheckStatus::Unknown { .. }
+    ));
+    for (from, to) in [(new_lv, new_fs), (new_fs, new_lv)] {
+        let relation = Relation {
+            from,
+            to,
+            kind: RelationKind::SnapshotOf,
+        };
+        observation.snapshot.graph.insert_relation(relation.clone());
+        let report = check_observed_prerequisites(&baseline, &observation, &conditions)?;
+        assert!(matches!(
+            report.checks[3].status,
+            LiveCheckStatus::Violated { .. }
+        ));
+        observation.snapshot.graph.remove_relation(&relation);
+    }
+    let edge = observation
+        .snapshot
+        .graph
+        .dependencies()
+        .find(|edge| edge.from == new_lv)
+        .ok_or("fresh backing")?
+        .clone();
+    observation.snapshot.graph.remove_dependency(&edge);
+    observation.snapshot.mounts.entries.clear();
+    let report = check_observed_prerequisites(&baseline, &observation, &conditions)?;
+    assert!(
+        report
+            .checks
+            .iter()
+            .all(|check| matches!(check.status, LiveCheckStatus::Unknown { .. }))
+    );
+    observation
+        .snapshot
+        .mounts
+        .entries
+        .push(storage_core::model::ObservedMount {
+            source: MountSource::Bind("/unknown-source".into()),
+            target: "/bind".into(),
+            options: Vec::new(),
+            context: storage_core::model::MountContext::Host,
+        });
+    let report = check_observed_prerequisites(&baseline, &observation, &conditions)?;
+    assert!(
+        report
+            .checks
+            .iter()
+            .all(|check| matches!(check.status, LiveCheckStatus::Unknown { .. }))
+    );
+    Ok(())
+}
+
+/// Partial observations are representable, but contradictory publication stamps and nil IDs fail.
+#[test]
+fn observation_validation_preserves_partial_state_and_rejects_invalid_envelopes()
+-> Result<(), Box<dyn Error>> {
+    let (_, mut observation, _, new) = fixture()?;
+    let mut node = observation.snapshot.graph.node(&new).ok_or("LV")?.clone();
+    node.size.observed_in = Some(observation.reference.epoch);
+    node.size.presence = storage_core::model::Presence::Missing;
+    observation
+        .snapshot
+        .graph
+        .replace_existing(new, node.clone())?;
+    observation.validate()?;
+    node.size.observed_in = Some(ProbeEpoch::new(99));
+    observation
+        .snapshot
+        .graph
+        .replace_existing(new, node.clone())?;
+    assert!(
+        matches!(observation.validate(), Err(storage_engine::live::ObservationError::NodeEpoch(id)) if id == new)
+    );
+    node.size.observed_in = None;
+    observation
+        .snapshot
+        .graph
+        .replace_existing(new, node.clone())?;
+    observation
+        .snapshot
+        .graph
+        .insert_new(NodeId::from_uuid(Uuid::nil()), node)?;
+    assert!(matches!(
+        observation.validate(),
+        Err(storage_engine::live::ObservationError::NilNode)
+    ));
+    observation.reference.probe_instance = Uuid::nil();
+    assert!(matches!(
+        observation.validate(),
+        Err(storage_engine::live::ObservationError::NilInstance)
+    ));
+    Ok(())
+}
