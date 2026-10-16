@@ -41,9 +41,9 @@ use crate::{
     snapshot::ProbeSnapshot,
 };
 
-/// Linux current-state probe backed by provider-specific adapters.
-pub struct LinuxProbe {
-    providers: Vec<Box<dyn StateProvider>>,
+/// Linux current-state probe; adapters may borrow backend registrations for its lifetime.
+pub struct LinuxProbe<'a> {
+    providers: Vec<Box<dyn StateProvider + 'a>>,
     /// Last published generation; interior mutation preserves the read-only probe API.
     generation: Cell<u64>,
 }
@@ -378,9 +378,8 @@ impl StateProvider for NativeLocalProvider<'_> {
         state
             .diagnostics
             .extend(enrich_mdraid(&mut state.graph, &mdraid));
-        state
-            .diagnostics
-            .extend(enrich_lvm(&mut state.graph, &endpoints, &mappings, &lvm));
+        let diagnostics = enrich_lvm(&mut state, &endpoints, &mappings, &lvm);
+        state.diagnostics.extend(diagnostics);
         Ok(state)
     }
 }
@@ -1013,13 +1012,14 @@ fn md_metadata(metadata: Option<&str>) -> MdMetadata {
     }
 }
 
-/// Adds LVM PV/VG/LV topology and stable LVM identities.
+/// Adds LVM topology and retains the same raw VG records with their assigned graph identities.
 fn enrich_lvm(
-    graph: &mut NodeGraph,
+    state: &mut ProviderState,
     endpoints: &[UdevBlockEntry],
     mappings: &[storage_provider::DevmapperEntry],
     topology: &storage_provider::LvmEntry,
 ) -> Vec<Diagnostic> {
+    let graph = &mut state.graph;
     let mut diagnostics = Vec::new();
     let endpoint_paths = endpoints
         .iter()
@@ -1051,6 +1051,10 @@ fn enrich_lvm(
                 },
             },
         );
+        state.lvm_vgs.push(storage_provider::LvmVgObservation {
+            node: id,
+            vg: vg.clone(),
+        });
     }
 
     for pv in &topology.pvs {
@@ -1923,9 +1927,9 @@ fn partition_path(device: &Path, number: u32) -> PathBuf {
     PathBuf::from(path)
 }
 
-impl LinuxProbe {
+impl<'a> LinuxProbe<'a> {
     /// Creates a probe from adapters with non-overlapping responsibilities.
-    pub fn from_providers(providers: Vec<Box<dyn StateProvider>>) -> Self {
+    pub fn from_providers(providers: Vec<Box<dyn StateProvider + 'a>>) -> Self {
         Self {
             providers,
             generation: Cell::new(0),
@@ -2838,8 +2842,16 @@ mod tests {
             }],
         };
 
-        let diagnostics = enrich_lvm(&mut graph, &[mapper_endpoint], &mappings, &topology);
+        let mut state = ProviderState {
+            graph,
+            ..ProviderState::default()
+        };
+        let diagnostics = enrich_lvm(&mut state, &[mapper_endpoint], &mappings, &topology);
         assert!(diagnostics.is_empty());
+        assert_eq!(state.lvm_vgs.len(), 1);
+        assert_eq!(state.lvm_vgs[0].node, stable_node_id("lvm-vg", "aaaaaaaa"));
+        assert_eq!(state.lvm_vgs[0].vg, topology.vgs[0]);
+        let graph = &state.graph;
 
         let vg_id = stable_node_id("lvm-vg", "aaaaaaaa");
         let lv_id = block_node_id(Path::new("/dev/dm-0"));
@@ -2856,6 +2868,63 @@ mod tests {
                 && dependency.to == lv_id
                 && dependency.kind == DependencyKind::Provides
         }));
+    }
+
+    /// Adapter borrowing observed state, like native adapters borrow backend registrations.
+    struct BorrowedProvider<'a> {
+        /// One immutable response tied to the adapter's borrowed context.
+        state: &'a ProviderState,
+    }
+
+    impl StateProvider for BorrowedProvider<'_> {
+        /// Stable identity for the borrowed fixture adapter.
+        fn id(&self) -> &str {
+            "borrowed"
+        }
+        /// Exclusive storage responsibility for this test publication.
+        fn responsibility(&self) -> &str {
+            "borrowed.storage"
+        }
+        /// Same built-in attachment mechanism as the native stack.
+        fn connection_kind(&self) -> ProviderConnectionKind {
+            ProviderConnectionKind::BuiltIn
+        }
+        /// Publishes a clone without replacing or mutating the borrowed source.
+        fn probe(&self) -> Result<ProviderState, ProviderProbeError> {
+            Ok(self.state.clone())
+        }
+    }
+
+    /// Native raw records stay attached through a borrowed adapter and one Linux publication.
+    #[test]
+    fn borrowed_adapters_publish_native_vg_observations() {
+        let mut state = ProviderState::default();
+        let topology = LvmEntry {
+            vgs: vec![LvmVgEntry {
+                name: "vg0".to_owned(),
+                uuid: "same-pass-uuid".to_owned(),
+                size: 400 * 1024 * 1024,
+                extent_size: 4 * 1024 * 1024,
+                free: 0,
+                pv_count: 1,
+                exported: false,
+            }],
+            ..LvmEntry::default()
+        };
+        assert!(enrich_lvm(&mut state, &[], &[], &topology).is_empty());
+        let probe = LinuxProbe::from_providers(vec![Box::new(BorrowedProvider { state: &state })]);
+        let first = probe.probe();
+        let second = probe.probe();
+        assert_eq!(first.current.graph, state.graph);
+        assert_eq!(first.lvm_vgs, state.lvm_vgs);
+        assert_eq!(first.lvm_vgs[0].vg.free, 0);
+        assert!(first.current.graph.node(&first.lvm_vgs[0].node).is_some());
+        assert_eq!(second.lvm_vgs, first.lvm_vgs);
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(state.lvm_vgs[0].vg, topology.vgs[0]);
+        let mut empty = ProviderState::default();
+        assert!(enrich_lvm(&mut empty, &[], &[], &LvmEntry::default()).is_empty());
+        assert!(empty.lvm_vgs.is_empty());
     }
 
     /// Ensures MD levels requiring unavailable layout data stay unclassified.
