@@ -133,8 +133,8 @@ impl DurableJournal {
         run: &ExecutionRun,
         action: ActionId,
     ) -> Result<(), JournalError> {
-        self.check_run(run)?;
-        if !self.intents.contains(&action) || self.completions.contains(&action) {
+        self.require_dispatch_intent(run, action)?;
+        if self.completions.contains(&action) {
             return Err(JournalError::Structure(
                 "completion requires one recorded intent",
             ));
@@ -151,6 +151,21 @@ impl DurableJournal {
             .last()
             .map_or(self.event_sequence, |event| event.sequence);
         self.completions.insert(action);
+        Ok(())
+    }
+
+    /// Requires an acknowledged intent on this healthy bound journal before collecting a result.
+    pub(crate) fn require_dispatch_intent(
+        &self,
+        run: &ExecutionRun,
+        action: ActionId,
+    ) -> Result<(), JournalError> {
+        self.check_run(run)?;
+        if !self.intents.contains(&action) {
+            return Err(JournalError::Structure(
+                "completion requires one recorded intent",
+            ));
+        }
         Ok(())
     }
 
@@ -250,6 +265,67 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// An unacknowledged completion stops even a successful backend; the actual probe is retained.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leased_completion_write_failure_retains_actual_state_and_stops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            BackendOutcome, LiveCheck, LiveCheckStatus, journal::RecoveryStatus,
+            leases::ExecutionLease, live::ProbedObservation,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let directory = Directory::new()?;
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))?;
+        let path = directory.0.join("run.jsonl");
+        let (frozen, mut run) = super::super::tests::frozen_run()?;
+        let mut journal = DurableJournal::create(&path, &frozen, &run)?;
+        let action = ActionId::new(0);
+        run.begin_check(action)?;
+        let guard = ExecutionLease::try_acquire(&directory.0, &run, action)?;
+        let probe = storage_probe::LinuxProbe::from_providers(Vec::new());
+        let observed = ProbedObservation::collect(&probe)?.into_observation();
+        // Synthetic admission tests I/O handling only; no native backend/checker is invoked.
+        let claims = run.context().plan.actions()[0]
+            .informational_contract
+            .prerequisites
+            .iter()
+            .cloned()
+            .map(|condition| LiveCheck {
+                condition,
+                status: LiveCheckStatus::Satisfied,
+            })
+            .collect();
+        guard.record_admission(&mut run, observed, LiveCheckStatus::Satisfied, claims)?;
+        guard.record_dispatch_intent(&mut journal, &run)?;
+        let before = std::fs::read(&path)?;
+        journal.file = File::open(&path)?;
+        assert!(
+            guard
+                .record_probed_completion(&mut journal, &mut run, &probe, BackendOutcome::Succeeded)
+                .is_err()
+        );
+        assert_eq!(run.state(action)?, ActionRunState::OutcomeUnknown);
+        assert!(run.completion(action)?.is_some());
+        assert_eq!(
+            run.latest_observation()
+                .ok_or("actual observation")?
+                .reference
+                .epoch
+                .get(),
+            2
+        );
+        assert!(journal.poisoned);
+        assert_eq!(std::fs::read(&path)?, before);
+        assert_eq!(
+            JournalLog::read(&path)?.review()?.actions[0].status,
+            RecoveryStatus::InvocationUnconfirmed
+        );
+        assert!(run.begin_check(action).is_err());
+        drop(guard);
+        Ok(())
     }
 
     /// Existing files remain untouched, events flush once, and I/O errors poison the writer.

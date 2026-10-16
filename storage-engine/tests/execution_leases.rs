@@ -364,3 +364,186 @@ fn lease_excludes_other_processes_and_survives_process_exit() -> Result<(), Box<
     drop(lease);
     Ok(())
 }
+
+/// Supplies mutable test observations through the real probe assembler, without native adapters.
+struct ActualProvider<'a> {
+    /// Synthetic actual snapshot selected by the test after its simulated backend returns.
+    state: &'a std::cell::RefCell<storage_core::model::CurrentState>,
+    /// Confirms that rejected lifecycle/journal inputs do not trigger another probe.
+    calls: &'a std::cell::Cell<u64>,
+}
+impl storage_probe::StateProvider for ActualProvider<'_> {
+    /// Explicit identity of this test adapter.
+    fn id(&self) -> &str {
+        "completion-fixture"
+    }
+    /// Sole responsibility for its synthetic contribution.
+    fn responsibility(&self) -> &str {
+        "completion.fixture"
+    }
+    /// Uses normal in-process probe orchestration.
+    fn connection_kind(&self) -> storage_provider::ProviderConnectionKind {
+        storage_provider::ProviderConnectionKind::BuiltIn
+    }
+    /// Publishes only the selected actual fixture, without applying any predicted effect.
+    fn probe(&self) -> Result<storage_probe::ProviderState, storage_probe::ProviderProbeError> {
+        self.calls.set(self.calls.get() + 1);
+        let state = self.state.borrow();
+        Ok(storage_probe::ProviderState {
+            graph: state.graph.clone(),
+            mounts: state.mounts.entries.clone(),
+            environment: Some(state.environment.clone()),
+            diagnostics: state.diagnostics.clone(),
+            lvm_vgs: Vec::new(),
+        })
+    }
+}
+
+/// All classified outcomes publish actual probe state and sync it under the retained guard.
+#[test]
+fn leased_completion_probes_and_journals_success_failure_and_unknown() -> Result<(), Box<dyn Error>>
+{
+    use storage_engine::{
+        ActionRunState, BackendOutcome, LiveCheckStatus,
+        journal::{DurableJournal, JournalLog, RecoveryStatus},
+        live::ProbedObservation,
+    };
+    for (outcome, expected_state) in [
+        (BackendOutcome::Succeeded, ActionRunState::Verifying),
+        (
+            BackendOutcome::Failed {
+                reason: "fixture failure".into(),
+            },
+            ActionRunState::Failed,
+        ),
+        (
+            BackendOutcome::OutcomeUnknown {
+                reason: "fixture interruption".into(),
+            },
+            ActionRunState::OutcomeUnknown,
+        ),
+    ] {
+        let root = Scratch::new()?;
+        let (frozen, _) = fixture()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let action = ActionId::new(0);
+        let path = root.0.join("run.jsonl");
+        let mut journal = DurableJournal::create(&path, &frozen, &run)?;
+        run.begin_check(action)?;
+        let guard = ExecutionLease::try_acquire(&root.0, &run, action)?;
+        let state = std::cell::RefCell::new(run.document().baseline.snapshot.clone());
+        let calls = std::cell::Cell::new(0);
+        let probe = storage_probe::LinuxProbe::from_providers(vec![Box::new(ActualProvider {
+            state: &state,
+            calls: &calls,
+        })]);
+        let observed = ProbedObservation::collect(&probe)?.into_observation();
+        // Synthetic complete admission isolates completion wiring from the unfinished native checker.
+        let claims = checks(&run, LiveCheckStatus::Satisfied);
+        guard.record_admission(&mut run, observed, LiveCheckStatus::Satisfied, claims)?;
+        assert!(
+            guard
+                .record_probed_completion(&mut journal, &mut run, &probe, outcome.clone())
+                .is_err()
+        );
+        assert_eq!(calls.get(), 1);
+        guard.record_dispatch_intent(&mut journal, &run)?;
+        state.borrow_mut().graph = storage_core::model::NodeGraph::new();
+        guard.record_probed_completion(&mut journal, &mut run, &probe, outcome.clone())?;
+        assert_eq!(calls.get(), 2);
+        assert_eq!(run.state(action)?, expected_state);
+        let completion = run.completion(action)?.ok_or("actual completion")?;
+        assert_eq!(completion.outcome, outcome);
+        assert_eq!(completion.observation.reference.epoch.get(), 2);
+        assert_eq!(completion.observation.snapshot, *state.borrow());
+        assert_eq!(run.latest_observation(), Some(&completion.observation));
+        assert!(
+            matches!(&JournalLog::read(&path)?.review()?.actions[0].status,
+            RecoveryStatus::CompletionRecorded { outcome: recorded, .. } if *recorded == outcome)
+        );
+        assert!(
+            guard
+                .record_probed_completion(&mut journal, &mut run, &probe, outcome)
+                .is_err()
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(!run.is_verified());
+        drop(guard);
+    }
+    Ok(())
+}
+
+/// Missing/foreign post-backend evidence stops the action and cannot replace the last actual state.
+#[test]
+fn completion_probe_failure_stops_without_retry_or_projected_success() -> Result<(), Box<dyn Error>>
+{
+    use storage_engine::{
+        ActionRunState, BackendOutcome, LiveCheckStatus,
+        journal::{DurableJournal, JournalLog, RecoveryStatus},
+        live::ProbedObservation,
+    };
+    for foreign_probe in [false, true] {
+        let root = Scratch::new()?;
+        let (frozen, _) = fixture()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let action = ActionId::new(0);
+        let path = root.0.join("run.jsonl");
+        let mut journal = DurableJournal::create(&path, &frozen, &run)?;
+        run.begin_check(action)?;
+        let guard = ExecutionLease::try_acquire(&root.0, &run, action)?;
+        let state = std::cell::RefCell::new(run.document().baseline.snapshot.clone());
+        let calls = std::cell::Cell::new(0);
+        let probe = storage_probe::LinuxProbe::from_providers(vec![Box::new(ActualProvider {
+            state: &state,
+            calls: &calls,
+        })]);
+        let other_probe =
+            storage_probe::LinuxProbe::from_providers(vec![Box::new(ActualProvider {
+                state: &state,
+                calls: &calls,
+            })]);
+        let observed = ProbedObservation::collect(&probe)?.into_observation();
+        let claims = checks(&run, LiveCheckStatus::Satisfied);
+        guard.record_admission(&mut run, observed, LiveCheckStatus::Satisfied, claims)?;
+        guard.record_dispatch_intent(&mut journal, &run)?;
+        let retained = run.latest_observation().cloned();
+        if !foreign_probe {
+            state
+                .borrow_mut()
+                .graph
+                .insert_dependency(storage_core::model::Dependency {
+                    from: storage_core::model::NodeId::new(),
+                    to: storage_core::model::NodeId::new(),
+                    kind: storage_core::model::DependencyKind::Backs,
+                });
+        }
+        let selected = if foreign_probe { &other_probe } else { &probe };
+        assert!(
+            guard
+                .record_probed_completion(
+                    &mut journal,
+                    &mut run,
+                    selected,
+                    BackendOutcome::Succeeded
+                )
+                .is_err()
+        );
+        assert_eq!(run.state(action)?, ActionRunState::OutcomeUnknown);
+        assert_eq!(run.latest_observation(), retained.as_ref());
+        assert!(run.completion(action)?.is_none());
+        assert!(run.unknown_reason(action)?.is_some());
+        assert_eq!(
+            JournalLog::read(&path)?.review()?.actions[0].status,
+            RecoveryStatus::InvocationUnconfirmed
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(
+            guard
+                .record_probed_completion(&mut journal, &mut run, &probe, BackendOutcome::Succeeded)
+                .is_err()
+        );
+        assert_eq!(calls.get(), 2);
+        drop(guard);
+    }
+    Ok(())
+}

@@ -13,8 +13,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ActionId, ActionRunState, AdmissionReport, ExecutionRun, ExecutionRunError, LiveCheck,
-    LiveCheckStatus, LiveObservation,
+    ActionId, ActionRunState, AdmissionReport, BackendCompletion, BackendOutcome, ExecutionRun,
+    ExecutionRunError, LiveCheck, LiveCheckStatus, LiveObservation,
     journal::{DurableJournal, JournalError},
     live::{ProbeObservationError, ProbedObservation},
 };
@@ -199,6 +199,54 @@ impl ExecutionLease {
         self.record_admission(run, publication.into_observation(), LiveCheckStatus::Unknown {
             required_evidence: "native capability, scope applicability, and authorization checks are not configured".into(),
         }, report.checks)?;
+        Ok(())
+    }
+
+    /// Collects and journals the actual result after the host's backend invocation returns.
+    /// The host supplies its classified outcome; this method never invokes a storage backend.
+    /// Probe/identity failure stops as OutcomeUnknown while preserving the last actual snapshot.
+    pub fn record_probed_completion(
+        &self,
+        journal: &mut DurableJournal,
+        run: &mut ExecutionRun,
+        probe: &storage_probe::LinuxProbe<'_>,
+        outcome: BackendOutcome,
+    ) -> Result<(), LeaseError> {
+        self.check_run(run)?;
+        let state = run.state(self.action)?;
+        if state != ActionRunState::Running {
+            return Err(ExecutionRunError::InvalidTransition {
+                action: self.action,
+                state,
+            }
+            .into());
+        }
+        journal.require_dispatch_intent(run, self.action)?;
+        let result = ProbedObservation::collect(probe)
+            .map_err(LeaseError::from)
+            .and_then(|publication| {
+                run.record_completion(BackendCompletion {
+                    run_id: self.run_id,
+                    action: self.action,
+                    outcome,
+                    observation: publication.into_observation(),
+                })?;
+                Ok(())
+            });
+        if let Err(error) = result {
+            run.mark_outcome_unknown(self.action, error.to_string())?;
+            journal.flush_events(run)?;
+            return Err(error);
+        }
+        if let Err(error) = journal.record_completion(run, self.action) {
+            if run.state(self.action)? == ActionRunState::Verifying {
+                run.mark_outcome_unknown(
+                    self.action,
+                    format!("completion journal acknowledgment failed: {error}"),
+                )?;
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 
