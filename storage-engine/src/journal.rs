@@ -11,6 +11,9 @@ use crate::{
     editing::{DraftRevision, FrozenPlan, OperationId},
 };
 
+mod file;
+pub use file::DurableJournal;
+
 /// Initial JSON-lines journal envelope, separate from plan/action schemas.
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 /// Maximum journal size accepted by this initial non-rotating format.
@@ -169,6 +172,12 @@ pub enum JournalError {
     /// Bounded size/count exhausted before further writing or parsing.
     #[error("journal exceeds its byte or record limit")]
     Limit,
+    /// A failed write/sync makes further appends unsafe; this handle cannot be resumed.
+    #[error("journal is unusable after an I/O failure")]
+    Poisoned,
+    /// The run has no admissible state or completion for the requested record.
+    #[error(transparent)]
+    Run(#[from] crate::ExecutionRunError),
     /// Invalid identity, scope, sequence, or record association.
     #[error("invalid journal: {0}")]
     Structure(&'static str),
