@@ -84,6 +84,16 @@ pub fn correlate_nodes(
             [identity] => *identity,
             _ => return Err(CorrelationError::AmbiguousSource(*source)),
         };
+        if node
+            .size
+            .identities
+            .iter()
+            .filter(|item| std::mem::discriminant(*item) == std::mem::discriminant(identity))
+            .count()
+            != 1
+        {
+            return Err(CorrelationError::AmbiguousSource(*source));
+        }
         if current
             .graph
             .nodes()
@@ -122,7 +132,7 @@ pub fn correlate_nodes(
             .size
             .identities
             .iter()
-            .filter(|identity| supported_identity(candidate, identity))
+            .filter(|item| std::mem::discriminant(*item) == std::mem::discriminant(identity))
             .count()
             != 1
         {
@@ -150,8 +160,8 @@ fn supported_identity(node: &Node, identity: &ExternalId) -> bool {
     let value = match (&node.kind.kind, identity) {
         (NodeKind::LvmVg { .. }, ExternalId::LvmVgUuid(value))
         | (NodeKind::LvmLv(_), ExternalId::LvmLvUuid(value)) => value,
-        (NodeKind::Filesystem { .. }, ExternalId::Filesystem { fs_type, value })
-            if !fs_type.trim().is_empty() =>
+        (NodeKind::Filesystem { kind, .. }, ExternalId::Filesystem { fs_type, value })
+            if fs_type == kind.as_str() =>
         {
             value
         }
@@ -273,6 +283,73 @@ pub(super) mod tests {
                 Err(CorrelationError::KindChanged { .. })
             ));
         }
+    }
+
+    /// Invalid extra UUID records cannot be hidden beside one apparently usable identity.
+    #[test]
+    fn contradictory_identity_metadata_is_rejected() {
+        let (mut current, mut next, source, target) = snapshots();
+        let mut node = current
+            .graph
+            .node(&source)
+            .cloned()
+            .unwrap_or_else(|| panic!("source"));
+        node.size
+            .identities
+            .push(ExternalId::LvmVgUuid(String::new()));
+        current
+            .graph
+            .replace_existing(source, node)
+            .unwrap_or_else(|error| panic!("source metadata: {error}"));
+        assert_eq!(
+            correlate_nodes(&current, &next, &[source]),
+            Err(CorrelationError::AmbiguousSource(source))
+        );
+        let (current, _, _, _) = snapshots();
+        // Reuse the same source graph only for an explicit target metadata conflict.
+        let source = *current
+            .graph
+            .nodes()
+            .next()
+            .unwrap_or_else(|| panic!("source"))
+            .0;
+        let mut node = next
+            .graph
+            .node(&target)
+            .cloned()
+            .unwrap_or_else(|| panic!("target"));
+        node.size
+            .identities
+            .push(ExternalId::LvmVgUuid(String::new()));
+        next.graph
+            .replace_existing(target, node)
+            .unwrap_or_else(|error| panic!("target metadata: {error}"));
+        assert_eq!(
+            correlate_nodes(&current, &next, &[source]),
+            Err(CorrelationError::AmbiguousTarget(source))
+        );
+        let mut wrong_type = current.clone();
+        let mut node = wrong_type
+            .graph
+            .node(&source)
+            .cloned()
+            .unwrap_or_else(|| panic!("source"));
+        node.kind.kind = NodeKind::Filesystem {
+            kind: FilesystemKind::Ext4,
+            label: None,
+        };
+        node.size.identities = vec![ExternalId::Filesystem {
+            fs_type: "xfs".to_owned(),
+            value: "fs-uuid".to_owned(),
+        }];
+        wrong_type
+            .graph
+            .replace_existing(source, node)
+            .unwrap_or_else(|error| panic!("filesystem metadata: {error}"));
+        assert_eq!(
+            correlate_nodes(&wrong_type, &next, &[source]),
+            Err(CorrelationError::NoIdentity(source))
+        );
     }
 
     /// Cloned, missing, weak, non-present, and incompatible identities all fail closed.
