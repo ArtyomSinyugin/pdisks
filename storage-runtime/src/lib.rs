@@ -4,3 +4,5 @@
 
 #[cfg(target_os = "linux")]
 pub mod lease;
+
+pub mod checkpoint;
