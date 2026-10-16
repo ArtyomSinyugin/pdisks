@@ -150,3 +150,126 @@ fn missing_result_evidence_does_not_verify_a_predicted_effect() -> Result<(), Bo
     );
     Ok(())
 }
+
+/// Present edges and mounts can be proven; an incomplete graph/list cannot prove disappearance.
+#[test]
+fn relationship_checks_preserve_unknown_absence_and_frozen_identity_space()
+-> Result<(), Box<dyn Error>> {
+    use storage_core::model::{DependencyKind, MountContext, MountSource};
+    let (baseline, mut observation) = fixture()?;
+    let (lv, fs) = selected(&baseline)?;
+    let edge = baseline
+        .snapshot
+        .graph
+        .dependencies()
+        .find(|edge| edge.from == lv && edge.to == fs)
+        .ok_or("historical backing")?
+        .clone();
+    let conditions = [
+        Postcondition::DependencyPresent(edge.clone()),
+        Postcondition::DependencyAbsent(edge),
+        Postcondition::NodeAbsent(lv),
+        Postcondition::RuntimeMountPresent {
+            source: MountSource::Filesystem(fs),
+            target: "/data".into(),
+            context: MountContext::Host,
+        },
+        Postcondition::RuntimeMountAbsent {
+            target: "/data".into(),
+            context: MountContext::Host,
+        },
+    ];
+    let report = check_observed_postconditions(&baseline, &observation, &conditions)?;
+    for index in [0, 3] {
+        assert_eq!(report.checks[index].status, LiveCheckStatus::Satisfied);
+    }
+    for index in [1, 2, 4] {
+        assert!(matches!(
+            report.checks[index].status,
+            LiveCheckStatus::Violated { .. }
+        ));
+    }
+    let actual_edge = observation
+        .snapshot
+        .graph
+        .dependencies()
+        .find(|edge| edge.kind == DependencyKind::Backs)
+        .ok_or("fresh backing")?
+        .clone();
+    observation.snapshot.graph.remove_dependency(&actual_edge);
+    observation.snapshot.mounts.entries.clear();
+    let report = check_observed_postconditions(&baseline, &observation, &conditions)?;
+    for index in [0, 1, 3, 4] {
+        assert!(matches!(
+            report.checks[index].status,
+            LiveCheckStatus::Unknown { .. }
+        ));
+    }
+    let mut node = observation
+        .snapshot
+        .graph
+        .node(&actual_edge.from)
+        .ok_or("LV")?
+        .clone();
+    node.size.presence = storage_core::model::Presence::Missing;
+    observation
+        .snapshot
+        .graph
+        .replace_existing(actual_edge.from, node)?;
+    let absent = [
+        Postcondition::NodeAbsent(lv),
+        Postcondition::NodeAbsent(NodeId::new()),
+        Postcondition::RuntimeMountPresent {
+            source: MountSource::Filesystem(fs),
+            target: "/data".into(),
+            context: MountContext::Namespace("unresolved".into()),
+        },
+        Postcondition::PersistentMountAbsent {
+            target: "/data".into(),
+            context: MountContext::Host,
+        },
+    ];
+    assert!(
+        check_observed_postconditions(&baseline, &observation, &absent)?
+            .checks
+            .iter()
+            .all(|check| matches!(check.status, LiveCheckStatus::Unknown { .. }))
+    );
+    Ok(())
+}
+
+/// An assembler conflict revokes positive postconditions even if one retained contribution matches.
+#[test]
+fn blocking_diagnostics_and_invalid_envelopes_cannot_verify_results() -> Result<(), Box<dyn Error>>
+{
+    use storage_core::model::{Diagnostic, DiagnosticSeverity};
+    let (baseline, mut observation) = fixture()?;
+    let (lv, _) = selected(&baseline)?;
+    observation.snapshot.diagnostics.push(Diagnostic {
+        code: "provider.node_conflict".into(),
+        severity: DiagnosticSeverity::Error,
+        subjects: Vec::new(),
+        message: "conflicting result".into(),
+        evidence: None,
+        suggested_remedy: None,
+    });
+    let conditions = [
+        Postcondition::NodeReprobed(lv),
+        Postcondition::NodeSize {
+            node: lv,
+            size: Bytes::new(1),
+        },
+    ];
+    let report = check_observed_postconditions(&baseline, &observation, &conditions)?;
+    assert!(matches!(
+        report.checks[0].status,
+        LiveCheckStatus::Unknown { .. }
+    ));
+    assert!(matches!(
+        report.checks[1].status,
+        LiveCheckStatus::Violated { .. }
+    ));
+    observation.reference.probe_instance = Uuid::nil();
+    assert!(check_observed_postconditions(&baseline, &observation, &conditions).is_err());
+    Ok(())
+}
