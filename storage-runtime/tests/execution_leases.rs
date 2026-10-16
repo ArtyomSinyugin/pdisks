@@ -11,8 +11,8 @@ use storage_core::model::Bytes;
 use storage_engine::{
     ActionId, ExecutionRun,
     editing::{FrozenPlan, PlanSession},
-    leases::{ExecutionLease, LeaseError},
 };
+use storage_runtime::lease::{ExecutionLease, ExecutionRoot, LeaseError};
 use uuid::Uuid;
 
 /// Owns a fresh private directory, removed only after all test guards have been dropped.
@@ -34,8 +34,9 @@ impl Drop for Scratch {
 
 /// Creates a frozen fixture plan whose active first action is waiting for admission evidence.
 fn fixture() -> Result<(FrozenPlan, ExecutionRun), Box<dyn Error>> {
-    let baseline =
-        serde_json::from_str(include_str!("../examples/fixtures/editing_baseline.json"))?;
+    let baseline = serde_json::from_str(include_str!(
+        "../../storage-engine/examples/fixtures/editing_baseline.json"
+    ))?;
     let mut session = PlanSession::new(baseline)?;
     let storage_provider::AllocationDomain::LvmVolumeGroup(vg) =
         session.baseline().capacity_evidence[0].domain;
@@ -53,7 +54,7 @@ fn host_lease_serializes_runs_and_releases_on_drop() -> Result<(), Box<dyn Error
     let (_, run) = fixture()?;
     let (_, other) = fixture()?;
     let action = ActionId::new(0);
-    let guard = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let guard = ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action)?;
     assert_eq!(guard.run_id(), run.run_id());
     assert_eq!(guard.action(), action);
     assert_eq!(
@@ -63,11 +64,11 @@ fn host_lease_serializes_runs_and_releases_on_drop() -> Result<(), Box<dyn Error
             .affected_resources
     );
     assert!(matches!(
-        ExecutionLease::try_acquire(&root.0, &other, action),
+        ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &other, action),
         Err(LeaseError::Busy)
     ));
     assert!(matches!(
-        ExecutionLease::try_acquire(&root.0, &run, action),
+        ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action),
         Err(LeaseError::Busy)
     ));
     let lock = root.0.join("execution.lock");
@@ -75,7 +76,7 @@ fn host_lease_serializes_runs_and_releases_on_drop() -> Result<(), Box<dyn Error
     assert_eq!(fs::metadata(&lock)?.permissions().mode() & 0o077, 0);
     drop(guard);
     assert!(lock.exists());
-    let next = ExecutionLease::try_acquire(&root.0, &other, action)?;
+    let next = ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &other, action)?;
     drop(next);
     Ok(())
 }
@@ -89,13 +90,13 @@ fn lease_rejects_untrusted_paths_and_nonchecking_actions() -> Result<(), Box<dyn
     let action = ActionId::new(0);
     let waiting = ExecutionRun::new(frozen.document())?;
     assert!(matches!(
-        ExecutionLease::try_acquire(&root.0, &waiting, action),
+        ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &waiting, action),
         Err(LeaseError::NotChecking)
     ));
     assert!(!root.0.join("execution.lock").exists());
     fs::set_permissions(&root.0, fs::Permissions::from_mode(0o777))?;
     assert!(matches!(
-        ExecutionLease::try_acquire(&root.0, &run, action),
+        ExecutionRoot::open(&root.0),
         Err(LeaseError::InsecureDirectory)
     ));
     fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700))?;
@@ -103,32 +104,32 @@ fn lease_rejects_untrusted_paths_and_nonchecking_actions() -> Result<(), Box<dyn
     fs::write(&target, b"keep")?;
     let lock = root.0.join("execution.lock");
     symlink(&target, &lock)?;
-    assert!(ExecutionLease::try_acquire(&root.0, &run, action).is_err());
+    assert!(ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action).is_err());
     assert_eq!(fs::read(&target)?, b"keep");
     fs::remove_file(&lock)?;
     fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
     fs::hard_link(&target, &lock)?;
     assert!(matches!(
-        ExecutionLease::try_acquire(&root.0, &run, action),
+        ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action),
         Err(LeaseError::InvalidLockFile)
     ));
     fs::remove_file(&lock)?;
     fs::create_dir(&lock)?;
-    assert!(ExecutionLease::try_acquire(&root.0, &run, action).is_err());
+    assert!(ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action).is_err());
     fs::remove_dir(&lock)?;
     fs::write(&lock, b"persistent lock inode")?;
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o600))?;
-    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let lease = ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action)?;
     drop(lease);
     assert_eq!(fs::read(&lock)?, b"persistent lock inode");
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o644))?;
     assert!(matches!(
-        ExecutionLease::try_acquire(&root.0, &run, action),
+        ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action),
         Err(LeaseError::InvalidLockFile)
     ));
     let alias = root.0.join("alias");
     symlink(&root.0, &alias)?;
-    assert!(ExecutionLease::try_acquire(&alias, &run, action).is_err());
+    assert!(ExecutionRoot::open(&alias).is_err());
     Ok(())
 }
 
@@ -172,7 +173,7 @@ fn lease_remains_held_through_result_verification() -> Result<(), Box<dyn Error>
     let mut other = ExecutionRun::new(frozen.document())?;
     let action = ActionId::new(0);
     other.begin_check(action)?;
-    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let lease = ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action)?;
     let instance = Uuid::now_v7();
     let report = AdmissionReport {
         run_id: lease.run_id(),
@@ -190,7 +191,7 @@ fn lease_remains_held_through_result_verification() -> Result<(), Box<dyn Error>
         observation: observation(&run, instance, 2),
     })?;
     assert!(matches!(
-        ExecutionLease::try_acquire(&root.0, &other, action),
+        ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &other, action),
         Err(LeaseError::Busy)
     ));
     // These synthetic claims test guard lifetime; they do not establish native result evidence.
@@ -215,13 +216,13 @@ fn lease_remains_held_through_result_verification() -> Result<(), Box<dyn Error>
         checks,
     })?;
     assert!(matches!(
-        ExecutionLease::try_acquire(&root.0, &other, action),
+        ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &other, action),
         Err(LeaseError::Busy)
     ));
     assert!(!run.is_verified());
     assert_eq!(fs::read_dir(&root.0)?.count(), 1);
     drop(lease);
-    let next = ExecutionLease::try_acquire(&root.0, &other, action)?;
+    let next = ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &other, action)?;
     drop(next);
     Ok(())
 }
@@ -233,7 +234,11 @@ fn lease_subprocess_child() -> Result<(), Box<dyn Error>> {
     let root = std::env::var_os("DISKSGRAPH_LEASE_TEST_ROOT").ok_or("missing subprocess root")?;
     let mode = std::env::var("DISKSGRAPH_LEASE_TEST_MODE")?;
     let (_, run) = fixture()?;
-    let guard = ExecutionLease::try_acquire(PathBuf::from(root), &run, ActionId::new(0));
+    let guard = ExecutionLease::try_acquire(
+        &ExecutionRoot::open(PathBuf::from(root))?,
+        &run,
+        ActionId::new(0),
+    );
     match mode.as_str() {
         "busy" => assert!(matches!(guard, Err(LeaseError::Busy))),
         "exit_holding" => {
@@ -252,7 +257,7 @@ fn lease_excludes_other_processes_and_survives_process_exit() -> Result<(), Box<
     let root = Scratch::new()?;
     let (_, run) = fixture()?;
     let action = ActionId::new(0);
-    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let lease = ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action)?;
     let spawn = |mode: &str| -> Result<(), Box<dyn Error>> {
         let result = std::process::Command::new(std::env::current_exe()?)
             .args([
@@ -275,7 +280,50 @@ fn lease_excludes_other_processes_and_survives_process_exit() -> Result<(), Box<
     spawn("busy")?;
     drop(lease);
     spawn("exit_holding")?;
-    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let lease = ExecutionLease::try_acquire(&ExecutionRoot::open(&root.0)?, &run, action)?;
     drop(lease);
+    Ok(())
+}
+
+/// Incident inspection and action execution share exclusion without needing a historical run.
+#[test]
+fn host_lock_and_action_lease_share_one_lock() -> Result<(), Box<dyn Error>> {
+    let scratch = Scratch::new()?;
+    let root = ExecutionRoot::open(&scratch.0)?;
+    let (_, run) = fixture()?;
+    let guard = root.try_lock_host()?;
+    assert!(matches!(root.try_lock_host(), Err(LeaseError::Busy)));
+    assert!(matches!(
+        ExecutionLease::try_acquire(&root, &run, ActionId::new(0)),
+        Err(LeaseError::Busy)
+    ));
+    drop(guard);
+    let lease = ExecutionLease::try_acquire(&root, &run, ActionId::new(0))?;
+    assert!(matches!(root.try_lock_host(), Err(LeaseError::Busy)));
+    drop(lease);
+    let guard = root.try_lock_host()?;
+    drop(guard);
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o777))?;
+    assert!(matches!(
+        root.try_lock_host(),
+        Err(LeaseError::InsecureDirectory)
+    ));
+    Ok(())
+}
+
+/// Later path replacement cannot redirect operations through the previously checked directory fd.
+#[test]
+fn root_retains_the_opened_directory() -> Result<(), Box<dyn Error>> {
+    let scratch = Scratch::new()?;
+    let path = scratch.0.join("root");
+    fs::DirBuilder::new().mode(0o700).create(&path)?;
+    let root = ExecutionRoot::open(&path)?;
+    let retained = scratch.0.join("retained");
+    fs::rename(&path, &retained)?;
+    fs::DirBuilder::new().mode(0o700).create(&path)?;
+    let guard = root.try_lock_host()?;
+    assert!(retained.join("execution.lock").exists());
+    assert!(!path.join("execution.lock").exists());
+    drop(guard);
     Ok(())
 }

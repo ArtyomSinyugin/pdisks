@@ -251,7 +251,6 @@ dependencies = [
 name = "storage-engine"
 version = "0.1.0"
 dependencies = [
- "rustix",
  "serde",
  "serde_json",
  "storage-core",
@@ -281,6 +280,20 @@ dependencies = [
  "serde",
  "serde_json",
  "storage-core",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "storage-runtime"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde_json",
+ "storage-core",
+ "storage-engine",
+ "storage-probe",
+ "storage-provider",
  "thiserror",
  "uuid",
 ]

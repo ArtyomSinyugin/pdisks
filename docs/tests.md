@@ -6,6 +6,7 @@
 cargo test -p storage-core
 cargo test -p storage-provider
 cargo test -p storage-probe
+cargo test -p storage-runtime
 cargo clippy -p storage-provider -- -D warnings
 cargo check -p storage-probe --tests
 ```

@@ -5,6 +5,7 @@ members = [
     "storage-engine",
     "storage-provider",
     "storage-probe",
+    "storage-runtime",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [workspace.dependencies]
+storage-engine = { version = "0.1.0", path = "storage-engine" }
 storage-core = { version = "0.1.0", path = "storage-core" }
 storage-provider = { version = "0.1.0", path = "storage-provider" }
 storage-probe = { version = "0.1.0", path = "storage-probe" }

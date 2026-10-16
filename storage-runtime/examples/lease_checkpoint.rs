@@ -1,5 +1,5 @@
 //! Real Linux advisory lease and rejected admission over a synthetic plan; no storage writes.
-//! Run with `cargo run -p storage-engine --example lease_checkpoint -- [EXISTING_PRIVATE_DIRECTORY]`.
+//! Run with `cargo run -p storage-runtime --example lease_checkpoint -- [EXISTING_PRIVATE_DIRECTORY]`.
 
 /// Explicit fixture adapter; this exercises probe collection without observing host devices.
 #[cfg(target_os = "linux")]
@@ -42,11 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use storage_core::model::Bytes;
     use storage_engine::{
         ActionId, ActionRunState, AdmissionReport, ExecutionRun, HistoricalBaseline,
-        LiveCheckStatus,
-        editing::PlanSession,
-        leases::{ExecutionLease, LeaseError},
-        live::ProbedObservation,
+        LiveCheckStatus, editing::PlanSession, live::ProbedObservation,
     };
+    use storage_runtime::lease::{ExecutionLease, ExecutionRoot, LeaseError};
     use uuid::Uuid;
 
     let mut arguments = std::env::args_os().skip(1);
@@ -63,8 +61,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             path
         }
     };
-    let mut publication: storage_probe::ProbeSnapshot =
-        serde_json::from_str(include_str!("fixtures/probe_snapshot.json"))?;
+    let root = ExecutionRoot::open(&directory)?;
+    let mut publication: storage_probe::ProbeSnapshot = serde_json::from_str(include_str!(
+        "../../storage-engine/examples/fixtures/probe_snapshot.json"
+    ))?;
     let baseline = HistoricalBaseline::from_lvm_observations(
         publication.current.clone(),
         &publication.lvm_vgs,
@@ -77,11 +77,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut run = ExecutionRun::new(frozen.document())?;
     let action = ActionId::new(0);
     run.begin_check(action)?;
-    let guard = ExecutionLease::try_acquire(&directory, &run, action)?;
+    let guard = ExecutionLease::try_acquire(&root, &run, action)?;
     let mut contender = ExecutionRun::new(frozen.document())?;
     contender.begin_check(action)?;
     assert!(matches!(
-        ExecutionLease::try_acquire(&directory, &contender, action),
+        ExecutionLease::try_acquire(&root, &contender, action),
         Err(LeaseError::Busy)
     ));
     // The historical plan fit; this separate fixture measurement reports no remaining capacity.
@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .any(|check| matches!(check.status, LiveCheckStatus::Violated { .. }))
     );
     drop(guard);
-    let next = ExecutionLease::try_acquire(&directory, &contender, action)?;
+    let next = ExecutionLease::try_acquire(&root, &contender, action)?;
     drop(next);
     println!("lease root: {}", directory.display());
     println!("real flock: contender gets Busy until guard drops; persistent lock file retained");

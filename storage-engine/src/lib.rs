@@ -6,8 +6,6 @@ mod compose;
 pub mod editing;
 mod effects;
 mod execution;
-#[cfg(target_os = "linux")]
-pub mod leases;
 pub mod live;
 mod observe;
 mod plan;

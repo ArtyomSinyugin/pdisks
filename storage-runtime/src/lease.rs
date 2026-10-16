@@ -12,7 +12,7 @@ use storage_provider::ResourceAccess;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{ActionId, ActionRunState, ExecutionRun, ExecutionRunError};
+use storage_engine::{ActionId, ActionRunState, ExecutionRun, ExecutionRunError};
 
 /// Permanent name shared by every cooperating host, regardless of transient plan/node IDs.
 const LOCK_FILE: &str = "execution.lock";
@@ -40,38 +40,20 @@ pub enum LeaseError {
     Run(#[from] ExecutionRunError),
 }
 
-/// Exclusive cooperative lease bound to one run/action; dropping it releases the OS lock.
-/// All hosts must share a stable local directory and keep this guard through verification.
-/// This serializes every resource conservatively; it cannot exclude arbitrary external tools.
+/// An existing private local directory beneath a trusted, stable parent.
+/// Every cooperating process must use the same root; never replace it or its lock inode.
 #[derive(Debug)]
-pub struct ExecutionLease {
-    /// Retains the opened directory without relying on later path resolution.
-    _directory: OwnedFd,
-    /// Never cloned or exposed: close releases flock, including after process termination.
-    _lock: OwnedFd,
-    /// Attempt that acquired this guard.
-    run_id: Uuid,
-    /// Active action whose entire resource set is covered by the global lease.
-    action: ActionId,
-    /// Logical resource declarations from the trusted frozen contract.
-    resources: Vec<ResourceAccess>,
+pub struct ExecutionRoot {
+    /// Opened once without following a final symlink; later operations are relative to this fd.
+    directory: OwnedFd,
 }
 
-impl ExecutionLease {
-    /// Acquires a nonblocking OS lease before the host obtains its admission probe.
-    /// The caller supplies an existing private local directory under a trusted stable parent.
-    /// Never remove/replace this directory or its lock file while hosts may be running.
-    pub fn try_acquire(
-        directory: impl AsRef<Path>,
-        run: &ExecutionRun,
-        action: ActionId,
-    ) -> Result<Self, LeaseError> {
-        if run.state(action)? != ActionRunState::Checking {
-            return Err(LeaseError::NotChecking);
-        }
+impl ExecutionRoot {
+    /// Opens a caller-configured directory and rejects public or foreign-owned roots.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, LeaseError> {
         let directory = openat(
             CWD,
-            directory.as_ref(),
+            path.as_ref(),
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )
@@ -80,8 +62,13 @@ impl ExecutionLease {
         if info.st_uid != geteuid().as_raw() || info.st_mode & 0o077 != 0 {
             return Err(LeaseError::InsecureDirectory);
         }
+        Ok(Self { directory })
+    }
+
+    /// Acquires the shared nonblocking lock without reconstructing any execution run.
+    pub fn try_lock_host(&self) -> Result<HostExecutionLock, LeaseError> {
         let lock = openat(
-            &directory,
+            &self.directory,
             LOCK_FILE,
             OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::RUSR | Mode::WUSR,
@@ -100,6 +87,60 @@ impl ExecutionLease {
             Err(Errno::WOULDBLOCK) => return Err(LeaseError::Busy),
             Err(error) => return Err(io::Error::from(error).into()),
         }
+        let host_lock = HostExecutionLock {
+            directory: self.directory.try_clone()?,
+            _lock: lock,
+        };
+        let info = fstat(host_lock.directory()).map_err(io::Error::from)?;
+        if info.st_uid != geteuid().as_raw() || info.st_mode & 0o077 != 0 {
+            return Err(LeaseError::InsecureDirectory);
+        }
+        Ok(host_lock)
+    }
+}
+
+/// The single OS lock used for both execution and incident inspection.
+/// Dropping the guard releases exclusion, including on process termination.
+#[derive(Debug)]
+pub struct HostExecutionLock {
+    /// Retained root for descriptor-relative checkpoint operations while this guard is borrowed.
+    directory: OwnedFd,
+    /// Never cloned or exposed: close releases flock.
+    _lock: OwnedFd,
+}
+
+impl HostExecutionLock {
+    /// Borrows the retained root descriptor without exposing or cloning the lock itself.
+    pub(crate) fn directory(&self) -> &OwnedFd {
+        &self.directory
+    }
+}
+
+/// Exclusive cooperative lease bound to one run/action and its trusted resource declarations.
+/// Retain it through verification; arbitrary external disk tools do not participate in this lock.
+#[derive(Debug)]
+pub struct ExecutionLease {
+    /// The same lock used by incident inspection, retained through action verification.
+    host_lock: HostExecutionLock,
+    /// Attempt that acquired this guard.
+    run_id: Uuid,
+    /// Active action covered by the global lease.
+    action: ActionId,
+    /// Logical resources from the trusted frozen contract.
+    resources: Vec<ResourceAccess>,
+}
+
+impl ExecutionLease {
+    /// Acquires OS exclusion before the host obtains its admission probe.
+    pub fn try_acquire(
+        root: &ExecutionRoot,
+        run: &ExecutionRun,
+        action: ActionId,
+    ) -> Result<Self, LeaseError> {
+        if run.state(action)? != ActionRunState::Checking {
+            return Err(LeaseError::NotChecking);
+        }
+        let host_lock = root.try_lock_host()?;
         let resources = run
             .context()
             .plan
@@ -111,12 +152,16 @@ impl ExecutionLease {
             .affected_resources
             .clone();
         Ok(Self {
-            _directory: directory,
-            _lock: lock,
+            host_lock,
             run_id: run.run_id(),
             action,
             resources,
         })
+    }
+
+    /// Borrows the held host lock for operations that must not outlive OS exclusion.
+    pub fn host_lock(&self) -> &HostExecutionLock {
+        &self.host_lock
     }
 
     /// Returns the attempt bound at acquisition; a new run requires a new guard.

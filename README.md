@@ -9,7 +9,7 @@
 
 ## Текущая реализованная архитектура
 
-Workspace разделён на четыре крейта. Поток данных во время probe выглядит так:
+Workspace разделён на пять крейтов. Поток данных во время probe выглядит так:
 
 ```text
 native-библиотеки / результаты системных утилит
@@ -339,7 +339,7 @@ extent не позволяют переосмыслить frozen allocation coun
 
 ## Execution leases: C3, Linux
 
-`storage_engine::leases::ExecutionLease` удерживает настоящий неблокирующий
+`storage_runtime::lease::ExecutionLease` удерживает настоящий неблокирующий
 `flock` на `execution.lock`. Одна эксклюзивная блокировка последовательно
 пропускает все действия сотрудничающих hosts. Она покрывает весь logical resource
 set frozen action и не зависит от transient NodeId, plan UUID или путей устройств.
@@ -353,16 +353,21 @@ symlink; lock должен быть regular, private и иметь ровно о
 удалять, пока hosts могут работать: новый inode создаст другую область блокировки.
 Разные каталоги и произвольные внешние disk tools этой блокировкой не исключаются.
 
+`ExecutionRoot::open()` фиксирует проверенный directory fd.
+`try_lock_host()` получает тот же lock без `ExecutionRun` для будущей инспекции
+checkpoint; `ExecutionLease::host_lock()` даёт заимствованный guard этого lock.
+`storage-runtime` зависит от engine; engine не зависит от runtime или `rustix`.
+
 Lease отвечает только за OS-блокировку и список ресурсов одного run/action.
 Сбор наблюдений, admission и verification выполняются отдельно через `ExecutionRun`.
 Drop и завершение процесса освобождают lock, но не доказывают завершения операции.
 Реальный write остаётся отключён до готовности runtime и аварийного checkpoint.
 
 ```sh
-cargo run -p storage-engine --example lease_checkpoint
+cargo run -p storage-runtime --example lease_checkpoint
 ```
 
-[Пример](storage-engine/examples/lease_checkpoint.rs) удерживает настоящий lock,
+[Пример](storage-runtime/examples/lease_checkpoint.rs) удерживает настоящий lock,
 проверяет конкуренцию и отклоняет создание LV по свежему recorded probe с нулём
 свободных extents. В новом изолированном каталоге остаётся только `execution.lock`:
 история и checkpoint при отказе admission не создаются. Native probe и backend
