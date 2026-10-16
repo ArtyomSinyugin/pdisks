@@ -416,6 +416,16 @@ backend или привязку к probe после resolution. Сохранён
 полноты provider/namespace coverage и авторизация остаются обязанностью host.
 Пока resolver не поддерживает `SetActivation` и остальные write-рецепты.
 
+`LinuxLiveHost` собирает новый provider-pass под `ExecutionLease`, проверяет
+принадлежность guard/publication, отсутствие активного checkpoint и все frozen
+prerequisites. `BackendCapabilityCheck` отдельно устанавливает поддержку точной
+операции и полноту scope/namespace coverage; default scope остаётся `Unknown`.
+`AuthorizationContext` вызывается только после остальных положительных проверок
+и получает run/action, digest плана, backend и live UUID targets. JSON-флага
+разрешения, автоматического допуска по root и production allow-all policy нет.
+Положительный admission пока проверяется только с синтетическими test policies;
+реальные capability/authorization adapters остаются частью следующего native этапа.
+
 ## Аварийный checkpoint вместо истории выполнения
 
 Старый JSONL-журнал удалён. Импорт исторических `.jsonl`, восстановление run и

@@ -152,3 +152,208 @@ fn rejects_new_consumers_and_foreign_mounts() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+mod admission {
+    use super::*;
+    use std::{cell::Cell, fs, os::unix::fs::DirBuilderExt, path::PathBuf};
+    use storage_engine::{ActionRunState, LiveCheckStatus};
+    use storage_runtime::{
+        authorization::{ApprovalRequest, AuthorizationContext},
+        capability::{BackendCapabilityCheck, OperationAvailability},
+        checkpoint::plan_digest,
+        host::{HostError, LinuxLiveHost, RuntimeHost},
+        lease::{ExecutionLease, ExecutionRoot},
+    };
+
+    /// Newly allocated private execution root, removed after every store and OS guard has dropped.
+    pub(super) struct Scratch(pub(super) PathBuf);
+    impl Scratch {
+        /// Reserves a private test directory without touching existing user state.
+        pub(super) fn new() -> Result<Self, Box<dyn Error>> {
+            let path =
+                std::env::temp_dir().join(format!("disksgraph-runtime-{}", uuid::Uuid::now_v7()));
+            fs::DirBuilder::new().mode(0o700).create(&path)?;
+            Ok(Self(path))
+        }
+    }
+    impl Drop for Scratch {
+        /// Production code retains roots and locks; only newly owned test fixtures are removed here.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Test-only capability provider; never used to claim installed native adapter support.
+    pub(super) struct Capabilities {
+        /// Explicit result of operation-specific synthetic availability checks.
+        pub(super) availability: OperationAvailability,
+        /// Explicit synthetic completeness evidence, independent of successful discovery.
+        pub(super) scope: LiveCheckStatus,
+    }
+    impl BackendCapabilityCheck for Capabilities {
+        /// Supplies the fixture's exact operation availability.
+        fn availability(
+            &self,
+            _: &storage_provider::ProviderAction,
+            _: &storage_engine::LiveObservation,
+        ) -> OperationAvailability {
+            self.availability.clone()
+        }
+        /// Positive coverage is an explicit test claim, never inferred from missing diagnostics.
+        fn check_scope(
+            &self,
+            _: &storage_engine::ExecutionContext<'_>,
+            _: &storage_runtime::targets::ResolvedAction,
+            _: &storage_engine::LiveObservation,
+        ) -> LiveCheckStatus {
+            self.scope.clone()
+        }
+    }
+
+    /// Test-only policy bound to the exact reviewed plan, backend, target, and current run.
+    pub(super) struct Authorization {
+        /// Digest the fixture explicitly reviewed.
+        pub(super) digest: String,
+        /// Attempt allowed by this fixture principal.
+        pub(super) run_id: uuid::Uuid,
+        /// Recorded policy decision; no production allow-all policy exists.
+        pub(super) status: LiveCheckStatus,
+        /// Confirms that policy is not consulted before other necessary evidence is complete.
+        pub(super) calls: Rc<Cell<usize>>,
+    }
+    impl AuthorizationContext for Authorization {
+        /// Verifies the complete request wiring before returning this fixture's principal decision.
+        fn check(&mut self, request: &ApprovalRequest) -> LiveCheckStatus {
+            self.calls.set(self.calls.get() + 1);
+            if request.plan_digest != self.digest
+                || request.run_id != self.run_id
+                || request.backend != backend()
+                || request.targets.len() != 1
+                || request.observation.probe_instance.is_nil()
+                || request.targets[0].external_ids
+                    != vec![ExternalId::LvmVgUuid("example-vg-uuid".into())]
+            {
+                return LiveCheckStatus::Violated {
+                    reason: "approval is bound to another plan, attempt or target".into(),
+                };
+            }
+            self.status.clone()
+        }
+    }
+
+    /// Constructs an explicit synthetic policy for one run, rather than serializing an approval flag.
+    pub(super) fn authorization(run: &ExecutionRun) -> Result<Authorization, Box<dyn Error>> {
+        Ok(Authorization {
+            digest: plan_digest(run.document())?,
+            run_id: run.run_id(),
+            status: LiveCheckStatus::Satisfied,
+            calls: Rc::new(Cell::new(0)),
+        })
+    }
+
+    /// Every positive admission prerequisite is independent; unknown capability/scope never becomes true.
+    #[test]
+    fn admission_requires_capability_scope_and_exact_authorization() -> Result<(), Box<dyn Error>> {
+        for case in 0..7 {
+            let (state, frozen) = fixture()?;
+            let scratch = Scratch::new()?;
+            let root = ExecutionRoot::open(&scratch.0)?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let action = ActionId::new(0);
+            run.begin_check(action)?;
+            let lease = ExecutionLease::try_acquire(&root, &run, action)?;
+            let mut capability = Capabilities {
+                availability: OperationAvailability::Available(backend()),
+                scope: LiveCheckStatus::Satisfied,
+            };
+            let mut authorization = authorization(&run)?;
+            let calls = authorization.calls.clone();
+            let state = Rc::new(RefCell::new(state));
+            match case {
+                1 => {
+                    capability.availability =
+                        OperationAvailability::Unknown("no checked write adapter".into())
+                }
+                2 => {
+                    capability.scope = LiveCheckStatus::Unknown {
+                        required_evidence: "other mount namespaces".into(),
+                    }
+                }
+                3 => {
+                    authorization.status = LiveCheckStatus::Unknown {
+                        required_evidence: "principal confirmation".into(),
+                    }
+                }
+                4 => authorization.digest = "b".repeat(64),
+                5 => state.borrow_mut().lvm_vgs[0].vg.free = 0,
+                6 => {
+                    capability.availability =
+                        OperationAvailability::Unavailable("adapter cannot execute CreateLv".into())
+                }
+                _ => {}
+            }
+            let mut host = LinuxLiveHost::new(probe(state), capability, authorization);
+            let observed = host.probe()?;
+            let decision = host.check_admission(&run, action, &observed, &lease)?;
+            assert_eq!(decision.resolved.is_some(), case == 0);
+            assert_eq!(run.record_admission(decision.report)?, case == 0);
+            assert_eq!(
+                run.state(action)?,
+                match case {
+                    0 => ActionRunState::Admitted,
+                    4..=6 => ActionRunState::Failed,
+                    _ => ActionRunState::Checking,
+                }
+            );
+            assert_eq!(
+                calls.get(),
+                usize::from(case == 0 || case == 3 || case == 4)
+            );
+            assert!(!scratch.0.join("active-attempt.json").exists());
+        }
+        Ok(())
+    }
+
+    /// A report cannot reuse another host's publication, an old generation, or another run's guard.
+    #[test]
+    fn admission_rejects_foreign_lease_and_stale_publications() -> Result<(), Box<dyn Error>> {
+        let (state, frozen) = fixture()?;
+        let scratch = Scratch::new()?;
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let action = ActionId::new(0);
+        run.begin_check(action)?;
+        let lease = ExecutionLease::try_acquire(&root, &run, action)?;
+        let mut other = ExecutionRun::new(frozen.document())?;
+        other.begin_check(action)?;
+        let state = Rc::new(RefCell::new(state));
+        let mut host = LinuxLiveHost::new(
+            probe(state.clone()),
+            Capabilities {
+                availability: OperationAvailability::Available(backend()),
+                scope: LiveCheckStatus::Satisfied,
+            },
+            authorization(&run)?,
+        );
+        let observed = host.probe()?;
+        assert!(matches!(
+            host.check_admission(&other, action, &observed, &lease),
+            Err(HostError::LeaseMismatch)
+        ));
+        let foreign = ProbedObservation::collect(&probe(state))?;
+        assert!(matches!(
+            host.check_admission(&run, action, &foreign, &lease),
+            Err(HostError::ObservationMismatch)
+        ));
+        let latest = host.probe()?;
+        assert!(matches!(
+            host.check_admission(&run, action, &observed, &lease),
+            Err(HostError::ObservationMismatch)
+        ));
+        let decision = host.check_admission(&run, action, &latest, &lease)?;
+        assert_eq!(decision.report.run_id, run.run_id());
+        assert_eq!(decision.report.held_resources, lease.held_resources());
+        Ok(())
+    }
+}

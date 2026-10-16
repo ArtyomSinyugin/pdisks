@@ -10,3 +10,8 @@ pub mod checkpoint;
 pub mod probe;
 
 pub mod targets;
+
+pub mod authorization;
+pub mod capability;
+#[cfg(target_os = "linux")]
+pub mod host;

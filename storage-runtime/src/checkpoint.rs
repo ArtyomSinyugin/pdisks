@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage_core::model::{ExternalId, NodeId};
 use storage_engine::{
-    ActionId, ActionRunState, ExecutionRun, ExecutionRunError, PlanDocumentError,
+    ActionId, ActionRunState, ExecutionRun, ExecutionRunError, PlanDocument, PlanDocumentError,
     editing::OperationId,
 };
 use storage_provider::{BackendId, LvmAction, ProviderAction};
@@ -122,7 +122,6 @@ impl ActiveAttempt {
         let action = run.context().plan.actions()[action_id.get() as usize]
             .operation
             .clone();
-        let canonical = run.document().canonical_json()?;
         let attempt = Self {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             run_id: run.run_id(),
@@ -131,7 +130,7 @@ impl ActiveAttempt {
             operation_id,
             action,
             targets,
-            plan_digest: format!("{:x}", Sha256::digest(canonical.as_bytes())),
+            plan_digest: plan_digest(run.document())?,
             backend_id,
         };
         attempt.to_bytes()?;
@@ -257,4 +256,13 @@ fn check_string_limits(value: &serde_json::Value) -> Result<(), CheckpointError>
         _ => {}
     }
     Ok(())
+}
+
+/// SHA-256 of a validated canonical plan, shared by approval requests and crash checkpoints.
+/// A digest binds data only; it cannot establish authorization or probe freshness.
+pub fn plan_digest(document: &PlanDocument) -> Result<String, PlanDocumentError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(document.canonical_json()?.as_bytes())
+    ))
 }
