@@ -751,7 +751,17 @@ fn describe_partition(
             ResizeSafety::DEPENDENTS,
         ),
         PartitionAction::Delete { partition } => {
-            remove_node_contract(context, *partition, NodeKindClass::Partition, true)
+            let mut result =
+                remove_node_contract(context, *partition, NodeKindClass::Partition, true);
+            result
+                .prerequisites
+                .push(ActionPrerequisite::DestructiveApproval(*partition));
+            if let Some(table) = crate::logical::partition_table(context.graph, *partition) {
+                result
+                    .prerequisites
+                    .push(ActionPrerequisite::Writable(table));
+            }
+            result
         }
         PartitionAction::SetAttributes {
             partition,
@@ -1058,6 +1068,9 @@ fn describe_lvm(action: &LvmAction, context: ActionDescriptionContext<'_>) -> Ac
         }
         LvmAction::RemoveLv { lv } => {
             let mut result = remove_node_contract(context, *lv, NodeKindClass::LvmLv, true);
+            result
+                .prerequisites
+                .push(ActionPrerequisite::DestructiveApproval(*lv));
             if let Some(vg) = lvm_volume_group(context.graph, *lv) {
                 write(&mut result, ActionResource::LvmMetadata(vg));
                 let domain = AllocationDomain::LvmVolumeGroup(vg);
@@ -1933,6 +1946,117 @@ mod tests {
     };
 
     use super::*;
+
+    /// Removal contracts preserve exact destructive targets and cannot lose approval on import.
+    #[test]
+    fn deletion_contracts_require_approval_for_only_the_selected_node()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut graph, disk) = block_graph();
+        let table = NodeId::new();
+        let partition = NodeId::new();
+        let lv = NodeId::new();
+        for (id, kind) in [
+            (
+                table,
+                NodeKind::PartitionTable(storage_core::model::PartitionTable::Gpt),
+            ),
+            (
+                partition,
+                NodeKind::Partition {
+                    number: std::num::NonZeroU32::new(1).ok_or("zero number")?,
+                    offset: Bytes::new(1024),
+                    role: None,
+                    attributes: storage_core::model::PartitionAttributes::default(),
+                },
+            ),
+            (
+                lv,
+                NodeKind::LvmLv(LvmLv {
+                    name: "data".to_owned(),
+                    kind: LvmLvKind::Linear,
+                }),
+            ),
+        ] {
+            graph.insert_new(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind,
+                        size: Some(Bytes::new(100)),
+                    },
+                    size: NodeFacts::default(),
+                },
+            )?;
+        }
+        graph.insert_dependency(Dependency {
+            from: disk,
+            to: table,
+            kind: DependencyKind::Backs,
+        });
+        graph.insert_dependency(Dependency {
+            from: table,
+            to: partition,
+            kind: DependencyKind::Contains {
+                offset: Bytes::new(1024),
+            },
+        });
+        let context = ActionDescriptionContext { graph: &graph };
+        for (target, action) in [
+            (
+                partition,
+                ProviderAction::Partition(PartitionAction::Delete { partition }),
+            ),
+            (lv, ProviderAction::Lvm(LvmAction::RemoveLv { lv })),
+        ] {
+            let contract = describe_action(&action, context);
+            assert_eq!(
+                contract
+                    .prerequisites
+                    .iter()
+                    .filter_map(|condition| match condition {
+                        ActionPrerequisite::DestructiveApproval(node) => Some(*node),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![target]
+            );
+            assert!(
+                contract
+                    .prerequisites
+                    .contains(&ActionPrerequisite::NoUnexpectedConsumers(target))
+            );
+            assert_eq!(
+                contract
+                    .predicted_effect
+                    .graph
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        GraphEffect::RemoveNode(node) => Some(*node),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![target]
+            );
+            assert_eq!(
+                serde_json::from_str::<ProviderAction>(&serde_json::to_string(&action)?)?,
+                action
+            );
+            let mut imported: ActionContract =
+                serde_json::from_str(&serde_json::to_string(&contract)?)?;
+            imported.prerequisites.retain(|condition| {
+                !matches!(condition, ActionPrerequisite::DestructiveApproval(_))
+            });
+            assert!(verify_imported_contract(&action, imported, context).is_err());
+            if target == partition {
+                assert!(
+                    contract
+                        .prerequisites
+                        .contains(&ActionPrerequisite::Writable(table))
+                );
+            }
+        }
+        Ok(())
+    }
 
     /// Imported contracts cannot preserve a superseded size by dropping the invalidation effect.
     #[test]

@@ -51,7 +51,7 @@ pub use transport::{
 
 /// Version of the shared action-contract semantics, independent of transport and manifests.
 /// Increment when trusted prerequisite, effect, or verification meaning or serialized shape changes.
-pub const ACTION_SEMANTICS_VERSION: u32 = 9;
+pub const ACTION_SEMANTICS_VERSION: u32 = 10;
 
 /// Manifest JSON schema version supported by this release.
 pub const BACKEND_MANIFEST_VERSION: u16 = 1;
