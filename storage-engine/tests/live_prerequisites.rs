@@ -290,3 +290,55 @@ fn observation_validation_preserves_partial_state_and_rejects_invalid_envelopes(
     ));
     Ok(())
 }
+
+/// An assembler may retain one conflicting contribution; its data cannot become positive evidence.
+#[test]
+fn blocking_diagnostics_withhold_success_but_keep_observed_vetoes() -> Result<(), Box<dyn Error>> {
+    use storage_core::model::{Diagnostic, DiagnosticSeverity};
+    let (baseline, observation, old, new) = fixture()?;
+    let conditions = [
+        ActionPrerequisite::NodeExists(old),
+        ActionPrerequisite::Writable(old),
+    ];
+    for severity in [
+        DiagnosticSeverity::Warning,
+        DiagnosticSeverity::Error,
+        DiagnosticSeverity::MissingInformation,
+        DiagnosticSeverity::RequiresConfirmation,
+    ] {
+        let mut observed = observation.clone();
+        observed.snapshot.diagnostics.push(Diagnostic {
+            code: "provider.node_conflict".into(),
+            severity,
+            subjects: Vec::new(),
+            message: "synthetic provider ambiguity".into(),
+            evidence: None,
+            suggested_remedy: None,
+        });
+        let report = check_observed_prerequisites(&baseline, &observed, &conditions)?;
+        if severity == DiagnosticSeverity::Warning {
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .all(|check| check.status == LiveCheckStatus::Satisfied)
+            );
+        } else {
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .all(|check| matches!(check.status, LiveCheckStatus::Unknown { .. }))
+            );
+        }
+        let mut node = observed.snapshot.graph.node(&new).ok_or("LV")?.clone();
+        node.size.block.as_mut().ok_or("block facts")?.read_only = Some(true);
+        observed.snapshot.graph.replace_existing(new, node)?;
+        let report = check_observed_prerequisites(&baseline, &observed, &conditions)?;
+        assert!(matches!(
+            report.checks[1].status,
+            LiveCheckStatus::Violated { .. }
+        ));
+    }
+    Ok(())
+}

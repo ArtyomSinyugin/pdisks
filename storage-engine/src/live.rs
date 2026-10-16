@@ -1,7 +1,7 @@
 //! Checks over actual observations; these do not grant authorization or acquire resources.
 
 use serde::Serialize;
-use storage_core::model::{GraphError, MountSource, Node, NodeId};
+use storage_core::model::{DiagnosticSeverity, GraphError, MountSource, Node, NodeId};
 use storage_provider::{ActionPrerequisite, NodeKindClass};
 use thiserror::Error;
 
@@ -35,10 +35,31 @@ pub fn check_observed_prerequisites(
             .iter()
             .map(|condition| LiveCheck {
                 condition: condition.clone(),
-                status: check_node_fact(baseline, observation, condition),
+                status: qualify_observed_status(
+                    observation,
+                    check_node_fact(baseline, observation, condition),
+                ),
             })
             .collect(),
     })
+}
+
+/// Partial or conflicting provider results cannot establish positive evidence; contradictions survive.
+fn qualify_observed_status(
+    observation: &LiveObservation,
+    status: LiveCheckStatus,
+) -> LiveCheckStatus {
+    if status == LiveCheckStatus::Satisfied
+        && observation
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity != DiagnosticSeverity::Warning)
+    {
+        unknown("resolve blocking probe diagnostics before relying on observed facts")
+    } else {
+        status
+    }
 }
 
 /// Resolves one existing node without trusting transient IDs, paths, or display names.
