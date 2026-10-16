@@ -78,6 +78,9 @@ pub enum EditError {
     /// The LV size convenience method requires a planned CreateLv request.
     #[error("operation {0:?} is not a planned LV creation")]
     NotCreatedLv(OperationId),
+    /// Geometry editing requires a planned CreatePartition request.
+    #[error("operation {0:?} is not a planned partition creation")]
+    NotCreatedPartition(OperationId),
     /// Cancelling a creator requires an explicit decision about its dependent requests.
     #[error("removal requires dependent operations {operations:?}")]
     DependentOperations {
@@ -344,6 +347,31 @@ impl PlanSession {
             return Err(EditError::NotCreatedLv(operation));
         };
         *requested = size;
+        self.edit(expected_revision, PlanEdit::Replace { operation, request })
+    }
+
+    /// Changes planned partition placement without resizing or moving an existing partition.
+    /// Invalid extents remain editable; stable operation and output identities are retained.
+    pub fn set_created_partition_extent(
+        &mut self,
+        expected_revision: DraftRevision,
+        operation: OperationId,
+        offset: Bytes,
+        size: Bytes,
+    ) -> Result<EditReceipt, EditError> {
+        self.check_revision(expected_revision)?;
+        let index = operation_index(&self.draft, operation)?;
+        let mut request = self.draft.operations[index].request.clone();
+        let PlanRequest::CreatePartition {
+            offset: requested_offset,
+            size: requested_size,
+            ..
+        } = &mut request
+        else {
+            return Err(EditError::NotCreatedPartition(operation));
+        };
+        *requested_offset = offset;
+        *requested_size = size;
         self.edit(expected_revision, PlanEdit::Replace { operation, request })
     }
 

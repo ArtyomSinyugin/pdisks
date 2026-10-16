@@ -1,0 +1,92 @@
+{
+  "id": "00000000-0000-7000-8000-000000000201",
+  "snapshot": {
+    "graph": {
+      "nodes": {
+        "00000000-0000-7000-8000-000000000001": {
+          "kind": {
+            "kind": "Disk",
+            "size": 67108864
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000002": {
+          "kind": {
+            "kind": {
+              "PartitionTable": "GPT"
+            },
+            "size": 67108864
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000003": {
+          "kind": {
+            "kind": {
+              "Partition": {
+                "number": 1,
+                "offset": 1048576,
+                "role": null,
+                "attributes": {
+                  "gpt": null,
+                  "bootable": null
+                }
+              }
+            },
+            "size": 8388608
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [],
+            "block": null,
+            "device": null
+          }
+        }
+      },
+      "dependencies": [
+        {
+          "from": "00000000-0000-7000-8000-000000000001",
+          "to": "00000000-0000-7000-8000-000000000002",
+          "kind": "Backs"
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000002",
+          "to": "00000000-0000-7000-8000-000000000003",
+          "kind": {
+            "Contains": {
+              "offset": 1048576
+            }
+          }
+        }
+      ],
+      "relations": []
+    },
+    "mounts": {
+      "entries": []
+    },
+    "environment": {
+      "host": {
+        "os_release": null,
+        "architecture": null,
+        "kernel_release": null,
+        "tools": [],
+        "kernel_modules": []
+      },
+      "target": null
+    },
+    "diagnostics": []
+  },
+  "capacity_evidence": []
+}

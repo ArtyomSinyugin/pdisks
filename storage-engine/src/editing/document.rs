@@ -360,13 +360,19 @@ mod draft_tests {
     /// Legacy drafts resume without changing identities and export with the current catalogue.
     #[test]
     fn legacy_request_catalogue_remains_readable_but_cannot_claim_partition_support() {
-        let mut document = PlanSession::new(baseline()).unwrap().draft_document();
+        let mut document = PlanSession::new(baseline())
+            .unwrap_or_else(|error| panic!("fixture: {error:?}"))
+            .draft_document();
         document.schema_version = 1;
         document.draft = workflow();
-        let json = document.to_json().unwrap();
-        let decoded = DraftDocument::from_json(&json).unwrap();
+        let json = document
+            .to_json()
+            .unwrap_or_else(|error| panic!("fixture: {error:?}"));
+        let decoded =
+            DraftDocument::from_json(&json).unwrap_or_else(|error| panic!("fixture: {error:?}"));
         assert_eq!(decoded, document);
-        let session = PlanSession::from_document(decoded).unwrap();
+        let session = PlanSession::from_document(decoded)
+            .unwrap_or_else(|error| panic!("fixture: {error:?}"));
         assert_eq!(session.draft(), &document.draft);
         assert_eq!(session.id(), document.session_id);
         assert_eq!(session.revision(), document.revision);
@@ -378,14 +384,16 @@ mod draft_tests {
         let table = document.draft.operations[0].request.referenced_nodes()[0];
         let operation = super::super::PlanOperation::new(PlanRequest::CreatePartition {
             table,
-            number: std::num::NonZeroU32::new(1).unwrap(),
+            number: std::num::NonZeroU32::new(1)
+                .unwrap_or_else(|| panic!("nonzero fixture number")),
             offset: Bytes::new(1024),
             size: Bytes::new(2048),
             role: None,
             attributes: storage_core::model::PartitionAttributes::default(),
         });
         document.draft.operations = vec![operation];
-        let untrusted = serde_json::to_string(&document).unwrap();
+        let untrusted =
+            serde_json::to_string(&document).unwrap_or_else(|error| panic!("fixture: {error:?}"));
         assert!(matches!(
             DraftDocument::from_json(&untrusted),
             Err(DraftDocumentError::RequestVersion { version: 1, .. })
@@ -393,9 +401,15 @@ mod draft_tests {
         assert!(document.to_json().is_err());
         assert!(PlanSession::from_document(document.clone()).is_err());
         document.schema_version = DRAFT_SCHEMA_VERSION;
-        let json = document.to_json().unwrap();
-        assert_eq!(DraftDocument::from_json(&json).unwrap(), document);
-        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let json = document
+            .to_json()
+            .unwrap_or_else(|error| panic!("fixture: {error:?}"));
+        assert_eq!(
+            DraftDocument::from_json(&json).unwrap_or_else(|error| panic!("fixture: {error:?}")),
+            document
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).unwrap_or_else(|error| panic!("fixture: {error:?}"));
         value["draft"]["operations"][0]["request"]["create_partition"]["number"] =
             serde_json::json!(0);
         assert!(matches!(

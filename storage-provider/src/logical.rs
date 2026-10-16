@@ -116,6 +116,7 @@ fn validate_partition_create(action: &PartitionAction, graph: &NodeGraph) -> Vec
             "partition must have nonzero size and fit within known table capacity",
         );
     }
+    let mut overlaps = false;
     for edge in graph
         .dependencies()
         .filter(|edge| edge.from == *table && matches!(edge.kind, DependencyKind::Contains { .. }))
@@ -139,15 +140,16 @@ fn validate_partition_create(action: &PartitionAction, graph: &NodeGraph) -> Vec
         }
         if let Some(occupied_size) = node.kind.size {
             let occupied_end = occupied_offset.as_u64().checked_add(occupied_size.as_u64());
-            if occupied_end.is_none_or(|occupied_end| {
+            overlaps |= occupied_end.is_none_or(|occupied_end| {
                 offset.as_u64() < occupied_end && occupied_offset.as_u64() < end
-            }) {
-                return reject(
-                    "partition.create.overlap",
-                    "partition overlaps a known occupied or overflowing byte range",
-                );
-            }
+            });
         }
+    }
+    if overlaps {
+        return reject(
+            "partition.create.overlap",
+            "partition overlaps a known occupied or overflowing byte range",
+        );
     }
     Vec::new()
 }
@@ -658,7 +660,8 @@ mod tests {
             (
                 occupied,
                 NodeKind::Partition {
-                    number: std::num::NonZeroU32::new(1).unwrap(),
+                    number: std::num::NonZeroU32::new(1)
+                        .unwrap_or_else(|| panic!("nonzero fixture number")),
                     offset: Bytes::new(100),
                     role: None,
                     attributes: PartitionAttributes::default(),
@@ -674,7 +677,7 @@ mod tests {
                         size: NodeFacts::default(),
                     },
                 )
-                .unwrap();
+                .unwrap_or_else(|error| panic!("fixture: {error:?}"));
         }
         graph.insert_dependency(Dependency {
             from: table,
@@ -697,7 +700,8 @@ mod tests {
             let action = ProviderAction::Partition(PartitionAction::Create {
                 table,
                 planned_node_id: NodeId::new(),
-                number: std::num::NonZeroU32::new(number).unwrap(),
+                number: std::num::NonZeroU32::new(number)
+                    .unwrap_or_else(|| panic!("nonzero fixture number")),
                 offset: Bytes::new(offset),
                 size: Bytes::new(size),
                 role: None,

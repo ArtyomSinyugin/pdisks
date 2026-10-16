@@ -185,7 +185,8 @@ mod tests {
     fn partition_recipe_covers_only_the_exact_request() {
         let operation = PlanOperation::new(PlanRequest::CreatePartition {
             table: NodeId::new(),
-            number: std::num::NonZeroU32::new(3).unwrap(),
+            number: std::num::NonZeroU32::new(3)
+                .unwrap_or_else(|| panic!("nonzero fixture number")),
             offset: Bytes::new(1024),
             size: Bytes::new(2048),
             role: Some(storage_core::model::UsageRole::Data),
@@ -194,7 +195,8 @@ mod tests {
                 bootable: Some(false),
             },
         });
-        let fragment = lower_operation(&operation, None).unwrap();
+        let fragment =
+            lower_operation(&operation, None).unwrap_or_else(|error| panic!("fixture: {error:?}"));
         assert_eq!(fragment.actions.len(), 1);
         assert!(fragment.dependencies.is_empty());
         assert_eq!(lower_operation(&operation, None), Ok(fragment.clone()));
@@ -219,7 +221,10 @@ mod tests {
             match field {
                 0 => *table = NodeId::new(),
                 1 => *planned_node_id = NodeId::new(),
-                2 => *number = std::num::NonZeroU32::new(4).unwrap(),
+                2 => {
+                    *number = std::num::NonZeroU32::new(4)
+                        .unwrap_or_else(|| panic!("nonzero fixture number"))
+                }
                 3 => *offset = Bytes::new(1025),
                 4 => *size = Bytes::new(2049),
                 5 => *role = None,
