@@ -955,3 +955,124 @@ mod coordination {
         Ok(())
     }
 }
+
+#[cfg(target_os = "linux")]
+mod incidents {
+    use super::*;
+    use super::{
+        admission::Scratch,
+        coordination::{dispatcher, host},
+    };
+    use storage_runtime::{
+        checkpoint::{ActiveAttempt, CheckpointStore},
+        coordinator::ExecutionCoordinator,
+        incident::{IncidentAssessment, inspect_incident},
+        lease::ExecutionRoot,
+    };
+
+    /// Leaves the same marker a stopped coordinator produces, using only a synthetic adapter.
+    fn interrupted(
+        root: &Scratch,
+        state: Rc<RefCell<ProbeSnapshot>>,
+        frozen: &FrozenPlan,
+    ) -> Result<(ActiveAttempt, ExecutionRun), Box<dyn Error>> {
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let fake = dispatcher(root, state.clone());
+        let mut coordinator = ExecutionCoordinator::new(
+            ExecutionRoot::open(&root.0)?,
+            host(state, &run)?,
+            fake,
+            &run,
+        );
+        coordinator.execute_action(&mut run, ActionId::new(0), None)?;
+        let lock = ExecutionRoot::open(&root.0)?.try_lock_host()?;
+        Ok((
+            CheckpointStore::new(&lock)
+                .inspect()?
+                .ok_or("active attempt")?,
+            run,
+        ))
+    }
+
+    /// Compatible observed properties do not remove the marker or recover any execution state.
+    #[test]
+    fn inspection_is_fresh_read_only_and_conservative() -> Result<(), Box<dyn Error>> {
+        let (state, frozen) = fixture()?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = Scratch::new()?;
+        let (attempt, run) = interrupted(&scratch, state.clone(), &frozen)?;
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let probe = probe(state.clone());
+        let bytes = std::fs::read(scratch.0.join("active-attempt.json"))?;
+        let first = inspect_incident(&root, &probe)?.ok_or("inspection")?;
+        assert_eq!(first.attempt, attempt);
+        assert_eq!(first.assessment, IncidentAssessment::Indeterminate);
+        let mut fake = dispatcher(&scratch, state.clone());
+        // Materialize only a recorded result fixture; this adapter never mutates host storage.
+        fake.created_uuid = Some("inspected-lv".into());
+        let observed = ProbedObservation::collect(&probe)?;
+        let resolved = resolve_action(&run, ActionId::new(0), observed.observation(), backend())?;
+        use storage_runtime::dispatcher::BackendDispatcher;
+        fake.execute(&resolved, &mut |_| Ok(()))?;
+        let second = inspect_incident(&root, &probe)?.ok_or("inspection")?;
+        assert_eq!(second.assessment, IncidentAssessment::EffectObserved);
+        assert!(second.fresh_state.reference.epoch > first.fresh_state.reference.epoch);
+        assert_eq!(std::fs::read(scratch.0.join("active-attempt.json"))?, bytes);
+        assert_eq!(std::fs::read_dir(&scratch.0)?.count(), 2);
+        let id = state
+            .borrow()
+            .current
+            .graph
+            .nodes()
+            .find_map(|(id, node)| matches!(node.kind.kind, NodeKind::LvmLv(_)).then_some(*id))
+            .ok_or("LV")?;
+        let mut duplicate = state.borrow().current.graph.node(&id).ok_or("LV")?.clone();
+        duplicate.kind.size = Some(Bytes::new(1));
+        state
+            .borrow_mut()
+            .current
+            .graph
+            .replace_existing(id, duplicate)?;
+        assert_eq!(
+            inspect_incident(&root, &probe)?
+                .ok_or("inspection")?
+                .assessment,
+            IncidentAssessment::Indeterminate
+        );
+        Ok(())
+    }
+
+    /// No incident needs no provider pass; unsafe or corrupt state remains a blocking error.
+    #[test]
+    fn inspection_rejects_busy_lock_corruption_and_probe_failure() -> Result<(), Box<dyn Error>> {
+        let (state, frozen) = fixture()?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = Scratch::new()?;
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let probe = probe(state.clone());
+        assert!(inspect_incident(&root, &probe)?.is_none());
+        let lock = root.try_lock_host()?;
+        assert!(inspect_incident(&root, &probe).is_err());
+        drop(lock);
+        let (attempt, _) = interrupted(&scratch, state.clone(), &frozen)?;
+        state
+            .borrow_mut()
+            .current
+            .graph
+            .insert_dependency(storage_core::model::Dependency {
+                from: NodeId::new(),
+                to: NodeId::new(),
+                kind: storage_core::model::DependencyKind::Backs,
+            });
+        assert!(inspect_incident(&root, &probe).is_err());
+        let bytes = attempt.to_bytes()?;
+        assert_eq!(std::fs::read(scratch.0.join("active-attempt.json"))?, bytes);
+        std::fs::write(scratch.0.join("active-attempt.json"), b"corrupt")?;
+        assert!(inspect_incident(&root, &probe).is_err());
+        assert_eq!(
+            std::fs::read(scratch.0.join("active-attempt.json"))?,
+            b"corrupt"
+        );
+        Ok(())
+    }
+}

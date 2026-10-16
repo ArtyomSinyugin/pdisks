@@ -21,3 +21,6 @@ pub mod coordinator;
 pub mod dispatcher;
 
 pub mod bindings;
+
+#[cfg(target_os = "linux")]
+pub mod incident;
