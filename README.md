@@ -121,7 +121,8 @@ resize-переходы, общий расход ёмкости, доступн�
 полного live-отчёта, зависимые действия ждут `Verified`, а конечная цель проверяется
 отдельно по новому наблюдению. `LiveExecutionChecks` задаёт контракт будущего
 доверенного исполнителя; native live-checkers, блокировки ОС и write-dispatch
-пока не подключены. Универсальный resolver всех desired-diff также не реализован.
+пока не подключены. Добавлен durable journal и read-only incident review;
+универсальный resolver всех desired-diff также не реализован.
 
 ## Редактирование плана без доступа к дискам
 
@@ -285,6 +286,58 @@ Rebase удаления LV сопоставляет UUID и повторно п�
 поддержки корреляции существующих разделов/mappings пока нет, их перенос
 отклоняется явно. Сохранение и freeze не разрешают реальную запись или закрытие
 mapping. Native dispatch и проверка фактических потребителей остаются работой runtime.
+
+## Durable journal: первый шаг C3
+
+`storage_engine::journal` записывает историю попытки, не вызывая backend:
+
+```sh
+cargo run -p storage-engine --example journal_plan
+# Необязательный аргумент — новый путь, существующий файл не перезаписывается:
+cargo run -p storage-engine --example journal_plan -- /tmp/my-new-run.jsonl
+```
+
+[Пример](storage-engine/examples/journal_plan.rs) создаёт обычный файл журнала
+(по умолчанию новый UUID-путь в temp directory) и оставляет его для просмотра.
+Он фиксирует header и событие `Checking`; live-отчёты и resource leases не
+выдумываются. Без допуска попытка записать dispatch intent отвергается.
+Ни probe, ни backend в этом примере не вызываются.
+
+`DurableJournal::create(path, frozen, run)` связывает ровно один новый run с
+точным frozen-документом, session/revision и исходной картой ActionId → OperationId.
+Файл создаётся через `create_new`, на Unix с mode 0600; header и родительский
+каталог синхронизируются. Открытия существующего журнала для append/resume нет.
+Позднее редактирование черновика не меняет зафиксированную карту операций.
+
+Порядок будущего доверенного host:
+
+1. Создать журнал до admission, получить свежие live checks и реальные leases.
+2. Передать допуск в `ExecutionRun`, затем вызвать `record_dispatch_intent`.
+   Только после успешного sync host может вызвать backend под удерживаемыми leases.
+3. Получить fresh probe даже при failure/unknown, передать actual completion в run
+   и сохранить его через `record_completion`. Прогноз не накладывается на snapshot.
+4. Отдельно проверить postconditions и конечную цель; `flush_events` сохраняет
+   исходные `RunEvent` и их sequence для просмотра после переподключения.
+
+Намерение записывается только для `Running` и единожды. Записанный intent ещё
+не доказывает факт вызова backend. Ошибка write/sync отравляет handle: дальнейшие
+append запрещены, dispatch после ошибки не допускается. Предварительная проверка
+размера/count происходит до записи batch; пределы — 16 МиБ и 16 384 записи,
+rotation пока нет. Блокировки устройств и авторизация этим API не реализуются.
+
+`JournalLog::read()` / `from_bytes()` читают bounded JSONL: версии, IDs, полный
+source map, sequence, переходы состояний, порядок предшественников и привязка
+completion проверяются. Незавершённая последняя строка отмечается как
+`incomplete_tail`; повреждённая полная строка отклоняется. Read-only `review()`
+возвращает исторические сведения: отсутствие записи о вызове, неподтверждённую
+попытку либо записанный outcome с actual observation reference. Даже `Succeeded`
+не считается доказательством postconditions или конечного успеха. Файл может быть
+изменён извне; его claims не становятся live evidence. Импорта в `ExecutionRun`,
+автоматического retry и восстановления права на запись нет.
+
+Следующая часть C3 — доверенный live-checker, реальные resource leases и узкий
+native dispatch. Сейчас запись выполняется только в обычный файл журнала;
+изменение устройств и незавершённый disks preview остаются выключенными.
 
 ## Наблюдения для нового baseline
 
