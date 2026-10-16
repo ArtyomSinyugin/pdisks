@@ -320,6 +320,23 @@ completion/final verification и при чтении completion из журна�
 
 Полного `LiveExecutionChecks` и native dispatch пока нет.
 
+`LinuxProbe::instance_id()` отличает независимые экземпляры probe при одинаковых
+generations; старые fixture JSON не меняются. `ProbedObservation::collect(&probe)`
+вызывает выбранные adapters ровно один раз, связывает snapshot с этим instance и
+generation, использует raw LVM records того же прохода. Импорта такого объекта
+из JSON нет. Выбор настоящих native adapters остаётся ответственностью host;
+recorded adapters продолжают быть fixtures, независимо от нового UUID.
+
+`ProbedObservation::check_prerequisites()` дополнительно проверяет
+`CapacityAvailable` по измеренной свободной ёмкости. VG сопоставляется по UUID;
+при смене NodeId условия сохраняют frozen IDs. Изменившиеся/неизвестные размеры
+extent не позволяют переосмыслить frozen allocation count. Отсутствующие,
+двусмысленные, exported и неточные measurements оставляют `Unknown`; известная
+нехватка места даёт `Violated`. Старые baseline/free counts не подмешиваются.
+Ошибки, missing information и requires-confirmation diagnostics не дают
+положительных observed checks; известные противоречия сохраняются. Warnings
+сами по себе evidence не отзывают.
+
 ## Execution leases: C3, Linux
 
 `storage_engine::leases::ExecutionLease` удерживает настоящий неблокирующий
@@ -349,6 +366,14 @@ symlink; lock должен быть regular, private и иметь ровно о
 5. Удерживать guard до actual completion probe, записи результата и verification,
    затем отпустить. Ошибка/unknown требуют журнала и явного recovery, без auto retry.
 
+Для уже реализованной части есть `guard.record_probe_preflight(&mut run, &probe)`:
+он сам собирает новую публикацию под удерживаемым lock и записывает observed
+checks с same-pass capacity. Foreign run, смена probe instance и неподходящая
+фаза отклоняются до вызова adapters. Повреждённый результат не меняет сохранённые
+runtime evidence/events. Known violation переводит run в Failed; остальные
+preflight оставляют Checking: applicability пока всегда Unknown до реализации
+native capability/scope/authorization checks. Метод не включает dispatch.
+
 Drop и завершение процесса освобождают OS lock. Освобождение после падения не
 доказывает завершения операции; старый journal нужно разобрать до нового dispatch.
 Безопасный `rustix` API сохраняет MSRV 1.88, новый unsafe в проекте не добавлен.
@@ -360,10 +385,12 @@ cargo run -p storage-engine --example lease_plan -- /path/to/private/leases
 ```
 
 [Пример](storage-engine/examples/lease_plan.rs) использует frozen fixture и
-настоящую блокировку обычного файла. Второй run получает Busy; без live evidence
-intent отклоняется. По умолчанию остаётся новый изолированный temp-каталог с
+настоящую блокировку обычного файла. Второй run получает Busy. Под guard
+выполняется recorded probe: новое измерение с нулём свободных extents запрещает
+исторически допустимое создание LV, run становится Failed, intent отклоняется.
+По умолчанию остаётся новый изолированный temp-каталог с
 lock/journal для просмотра; такой отдельный root служит только демонстрации.
-Native backend и реальный probe не вызываются. Межпроцессная конкуренция и
+Native backend и native probe не вызываются. Межпроцессная конкуренция и
 освобождение lock при exit без Rust drop проверяются отдельным subprocess-тестом.
 
 ## Durable journal: первый шаг C3

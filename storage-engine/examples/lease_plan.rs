@@ -1,13 +1,47 @@
 //! Real Linux advisory lease and journal preparation over a synthetic plan; no storage writes.
 //! Run with `cargo run -p storage-engine --example lease_plan -- [EXISTING_PRIVATE_DIRECTORY]`.
 
-/// Demonstrates actual exclusion while incomplete live evidence keeps the run in Checking.
+/// Explicit fixture adapter; this exercises probe collection without observing host devices.
+#[cfg(target_os = "linux")]
+struct RecordedProvider {
+    /// One synthetic graph and its same-pass VG measurements.
+    publication: storage_probe::ProbeSnapshot,
+}
+
+#[cfg(target_os = "linux")]
+impl storage_probe::StateProvider for RecordedProvider {
+    /// Identifies the example's fixture source explicitly.
+    fn id(&self) -> &str {
+        "recorded-preflight-example"
+    }
+    /// Owns the recorded contribution within normal provider assembly.
+    fn responsibility(&self) -> &str {
+        "recorded.storage"
+    }
+    /// Uses built-in attachment without pretending to be a native library.
+    fn connection_kind(&self) -> storage_provider::ProviderConnectionKind {
+        storage_provider::ProviderConnectionKind::BuiltIn
+    }
+    /// Supplies graph and allocation records together through the ordinary probe boundary.
+    fn probe(&self) -> Result<storage_probe::ProviderState, storage_probe::ProviderProbeError> {
+        let publication = &self.publication;
+        Ok(storage_probe::ProviderState {
+            graph: publication.current.graph.clone(),
+            mounts: publication.current.mounts.entries.clone(),
+            lvm_vgs: publication.lvm_vgs.clone(),
+            diagnostics: publication.current.diagnostics.clone(),
+            environment: Some(publication.current.environment.clone()),
+        })
+    }
+}
+
+/// Demonstrates actual exclusion and a fresh fixture measurement vetoing historical allocation.
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
     use storage_core::model::Bytes;
     use storage_engine::{
-        ActionId, ActionRunState, ExecutionRun,
+        ActionId, ActionRunState, ExecutionRun, HistoricalBaseline, LiveCheckStatus,
         editing::PlanSession,
         journal::{DurableJournal, JournalLog, RecoveryStatus},
         leases::{ExecutionLease, LeaseError},
@@ -28,7 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             path
         }
     };
-    let baseline = serde_json::from_str(include_str!("fixtures/editing_baseline.json"))?;
+    let mut publication: storage_probe::ProbeSnapshot =
+        serde_json::from_str(include_str!("fixtures/probe_snapshot.json"))?;
+    let baseline = HistoricalBaseline::from_lvm_observations(
+        publication.current.clone(),
+        &publication.lvm_vgs,
+    )?;
     let mut session = PlanSession::new(baseline)?;
     let storage_provider::AllocationDomain::LvmVolumeGroup(vg) =
         session.baseline().capacity_evidence[0].domain;
@@ -47,9 +86,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ExecutionLease::try_acquire(&directory, &contender, action),
         Err(LeaseError::Busy)
     ));
+    // The historical plan fit; this separate fixture measurement reports no remaining capacity.
+    publication.lvm_vgs[0].vg.free = 0;
+    let probe =
+        storage_probe::LinuxProbe::from_providers(vec![Box::new(RecordedProvider { publication })]);
+    guard.record_probe_preflight(&mut run, &probe)?;
     assert!(guard.record_dispatch_intent(&mut journal, &run).is_err());
-    assert_eq!(run.state(action)?, ActionRunState::Checking);
-    assert!(run.latest_observation().is_none());
+    assert_eq!(run.state(action)?, ActionRunState::Failed);
+    assert_eq!(
+        run.latest_observation()
+            .ok_or("preflight observation")?
+            .reference
+            .probe_instance,
+        probe.instance_id()
+    );
+    assert!(
+        run.admission(action)?
+            .ok_or("preflight admission")?
+            .checks
+            .iter()
+            .any(|check| matches!(check.status, LiveCheckStatus::Violated { .. }))
+    );
+    journal.flush_events(&run)?;
     let review = JournalLog::read(&journal_path)?.review()?;
     assert!(
         review
@@ -64,9 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("journal: {}", journal_path.display());
     println!("real flock: contender gets Busy until guard drops; persistent lock file retained");
     println!(
-        "no actual probe or authorization supplied: run stays Checking, dispatch intent rejected"
+        "recorded probe under lease: fresh free capacity is zero; run Failed, dispatch intent rejected"
     );
-    println!("no storage backend invoked; isolated default root is for this example only");
+    println!(
+        "no native probe or storage backend invoked; isolated default root is for this example only"
+    );
     Ok(())
 }
 
