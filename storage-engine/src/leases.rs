@@ -14,9 +14,9 @@ use uuid::Uuid;
 
 use crate::{
     ActionId, ActionRunState, AdmissionReport, BackendCompletion, BackendOutcome, ExecutionRun,
-    ExecutionRunError, LiveCheck, LiveCheckStatus, LiveObservation,
+    ExecutionRunError, LiveCheck, LiveCheckStatus, LiveObservation, VerificationReport,
     journal::{DurableJournal, JournalError},
-    live::{ProbeObservationError, ProbedObservation},
+    live::{ProbeObservationError, ProbedObservation, check_observed_postconditions},
 };
 
 /// Permanent name shared by every cooperating host, regardless of transient plan/node IDs.
@@ -248,6 +248,46 @@ impl ExecutionLease {
             return Err(error.into());
         }
         Ok(())
+    }
+
+    /// Records observed postconditions using only this action's retained, journaled completion.
+    /// No later probe or predicted effect substitutes for that publication.
+    /// The host must flush resulting events before releasing the guard or starting successors;
+    /// any journal error forbids continuation even if in-memory verification has succeeded.
+    pub fn record_observed_verification(
+        &self,
+        journal: &DurableJournal,
+        run: &mut ExecutionRun,
+    ) -> Result<bool, LeaseError> {
+        self.check_run(run)?;
+        let state = run.state(self.action)?;
+        if state != ActionRunState::Verifying {
+            return Err(ExecutionRunError::InvalidTransition {
+                action: self.action,
+                state,
+            }
+            .into());
+        }
+        journal.require_completion(run, self.action)?;
+        let completion = run
+            .completion(self.action)?
+            .ok_or(ExecutionRunError::ReportMismatch)?;
+        let context = run.context();
+        let postconditions = &context.plan.actions()[self.action.get() as usize]
+            .informational_contract
+            .postconditions;
+        let report = check_observed_postconditions(
+            context.historical_baseline,
+            &completion.observation,
+            postconditions,
+        )
+        .map_err(ProbeObservationError::from)?;
+        Ok(run.record_verification(VerificationReport {
+            run_id: self.run_id,
+            action: self.action,
+            observation: report.observation,
+            checks: report.checks,
+        })?)
     }
 
     /// Syncs this admitted action's invocation intent while the OS lease remains held.

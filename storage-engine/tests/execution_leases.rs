@@ -547,3 +547,151 @@ fn completion_probe_failure_stops_without_retry_or_projected_success() -> Result
     }
     Ok(())
 }
+
+/// Verification uses the exact durable completion, even when a later observation differs.
+#[test]
+fn leased_observed_verification_distinguishes_match_mismatch_and_missing_evidence()
+-> Result<(), Box<dyn Error>> {
+    use storage_core::model::NodeKind;
+    use storage_engine::{
+        ActionRunState, BackendCompletion, BackendOutcome, HistoricalBaseline, LiveCheckStatus,
+        editing::{PlanEdit, PlanRequest},
+        journal::{DurableJournal, JournalLog},
+        live::ProbedObservation,
+    };
+    for case in 0..3 {
+        let root = Scratch::new()?;
+        let baseline: HistoricalBaseline =
+            serde_json::from_str(include_str!("../examples/fixtures/resize_baseline.json"))?;
+        let filesystem = *baseline
+            .snapshot
+            .graph
+            .nodes()
+            .find(|(_, node)| matches!(node.kind.kind, NodeKind::Filesystem { .. }))
+            .ok_or("filesystem")?
+            .0;
+        let state = std::cell::RefCell::new(baseline.snapshot.clone());
+        let mut session = PlanSession::new(baseline)?;
+        session.edit(
+            session.revision(),
+            PlanEdit::Add(PlanRequest::SetFilesystemLabel {
+                filesystem,
+                label: Some("renamed".into()),
+            }),
+        )?;
+        let frozen = session.freeze(session.revision())?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let mut other = ExecutionRun::new(frozen.document())?;
+        let path = root.0.join("run.jsonl");
+        let mut journal = DurableJournal::create(&path, &frozen, &run)?;
+        let other_journal = DurableJournal::create(root.0.join("other.jsonl"), &frozen, &other)?;
+        let action = ActionId::new(0);
+        run.begin_check(action)?;
+        other.begin_check(action)?;
+        let guard = ExecutionLease::try_acquire(&root.0, &run, action)?;
+        let calls = std::cell::Cell::new(0);
+        let probe = storage_probe::LinuxProbe::from_providers(vec![Box::new(ActualProvider {
+            state: &state,
+            calls: &calls,
+        })]);
+        let observed = ProbedObservation::collect(&probe)?.into_observation();
+        // Synthetic complete admission and classified result exercise verification wiring only.
+        let claims = checks(&run, LiveCheckStatus::Satisfied);
+        guard.record_admission(&mut run, observed, LiveCheckStatus::Satisfied, claims)?;
+        guard.record_dispatch_intent(&mut journal, &run)?;
+        let original_node = state
+            .borrow()
+            .graph
+            .node(&filesystem)
+            .ok_or("filesystem")?
+            .clone();
+        let mut node = original_node.clone();
+        if case != 1 {
+            let NodeKind::Filesystem { label, .. } = &mut node.kind.kind else {
+                return Err("filesystem kind".into());
+            };
+            *label = Some("renamed".into());
+        }
+        if case == 2 {
+            node.size.identities.clear();
+        }
+        state
+            .borrow_mut()
+            .graph
+            .replace_existing(filesystem, node)?;
+        if case == 0 {
+            let completion = BackendCompletion {
+                run_id: run.run_id(),
+                action,
+                outcome: BackendOutcome::Succeeded,
+                observation: ProbedObservation::collect(&probe)?.into_observation(),
+            };
+            run.record_completion(completion)?;
+            assert!(
+                guard
+                    .record_observed_verification(&journal, &mut run)
+                    .is_err()
+            );
+            assert_eq!(run.state(action)?, ActionRunState::Verifying);
+            assert!(run.verification(action)?.is_none());
+            journal.record_completion(&run, action)?;
+        } else {
+            guard.record_probed_completion(
+                &mut journal,
+                &mut run,
+                &probe,
+                BackendOutcome::Succeeded,
+            )?;
+        }
+        let reference = run
+            .completion(action)?
+            .ok_or("retained completion")?
+            .observation
+            .reference;
+        assert!(
+            guard
+                .record_observed_verification(&other_journal, &mut run)
+                .is_err()
+        );
+        assert!(run.verification(action)?.is_none());
+        // A later snapshot cannot replace the publication retained for this result's postconditions.
+        state
+            .borrow_mut()
+            .graph
+            .replace_existing(filesystem, original_node)?;
+        let later = ProbedObservation::collect(&probe)?;
+        assert_ne!(later.observation().reference, reference);
+        assert_eq!(
+            guard.record_observed_verification(&journal, &mut run)?,
+            case == 0
+        );
+        let expected = match case {
+            0 => ActionRunState::Verified,
+            1 => ActionRunState::Failed,
+            _ => ActionRunState::OutcomeUnknown,
+        };
+        assert_eq!(run.state(action)?, expected);
+        assert_eq!(
+            run.verification(action)?.ok_or("verification")?.observation,
+            reference
+        );
+        assert_eq!(calls.get(), 3);
+        journal.flush_events(&run)?;
+        assert_eq!(
+            JournalLog::read(&path)?.review()?.actions[0].reported_state,
+            expected
+        );
+        assert!(matches!(
+            ExecutionLease::try_acquire(&root.0, &other, action),
+            Err(LeaseError::Busy)
+        ));
+        assert!(!run.is_verified());
+        assert!(
+            guard
+                .record_observed_verification(&journal, &mut run)
+                .is_err()
+        );
+        drop(guard);
+    }
+    Ok(())
+}

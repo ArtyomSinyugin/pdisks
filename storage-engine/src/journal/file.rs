@@ -169,6 +169,21 @@ impl DurableJournal {
         Ok(())
     }
 
+    /// Requires a healthy journal with an acknowledged actual completion before result verification.
+    pub(crate) fn require_completion(
+        &self,
+        run: &ExecutionRun,
+        action: ActionId,
+    ) -> Result<(), JournalError> {
+        self.require_dispatch_intent(run, action)?;
+        if !self.completions.contains(&action) {
+            return Err(JournalError::Structure(
+                "verification requires an acknowledged completion",
+            ));
+        }
+        Ok(())
+    }
+
     /// Rejects cross-run/frozen-document mixing and any use following uncertain journal I/O.
     fn check_run(&self, run: &ExecutionRun) -> Result<(), JournalError> {
         if self.poisoned {
