@@ -81,6 +81,9 @@ pub enum EditError {
     /// Geometry editing requires a planned CreatePartition request.
     #[error("operation {0:?} is not a planned partition creation")]
     NotCreatedPartition(OperationId),
+    /// Updating a resize size requires a ResizeLv or ResizeFilesystem request.
+    #[error("operation {0:?} is not a resize request")]
+    NotResize(OperationId),
     /// Cancelling a creator requires an explicit decision about its dependent requests.
     #[error("removal requires dependent operations {operations:?}")]
     DependentOperations {
@@ -372,6 +375,32 @@ impl PlanSession {
         };
         *requested_offset = offset;
         *requested_size = size;
+        self.edit(expected_revision, PlanEdit::Replace { operation, request })
+    }
+
+    /// Changes the target size of an explicit resize, retaining its operation and node identities.
+    /// This never changes a Create request or inserts implicit preparation actions.
+    pub fn set_resize_size(
+        &mut self,
+        expected_revision: DraftRevision,
+        operation: OperationId,
+        new_size: Bytes,
+    ) -> Result<EditReceipt, EditError> {
+        self.check_revision(expected_revision)?;
+        let index = operation_index(&self.draft, operation)?;
+        let mut request = self.draft.operations[index].request.clone();
+        let (PlanRequest::ResizeLv {
+            new_size: requested,
+            ..
+        }
+        | PlanRequest::ResizeFilesystem {
+            new_size: requested,
+            ..
+        }) = &mut request
+        else {
+            return Err(EditError::NotResize(operation));
+        };
+        *requested = new_size;
         self.edit(expected_revision, PlanEdit::Replace { operation, request })
     }
 

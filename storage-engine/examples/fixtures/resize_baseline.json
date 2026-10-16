@@ -1,0 +1,134 @@
+{
+  "id": "00000000-0000-7000-8000-000000000401",
+  "snapshot": {
+    "graph": {
+      "nodes": {
+        "00000000-0000-7000-8000-000000000002": {
+          "kind": {
+            "kind": {
+              "LvmVg": {
+                "name": "vg0",
+                "extent_size": 4194304
+              }
+            },
+            "size": 68719476736
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "LvmVgUuid": "example-vg-uuid"
+              }
+            ],
+            "block": null,
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000012": {
+          "kind": {
+            "kind": {
+              "LvmLv": {
+                "name": "data",
+                "kind": "Linear"
+              }
+            },
+            "size": 134217728
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "LvmLvUuid": "example-resize-lv-uuid"
+              }
+            ],
+            "block": {
+              "paths": [
+                "/dev/example/data"
+              ],
+              "devno": {
+                "major": 253,
+                "minor": 0
+              },
+              "geometry": null,
+              "read_only": false
+            },
+            "device": null
+          }
+        },
+        "00000000-0000-7000-8000-000000000013": {
+          "kind": {
+            "kind": {
+              "Filesystem": {
+                "kind": "Ext4",
+                "label": "data"
+              }
+            },
+            "size": 134217728
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "Filesystem": {
+                  "fs_type": "ext4",
+                  "value": "example-resize-fs-uuid"
+                }
+              }
+            ],
+            "block": null,
+            "device": null
+          }
+        }
+      },
+      "dependencies": [
+        {
+          "from": "00000000-0000-7000-8000-000000000002",
+          "to": "00000000-0000-7000-8000-000000000012",
+          "kind": "Provides"
+        },
+        {
+          "from": "00000000-0000-7000-8000-000000000012",
+          "to": "00000000-0000-7000-8000-000000000013",
+          "kind": "Backs"
+        }
+      ],
+      "relations": []
+    },
+    "mounts": {
+      "entries": [
+        {
+          "source": {
+            "filesystem": "00000000-0000-7000-8000-000000000013"
+          },
+          "target": "/data",
+          "options": [
+            "rw"
+          ],
+          "context": "host"
+        }
+      ]
+    },
+    "environment": {
+      "host": {
+        "os_release": null,
+        "architecture": null,
+        "kernel_release": null,
+        "tools": [],
+        "kernel_modules": []
+      },
+      "target": null
+    },
+    "diagnostics": []
+  },
+  "capacity_evidence": [
+    {
+      "domain": {
+        "lvm_volume_group": "00000000-0000-7000-8000-000000000002"
+      },
+      "available": 16
+    }
+  ]
+}
