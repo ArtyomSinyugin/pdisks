@@ -340,6 +340,11 @@ protects plugin lifecycle only and does not authorize storage writes.
 
 ## Backend ownership
 
+`LinearLvRequest` validates the first native write recipe: a new linear LV in
+an existing UUID-qualified VG. Its pure preflight requires a unique VG, an
+unused LV name, sufficient free space and an exact extent-aligned size.
+Constructing or checking a request does not authorize writes.
+
 One operation has one owning backend. A second library may enrich discovery,
 but it must not become an alternative executor for the same action.
 

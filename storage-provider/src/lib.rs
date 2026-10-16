@@ -21,6 +21,7 @@ mod contract;
 mod dylib;
 mod logical;
 mod luks;
+mod lvm_write;
 mod planning;
 mod transport;
 
@@ -39,6 +40,7 @@ pub use luks::{
     CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProbeFailure,
     LuksProbeReport, LuksProvider, LuksValidationError,
 };
+pub use lvm_write::{LinearLvRequest, LvmWriteError};
 pub use planning::{
     DependencyReason, ExternalRequirement, FragmentAction, FragmentDependency, FragmentOrigin,
     LocalActionId, PlanFragment,
