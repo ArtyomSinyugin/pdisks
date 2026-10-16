@@ -6,6 +6,7 @@ mod compose;
 pub mod editing;
 mod effects;
 mod execution;
+mod observe;
 mod plan;
 mod prerequisites;
 mod simulate;
