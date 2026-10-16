@@ -1177,6 +1177,12 @@ mod tests {
                 let simulation = crate::simulate_plan(&current, &plan)
                     .unwrap_or_else(|error| panic!("replay LUKS plan: {error}"));
                 assert_eq!(simulation.steps.len(), 3);
+                for step in simulation.steps.iter().take(2) {
+                    assert!(step.checks.iter().any(|check| matches!(
+                        (&check.prerequisite, &check.status),
+                        (ActionPrerequisite::CredentialAvailable(reference), crate::CheckStatus::Unknown { .. }) if *reference == credential
+                    )));
+                }
             }
             assert_eq!(current, baseline);
         }

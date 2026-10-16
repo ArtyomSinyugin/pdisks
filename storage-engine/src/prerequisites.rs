@@ -128,6 +128,10 @@ fn evaluate_prerequisite(
         ActionPrerequisite::DestructiveApproval(_) => CheckStatus::Unknown {
             required_evidence: "explicit destructive-scope approval".to_owned(),
         },
+        ActionPrerequisite::CredentialAvailable(_) => CheckStatus::Unknown {
+            required_evidence: "resolve credential reference through the runtime credential store"
+                .to_owned(),
+        },
         ActionPrerequisite::ExtentAvailable { .. } => CheckStatus::Unknown {
             required_evidence: "provider allocation and alignment evidence".to_owned(),
         },

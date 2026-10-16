@@ -10,8 +10,8 @@ use storage_core::model::{
 use thiserror::Error;
 
 use crate::{
-    BtrfsAction, FilesystemAction, LuksAction, LvmAction, MountAction, PartitionAction,
-    ProviderAction,
+    BtrfsAction, CredentialRef, FilesystemAction, LuksAction, LvmAction, MountAction,
+    PartitionAction, ProviderAction,
 };
 
 /// Read-only model context used to derive a trusted action contract.
@@ -72,6 +72,9 @@ pub enum ActionPrerequisite {
     },
     /// Destructive use of the named node requires explicit approval.
     DestructiveApproval(NodeId),
+    /// The referenced external secret must be resolvable for this invocation.
+    /// Persisting this opaque reference never proves that credential material is available.
+    CredentialAvailable(CredentialRef),
     /// A partition-table extent must be free and correctly aligned.
     ExtentAvailable {
         /// Partition-table node owning the address space.
@@ -796,9 +799,12 @@ fn describe_luks(action: &LuksAction, context: ActionDescriptionContext<'_>) -> 
             target,
             planned_node_id,
             version,
-            ..
+            credential,
         } => {
             let mut result = destructive_contract(*target, RestartPolicy::VerifyThenRetry);
+            result
+                .prerequisites
+                .push(ActionPrerequisite::CredentialAvailable(*credential));
             let spec = NodeSpec {
                 kind: NodeKind::LuksContainer { version: *version },
                 size: None,
@@ -818,11 +824,19 @@ fn describe_luks(action: &LuksAction, context: ActionDescriptionContext<'_>) -> 
             planned_node_id,
             mapping_name,
             read_only,
-            ..
+            credential,
         } => {
             let mut result = contract(RestartPolicy::ReprobeThenRetry);
             require_kind(&mut result, *container, NodeKindClass::LuksContainer);
+            if !read_only {
+                result
+                    .prerequisites
+                    .push(ActionPrerequisite::Writable(*container));
+            }
             read(&mut result, ActionResource::Node(*container));
+            result
+                .prerequisites
+                .push(ActionPrerequisite::CredentialAvailable(*credential));
             let spec = NodeSpec {
                 kind: NodeKind::DmCryptMapping {
                     name: mapping_name.clone(),
@@ -2168,6 +2182,64 @@ mod tests {
         assert_eq!(trusted, imported);
     }
 
+    /// Imported LUKS contracts cannot erase credential resolution or destructive approval.
+    #[test]
+    fn luks_preparation_contracts_retain_live_credential_requirements()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (graph, backing) = block_graph();
+        let context = ActionDescriptionContext { graph: &graph };
+        let credential = crate::CredentialRef::from_uuid(uuid::Uuid::now_v7());
+        for action in [
+            ProviderAction::Luks(LuksAction::Format {
+                target: backing,
+                planned_node_id: NodeId::new(),
+                version: LuksVersion::Luks2,
+                credential,
+            }),
+            ProviderAction::Luks(LuksAction::Open {
+                container: backing,
+                planned_node_id: NodeId::new(),
+                mapping_name: "crypt-data".to_owned(),
+                credential,
+                read_only: false,
+            }),
+        ] {
+            let contract = describe_action(&action, context);
+            assert!(
+                contract
+                    .prerequisites
+                    .contains(&ActionPrerequisite::CredentialAvailable(credential))
+            );
+            if matches!(action, ProviderAction::Luks(LuksAction::Format { .. })) {
+                assert!(
+                    contract
+                        .prerequisites
+                        .contains(&ActionPrerequisite::DestructiveApproval(backing))
+                );
+                assert!(
+                    contract
+                        .prerequisites
+                        .contains(&ActionPrerequisite::NoUnexpectedConsumers(backing))
+                );
+            }
+            if let ProviderAction::Luks(LuksAction::Open { container, .. }) = &action {
+                assert!(
+                    contract
+                        .prerequisites
+                        .contains(&ActionPrerequisite::Writable(*container))
+                );
+            }
+            let json = serde_json::to_string(&contract)?;
+            let mut imported: ActionContract = serde_json::from_str(&json)?;
+            assert_eq!(imported, contract);
+            imported.prerequisites.retain(|condition| {
+                !matches!(condition, ActionPrerequisite::CredentialAvailable(_))
+            });
+            assert!(verify_imported_contract(&action, imported, context).is_err());
+        }
+        Ok(())
+    }
+
     /// LUKS open exposes its requested access mode to dependent actions.
     #[test]
     fn luks_open_contract_reports_read_only_interface() {
@@ -2198,6 +2270,11 @@ mod tests {
 
         let contract = describe_action(&action, ActionDescriptionContext { graph: &graph });
 
+        assert!(
+            !contract
+                .prerequisites
+                .contains(&ActionPrerequisite::Writable(container))
+        );
         assert!(
             contract
                 .provided_outputs
