@@ -313,6 +313,7 @@ fn evaluate_dependent_sizes(
         };
     }
     let mut found = false;
+    let mut unknown = false;
     let mut predicted = evidence.projected_graph_nodes.contains(&node);
     for dependency in desired.graph.dependencies().filter(|dependency| {
         dependency.from == node && matches!(dependency.kind, DependencyKind::Backs)
@@ -325,15 +326,19 @@ fn evaluate_dependent_sizes(
             };
         };
         let Some(dependent_size) = dependent.kind.size else {
-            return CheckStatus::Unknown {
-                required_evidence: "dependent capacity observation".to_owned(),
-            };
+            unknown = true;
+            continue;
         };
         if dependent_size > size {
             return CheckStatus::Violated {
                 reason: "an upper layer exceeds the proposed backing capacity".to_owned(),
             };
         }
+    }
+    if unknown {
+        return CheckStatus::Unknown {
+            required_evidence: "dependent capacity observation".to_owned(),
+        };
     }
     if found {
         CheckStatus::Satisfied(if predicted {
@@ -358,13 +363,20 @@ fn evaluate_backing_size(
             reason: "referenced node is absent".to_owned(),
         };
     }
-    let Some(dependency) = desired.graph.dependencies().find(|dependency| {
+    let mut backings = desired.graph.dependencies().filter(|dependency| {
         dependency.to == node && matches!(dependency.kind, DependencyKind::Backs)
-    }) else {
+    });
+    let Some(dependency) = backings.next() else {
         return CheckStatus::Unknown {
             required_evidence: "direct backing relationship".to_owned(),
         };
     };
+    if backings.next().is_some() {
+        return CheckStatus::Unknown {
+            required_evidence: "provider capacity calculation for multiple backing nodes"
+                .to_owned(),
+        };
+    }
     let Some(backing) = desired.graph.node(&dependency.from) else {
         return CheckStatus::Violated {
             reason: "backing node is absent".to_owned(),
@@ -501,5 +513,121 @@ pub(crate) fn matches_kind(kind: &NodeKind, expected: NodeKindClass) -> bool {
                 ..
             }
         ),
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+    use storage_core::model::{Bytes, Dependency, Node, NodeFacts, NodeGraph, NodeSpec};
+
+    /// Builds a minimal desired graph without inventing runtime evidence.
+    fn desired() -> DesiredState {
+        let baseline: crate::HistoricalBaseline =
+            serde_json::from_str(include_str!("../examples/fixtures/editing_baseline.json"))
+                .unwrap_or_else(|error| panic!("fixture: {error}"));
+        let mut desired = DesiredState::from_current(&baseline.snapshot);
+        desired.graph = NodeGraph::new();
+        desired
+    }
+
+    /// Known oversized consumers outrank unknown siblings regardless of hash traversal order.
+    #[test]
+    fn dependent_violation_is_not_hidden_by_unknown_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut desired = desired();
+        let parent = NodeId::new();
+        let children = [NodeId::new(), NodeId::new()];
+        for node in [parent, children[0], children[1]] {
+            desired.graph.insert_new(
+                node,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: None,
+                    },
+                    size: NodeFacts::default(),
+                },
+            )?;
+        }
+        for child in children {
+            desired.graph.insert_dependency(Dependency {
+                from: parent,
+                to: child,
+                kind: DependencyKind::Backs,
+            });
+        }
+        let last = desired
+            .graph
+            .dependencies()
+            .last()
+            .ok_or("missing dependency")?
+            .to;
+        let mut node = desired.graph.node(&last).ok_or("missing child")?.clone();
+        node.kind.size = Some(Bytes::new(100));
+        desired.graph.replace_existing(last, node)?;
+        let check = ActionPrerequisite::DependentsFitWithin {
+            node: parent,
+            size: Bytes::new(60),
+        };
+        assert!(matches!(
+            evaluate_prerequisite(&desired, &SimulationEvidence::default(), &check),
+            CheckStatus::Violated { .. }
+        ));
+        let mut node = desired.graph.node(&last).ok_or("missing child")?.clone();
+        node.kind.size = Some(Bytes::new(50));
+        desired.graph.replace_existing(last, node)?;
+        assert!(matches!(
+            evaluate_prerequisite(&desired, &SimulationEvidence::default(), &check),
+            CheckStatus::Unknown { .. }
+        ));
+        Ok(())
+    }
+
+    /// Multiple lower layers cannot be reduced to whichever size is visited first.
+    #[test]
+    fn backing_capacity_requires_an_unambiguous_direct_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut desired = desired();
+        let target = NodeId::new();
+        let small = NodeId::new();
+        let large = NodeId::new();
+        for (id, size) in [(target, 10), (small, 20), (large, 200)] {
+            desired.graph.insert_new(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(size)),
+                    },
+                    size: NodeFacts::default(),
+                },
+            )?;
+        }
+        for backing in [small, large] {
+            desired.graph.insert_dependency(Dependency {
+                from: backing,
+                to: target,
+                kind: DependencyKind::Backs,
+            });
+        }
+        let check = ActionPrerequisite::BackingSizeAtLeast {
+            node: target,
+            size: Bytes::new(100),
+        };
+        assert!(matches!(
+            evaluate_prerequisite(&desired, &SimulationEvidence::default(), &check),
+            CheckStatus::Unknown { .. }
+        ));
+        desired.graph.remove_dependency(&Dependency {
+            from: large,
+            to: target,
+            kind: DependencyKind::Backs,
+        });
+        assert!(matches!(
+            evaluate_prerequisite(&desired, &SimulationEvidence::default(), &check),
+            CheckStatus::Violated { .. }
+        ));
+        Ok(())
     }
 }

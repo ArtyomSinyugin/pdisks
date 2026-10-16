@@ -37,6 +37,16 @@ pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> V
                     "filesystem.resize.unsupported",
                     "filesystem resize currently supports only the ext2/ext3/ext4 recipe",
                 )
+            } else if graph
+                .dependencies()
+                .filter(|edge| edge.to == *filesystem && matches!(edge.kind, DependencyKind::Backs))
+                .count()
+                > 1
+            {
+                (
+                    "filesystem.resize.ambiguous_backing",
+                    "ext resize requires at most one direct backing node",
+                )
             } else {
                 return Vec::new();
             };
@@ -643,6 +653,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The ext resize recipe cannot choose an arbitrary backing node from ambiguous metadata.
+    #[test]
+    fn filesystem_resize_rejects_multiple_backing_nodes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let filesystem = NodeId::new();
+        let mut graph = NodeGraph::new();
+        graph.insert_new(
+            filesystem,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::Filesystem {
+                        kind: storage_core::model::FilesystemKind::Ext4,
+                        label: None,
+                    },
+                    size: Some(Bytes::new(100)),
+                },
+                size: NodeFacts::default(),
+            },
+        )?;
+        let action = ProviderAction::Filesystem(FilesystemAction::Resize {
+            filesystem,
+            new_size: Bytes::new(60),
+        });
+        for count in 0..=2 {
+            let diagnostics = validate_provider_action(&action, &graph);
+            assert_eq!(diagnostics.is_empty(), count < 2);
+            if count == 2 {
+                assert_eq!(diagnostics[0].code, "filesystem.resize.ambiguous_backing");
+                break;
+            }
+            let backing = NodeId::new();
+            graph.insert_new(
+                backing,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(Bytes::new(100)),
+                    },
+                    size: NodeFacts::default(),
+                },
+            )?;
+            graph.insert_dependency(Dependency {
+                from: backing,
+                to: filesystem,
+                kind: DependencyKind::Backs,
+            });
+        }
+        Ok(())
     }
 
     /// Invalid ranges and occupied numbers are rejected, while adjacent ranges remain possible.
