@@ -323,6 +323,9 @@ pub enum ExecutionRunError {
     /// A new report reuses an old generation or changes probe-service instance mid-run.
     #[error("live observation is stale or belongs to another probe instance")]
     StaleObservation,
+    /// Malformed actual state cannot replace the last accepted observation.
+    #[error(transparent)]
+    InvalidObservation(#[from] crate::live::ObservationError),
     /// The final goal cannot be verified before all actions have verified results.
     #[error("final verification requires every action to be Verified")]
     ActionsNotVerified,
@@ -663,6 +666,7 @@ impl ExecutionRun {
         {
             return Err(ExecutionRunError::StaleObservation);
         }
+        observation.validate()?;
         Ok(())
     }
 
@@ -971,7 +975,7 @@ mod tests {
         let document = crate::wire::tests::document_fixture();
         let action = ActionId::new(0);
         let instance = Uuid::now_v7();
-        for case in 0..7 {
+        for case in 0..10 {
             let mut run =
                 ExecutionRun::new(&document).unwrap_or_else(|error| panic!("create run: {error}"));
             run.begin_check(action)
@@ -993,7 +997,41 @@ mod tests {
                     }
                 }
                 5 => report.run_id = Uuid::now_v7(),
-                _ => report.observation.reference.probe_instance = Uuid::nil(),
+                6 => report.observation.reference.probe_instance = Uuid::nil(),
+                7 => {
+                    report.observation.snapshot.graph.insert_dependency(
+                        storage_core::model::Dependency {
+                            from: NodeId::new(),
+                            to: NodeId::new(),
+                            kind: storage_core::model::DependencyKind::Backs,
+                        },
+                    );
+                }
+                8 => {
+                    let (id, mut node) = report
+                        .observation
+                        .snapshot
+                        .graph
+                        .nodes()
+                        .next()
+                        .map(|(id, node)| (*id, node.clone()))
+                        .unwrap_or_else(|| panic!("fixture has an observed node"));
+                    node.size.observed_in = Some(ProbeEpoch::new(99));
+                    report
+                        .observation
+                        .snapshot
+                        .graph
+                        .replace_existing(id, node)
+                        .unwrap_or_else(|error| panic!("replace fixture node: {error}"));
+                }
+                _ => report.observation.snapshot.mounts.entries.push(
+                    storage_core::model::ObservedMount {
+                        source: storage_core::model::MountSource::Filesystem(NodeId::new()),
+                        target: "/dangling".into(),
+                        options: Vec::new(),
+                        context: storage_core::model::MountContext::Host,
+                    },
+                ),
             }
             assert!(run.record_admission(report).is_err());
             assert_eq!(

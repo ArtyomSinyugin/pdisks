@@ -7,6 +7,7 @@ pub mod editing;
 mod effects;
 mod execution;
 pub mod journal;
+pub mod live;
 mod observe;
 mod plan;
 mod prerequisites;
