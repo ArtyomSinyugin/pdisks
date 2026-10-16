@@ -423,6 +423,14 @@ backend или привязку к probe после resolution. Сохранён
 полноты provider/namespace coverage и авторизация остаются обязанностью host.
 Пока resolver не поддерживает `SetActivation` и остальные write-рецепты.
 
+Runtime сверяет число PV из same-pass VG measurement с MemberOf edges, требует
+present PV с уникальными UUID и физическим диском/namespace в backing ancestry.
+Частичная или противоречивая топология не становится положительным admission.
+Для физических disks/partitions/namespaces обязательны известный размер,
+неизменная BlockGeometry и свежий `read_only = false`; пути и devno могут меняться
+при сохранённой identity. Полнота прочих namespace/provider данных всё равно
+требует отдельного trusted coverage check.
+
 `LinuxLiveHost` собирает новый provider-pass под `ExecutionLease`, проверяет
 принадлежность guard/publication, отсутствие активного checkpoint и все frozen
 prerequisites. `BackendCapabilityCheck` отдельно устанавливает поддержку точной

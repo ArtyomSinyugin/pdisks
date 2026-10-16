@@ -168,6 +168,9 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                 .check_scope(&context, action, observed.observation());
             applicability = scope;
             if applicability == LiveCheckStatus::Satisfied {
+                applicability = observed.check_vg_membership(action.target().observed_id);
+            }
+            if applicability == LiveCheckStatus::Satisfied {
                 if checks
                     .iter()
                     .all(|check| check.status == LiveCheckStatus::Satisfied)

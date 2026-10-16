@@ -172,7 +172,7 @@ pub(crate) fn check_scope(
     current: &CurrentState,
     source: NodeId,
 ) -> Result<(), TargetError> {
-    // shortcut: require supported LVM/filesystem identities, extend correlation before native PV-backed writes.
+    // Unsupported virtual-device identities remain fail-closed until their native scope recipe exists.
     let mut selected = vec![source];
     loop {
         let before = selected.len();
@@ -206,6 +206,25 @@ pub(crate) fn check_scope(
             != current.graph.node(new).map(|node| &node.kind)
         {
             return Err(TargetError::ScopeChanged);
+        }
+    }
+    for (old, new) in &ids {
+        let original = baseline.graph.node(old).ok_or(TargetError::ScopeChanged)?;
+        if matches!(
+            original.kind.kind,
+            NodeKind::Disk | NodeKind::NvmeNamespace(_) | NodeKind::Partition { .. }
+        ) {
+            let current = current.graph.node(new).ok_or(TargetError::ScopeChanged)?;
+            let (Some(before), Some(after)) = (&original.size.block, &current.size.block) else {
+                return Err(TargetError::ScopeChanged);
+            };
+            if !original.kind.size.is_some_and(|size| size.as_u64() != 0)
+                || before.geometry.is_none()
+                || after.geometry != before.geometry
+                || after.read_only != Some(false)
+            {
+                return Err(TargetError::ScopeChanged);
+            }
         }
     }
     let dependencies: Vec<_> = baseline

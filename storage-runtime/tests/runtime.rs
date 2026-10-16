@@ -43,9 +43,10 @@ impl StateProvider for Recorded {
 
 /// Creates a frozen CreateLv plan from recorded VG measurements with a supported stable UUID.
 fn fixture() -> Result<(ProbeSnapshot, FrozenPlan), Box<dyn Error>> {
-    let state: ProbeSnapshot = serde_json::from_str(include_str!(
+    let mut state: ProbeSnapshot = serde_json::from_str(include_str!(
         "../../storage-engine/examples/fixtures/probe_snapshot.json"
     ))?;
+    add_physical_backing(&mut state)?;
     let baseline =
         HistoricalBaseline::from_lvm_observations(state.current.clone(), &state.lvm_vgs)?;
     let mut session = PlanSession::new(baseline)?;
@@ -56,6 +57,48 @@ fn fixture() -> Result<(ProbeSnapshot, FrozenPlan), Box<dyn Error>> {
         Bytes::new(16 * 1024 * 1024),
     )?;
     Ok((state, session.freeze(session.revision())?))
+}
+
+/// Supplies the PV and physical disk that the recorded VG count says must exist.
+fn add_physical_backing(state: &mut ProbeSnapshot) -> Result<(), Box<dyn Error>> {
+    use storage_core::model::{
+        BlockFacts, BlockGeometry, BlockSize, Dependency, DependencyKind, DeviceNumber, MemberRole,
+    };
+    let vg = state.lvm_vgs[0].node;
+    let mut disk = state.current.graph.node(&vg).ok_or("VG")?.clone();
+    disk.kind.kind = NodeKind::Disk;
+    disk.size.identities = vec![ExternalId::Wwn("runtime-test-disk".into())];
+    disk.size.block = Some(BlockFacts {
+        paths: vec!["/dev/fixture-disk".into()],
+        devno: DeviceNumber { major: 8, minor: 0 },
+        read_only: Some(false),
+        geometry: Some(BlockGeometry {
+            logical_block_size: BlockSize::new(512).ok_or("block size")?,
+            physical_block_size: BlockSize::new(4096),
+            alignment_offset: Some(Bytes::new(0)),
+            minimum_io_size: None,
+            optimal_io_size: None,
+        }),
+    });
+    let mut pv = disk.clone();
+    pv.kind.kind = NodeKind::LvmPv;
+    pv.size.identities = vec![ExternalId::LvmPvUuid("runtime-test-pv".into())];
+    pv.size.block = None;
+    let disk_id = NodeId::new();
+    let pv_id = NodeId::new();
+    state.current.graph.insert_new(disk_id, disk)?;
+    state.current.graph.insert_new(pv_id, pv)?;
+    state.current.graph.insert_dependency(Dependency {
+        from: disk_id,
+        to: pv_id,
+        kind: DependencyKind::Backs,
+    });
+    state.current.graph.insert_dependency(Dependency {
+        from: pv_id,
+        to: vg,
+        kind: DependencyKind::MemberOf(MemberRole::LvmPv),
+    });
+    Ok(())
 }
 
 /// Collects a real provider pass over explicitly synthetic state.
@@ -1216,4 +1259,117 @@ mod incidents {
         }
         Ok(())
     }
+}
+
+/// An empty or partial graph cannot contradict measured PV count and still claim complete membership.
+#[test]
+fn vg_membership_requires_same_pass_count_present_pvs_and_physical_ancestry()
+-> Result<(), Box<dyn Error>> {
+    use storage_core::model::{DependencyKind, MemberRole, Presence};
+    use storage_engine::LiveCheckStatus;
+    let (state, _) = fixture()?;
+    let vg = state.lvm_vgs[0].node;
+    let observed = ProbedObservation::collect(&probe(Rc::new(RefCell::new(state.clone()))))?;
+    assert_eq!(observed.check_vg_membership(vg), LiveCheckStatus::Satisfied);
+    for case in 0..7 {
+        let mut changed = state.clone();
+        let pv = *changed
+            .current
+            .graph
+            .nodes()
+            .find(|(_, node)| node.kind.kind == NodeKind::LvmPv)
+            .ok_or("PV")?
+            .0;
+        match case {
+            0 => changed.lvm_vgs[0].vg.pv_count += 1,
+            1 => changed.lvm_vgs[0].vg.pv_count = 0,
+            2 => {
+                let edge = changed
+                    .current
+                    .graph
+                    .dependencies()
+                    .find(|edge| {
+                        edge.to == vg && edge.kind == DependencyKind::MemberOf(MemberRole::LvmPv)
+                    })
+                    .cloned()
+                    .ok_or("membership")?;
+                changed.current.graph.remove_dependency(&edge);
+            }
+            3 | 4 => {
+                let mut node = changed.current.graph.node(&pv).ok_or("PV")?.clone();
+                if case == 3 {
+                    node.size.identities.push(node.size.identities[0].clone());
+                } else {
+                    node.size.presence = Presence::Missing;
+                }
+                changed.current.graph.replace_existing(pv, node)?;
+            }
+            5 => {
+                let edge = changed
+                    .current
+                    .graph
+                    .dependencies()
+                    .find(|edge| edge.to == pv)
+                    .cloned()
+                    .ok_or("backing")?;
+                changed.current.graph.remove_dependency(&edge);
+            }
+            _ => changed.lvm_vgs.clear(),
+        }
+        let observed = ProbedObservation::collect(&probe(Rc::new(RefCell::new(changed))))?;
+        assert!(
+            matches!(
+                observed.check_vg_membership(vg),
+                LiveCheckStatus::Unknown { .. }
+            ),
+            "case {case}"
+        );
+    }
+    Ok(())
+}
+
+/// Device paths/numbers can change, while geometry drift and unknown/read-only endpoints forbid resolution.
+#[test]
+fn physical_scope_checks_geometry_and_writable_evidence() -> Result<(), Box<dyn Error>> {
+    use storage_core::model::BlockSize;
+    let (state, frozen) = fixture()?;
+    let run = ExecutionRun::new(frozen.document())?;
+    for case in 0..7 {
+        let mut changed = state.clone();
+        let disk = *changed
+            .current
+            .graph
+            .nodes()
+            .find(|(_, node)| node.kind.kind == NodeKind::Disk)
+            .ok_or("disk")?
+            .0;
+        let mut node = changed.current.graph.node(&disk).ok_or("disk")?.clone();
+        let block = node.size.block.as_mut().ok_or("block")?;
+        match case {
+            0 => {
+                block.paths = vec!["/dev/renamed-fixture".into()];
+                block.devno.minor += 16;
+            }
+            1 => block.read_only = Some(true),
+            2 => block.read_only = None,
+            3 => block.geometry = None,
+            4 => {
+                block
+                    .geometry
+                    .as_mut()
+                    .ok_or("geometry")?
+                    .logical_block_size = BlockSize::new(4096).ok_or("size")?
+            }
+            5 => node.kind.size = None,
+            _ => node.size.identities = vec![ExternalId::Wwn("replacement-disk".into())],
+        }
+        changed.current.graph.replace_existing(disk, node)?;
+        let observed = ProbedObservation::collect(&probe(Rc::new(RefCell::new(changed))))?;
+        assert_eq!(
+            resolve_action(&run, ActionId::new(0), observed.observation(), backend()).is_ok(),
+            case == 0,
+            "case {case}"
+        );
+    }
+    Ok(())
 }
