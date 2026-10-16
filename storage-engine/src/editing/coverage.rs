@@ -3,7 +3,9 @@
 use serde::Serialize;
 
 use storage_core::model::{Diagnostic, FilesystemKind, LvmLvKind, OperationIntent};
-use storage_provider::{FilesystemAction, LvmAction, MountAction, PartitionAction, ProviderAction};
+use storage_provider::{
+    FilesystemAction, LuksAction, LvmAction, MountAction, PartitionAction, ProviderAction,
+};
 
 use super::{OperationId, PlanOperation, PlanRequest, lower::diagnostic};
 
@@ -52,6 +54,49 @@ pub(super) fn request_coverage(
                 && size == actual_size
                 && role == actual_role
                 && attributes == actual_attributes
+        }
+        (
+            PlanRequest::FormatLuks {
+                backing,
+                version,
+                credential,
+            },
+            [
+                ProviderAction::Luks(LuksAction::Format {
+                    target,
+                    planned_node_id,
+                    version: actual_version,
+                    credential: actual_credential,
+                }),
+            ],
+        ) => {
+            backing == target
+                && operation.created_node == Some(*planned_node_id)
+                && version == actual_version
+                && credential == actual_credential
+        }
+        (
+            PlanRequest::OpenLuks {
+                container,
+                mapping_name,
+                credential,
+                read_only,
+            },
+            [
+                ProviderAction::Luks(LuksAction::Open {
+                    container: actual_container,
+                    planned_node_id,
+                    mapping_name: actual_name,
+                    credential: actual_credential,
+                    read_only: actual_read_only,
+                }),
+            ],
+        ) => {
+            container == actual_container
+                && operation.created_node == Some(*planned_node_id)
+                && mapping_name == actual_name
+                && credential == actual_credential
+                && read_only == actual_read_only
         }
         (
             PlanRequest::CreateLv {
@@ -179,6 +224,76 @@ mod tests {
     use storage_core::model::{
         Bytes, FilesystemKind, LvmLvKind, MountContext, MountEntry, MountSource, NodeId,
     };
+
+    /// LUKS coverage independently checks identities, credentials, format version, and access mode.
+    #[test]
+    fn luks_recipes_cover_exact_parameters_without_extra_actions() {
+        let input = NodeId::new();
+        let credential = storage_provider::CredentialRef::from_uuid(input.as_uuid());
+        for request in [
+            PlanRequest::FormatLuks {
+                backing: input,
+                version: storage_core::model::LuksVersion::Luks2,
+                credential,
+            },
+            PlanRequest::OpenLuks {
+                container: input,
+                mapping_name: "crypt-data".to_owned(),
+                credential,
+                read_only: true,
+            },
+        ] {
+            let operation = PlanOperation::new(request);
+            let fragment = lower_operation(&operation, None)
+                .unwrap_or_else(|error| panic!("lower LUKS: {error:?}"));
+            assert_eq!(fragment.actions.len(), 1);
+            assert_eq!(lower_operation(&operation, None), Ok(fragment.clone()));
+            let action = &fragment.actions[0].operation;
+            assert!(request_coverage(&operation, &[action]).covered);
+            assert!(!request_coverage(&operation, &[]).covered);
+            assert!(!request_coverage(&operation, &[action, action]).covered);
+            for field in 0..5 {
+                let mut changed = action.clone();
+                match &mut changed {
+                    ProviderAction::Luks(LuksAction::Format {
+                        target,
+                        planned_node_id,
+                        version,
+                        credential,
+                    }) => match field {
+                        0 => *target = NodeId::new(),
+                        1 => *planned_node_id = NodeId::new(),
+                        2 => *version = storage_core::model::LuksVersion::Luks1,
+                        _ => {
+                            *credential =
+                                storage_provider::CredentialRef::from_uuid(NodeId::new().as_uuid())
+                        }
+                    },
+                    ProviderAction::Luks(LuksAction::Open {
+                        container,
+                        planned_node_id,
+                        mapping_name,
+                        credential,
+                        read_only,
+                    }) => match field {
+                        0 => *container = NodeId::new(),
+                        1 => *planned_node_id = NodeId::new(),
+                        2 => *mapping_name = "other".to_owned(),
+                        3 => {
+                            *credential =
+                                storage_provider::CredentialRef::from_uuid(NodeId::new().as_uuid())
+                        }
+                        _ => *read_only = false,
+                    },
+                    _ => panic!("unexpected LUKS recipe"),
+                }
+                assert!(
+                    !request_coverage(&operation, &[&changed]).covered,
+                    "field {field}"
+                );
+            }
+        }
+    }
 
     /// Exact partition coverage rejects changes to every parameter and to the reserved identity.
     #[test]

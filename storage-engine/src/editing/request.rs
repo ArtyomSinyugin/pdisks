@@ -4,9 +4,11 @@ use std::{num::NonZeroU32, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use storage_core::model::{
-    Bytes, FilesystemKind, LvmLvKind, MountContext, MountEntry, MountSource, NodeId,
+    Bytes, FilesystemKind, LuksVersion, LvmLvKind, MountContext, MountEntry, MountSource, NodeId,
     OperationIntent, PartitionAttributes, UsageRole,
 };
+
+use storage_provider::CredentialRef;
 
 /// User-level parameters retained for editing instead of mutating a frozen action DAG.
 /// Representable requests may still be unsupported or semantically invalid when lowered.
@@ -27,6 +29,26 @@ pub enum PlanRequest {
         role: Option<UsageRole>,
         /// Native attributes preserved without implicit defaults or reinterpretation.
         attributes: PartitionAttributes,
+    },
+    /// Prepares a LUKS header on a block node; execution requires destructive-scope approval.
+    FormatLuks {
+        /// Existing or planned block node whose content would be replaced.
+        backing: NodeId,
+        /// Requested on-disk header version.
+        version: LuksVersion,
+        /// Opaque external credential-store identity, never credential material.
+        credential: CredentialRef,
+    },
+    /// Opens a LUKS container as a separately identified dm-crypt mapping.
+    OpenLuks {
+        /// Existing or planned LUKS container.
+        container: NodeId,
+        /// Explicit device-mapper name.
+        mapping_name: String,
+        /// Opaque external credential-store identity, resolved only by the runtime.
+        credential: CredentialRef,
+        /// Whether the resulting mapping rejects writes.
+        read_only: bool,
     },
     /// Creates one logical volume, optionally followed by activation.
     CreateLv {
@@ -84,7 +106,11 @@ impl PlanRequest {
     pub(crate) fn creates_node(&self) -> bool {
         matches!(
             self,
-            Self::CreatePartition { .. } | Self::CreateLv { .. } | Self::CreateFilesystem { .. }
+            Self::CreatePartition { .. }
+                | Self::FormatLuks { .. }
+                | Self::OpenLuks { .. }
+                | Self::CreateLv { .. }
+                | Self::CreateFilesystem { .. }
         )
     }
 
@@ -93,7 +119,10 @@ impl PlanRequest {
         match self {
             Self::CreatePartition { table, .. } => vec![*table],
             Self::CreateLv { vg, .. } => vec![*vg],
-            Self::CreateFilesystem { backing, .. } => vec![*backing],
+            Self::CreateFilesystem { backing, .. } | Self::FormatLuks { backing, .. } => {
+                vec![*backing]
+            }
+            Self::OpenLuks { container, .. } => vec![*container],
             Self::SetFilesystemLabel { filesystem, .. } => vec![*filesystem],
             Self::Mount(entry) | Self::PersistMount(entry) => match &entry.source {
                 MountSource::Filesystem(node)
@@ -128,7 +157,10 @@ impl PlanRequest {
         match self {
             Self::CreatePartition { table, .. } => remap(table),
             Self::CreateLv { vg, .. } => remap(vg),
-            Self::CreateFilesystem { backing, .. } => remap(backing),
+            Self::CreateFilesystem { backing, .. } | Self::FormatLuks { backing, .. } => {
+                remap(backing)
+            }
+            Self::OpenLuks { container, .. } => remap(container),
             Self::SetFilesystemLabel { filesystem, .. } => remap(filesystem),
             Self::Mount(entry) | Self::PersistMount(entry) => match &mut entry.source {
                 MountSource::Filesystem(node)
@@ -173,6 +205,17 @@ mod remap_tests {
             context: MountContext::Host,
         };
         for mut request in [
+            PlanRequest::FormatLuks {
+                backing: source,
+                version: LuksVersion::Luks2,
+                credential: CredentialRef::from_uuid(source.as_uuid()),
+            },
+            PlanRequest::OpenLuks {
+                container: source,
+                mapping_name: "crypt-data".to_owned(),
+                credential: CredentialRef::from_uuid(source.as_uuid()),
+                read_only: true,
+            },
             PlanRequest::Mount(entry.clone()),
             PlanRequest::PersistMount(entry.clone()),
             PlanRequest::SetFilesystemLabel {
@@ -196,6 +239,11 @@ mod remap_tests {
                     .iter()
                     .all(|node| *node == target)
             );
+            if let PlanRequest::FormatLuks { credential, .. }
+            | PlanRequest::OpenLuks { credential, .. } = &request
+            {
+                assert_eq!(credential.as_uuid(), source.as_uuid());
+            }
             if let PlanRequest::Mount(actual) | PlanRequest::PersistMount(actual) = request {
                 assert_eq!(actual.target, entry.target);
                 assert_eq!(actual.options, entry.options);

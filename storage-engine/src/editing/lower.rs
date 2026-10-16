@@ -5,8 +5,8 @@ use storage_core::model::{
 };
 use storage_provider::{
     ActionPrerequisite, DependencyReason, ExternalRequirement, FilesystemAction, FragmentAction,
-    FragmentDependency, FragmentOrigin, LocalActionId, LvmAction, MountAction, PartitionAction,
-    PlanFragment, ProviderAction,
+    FragmentDependency, FragmentOrigin, LocalActionId, LuksAction, LvmAction, MountAction,
+    PartitionAction, PlanFragment, ProviderAction,
 };
 
 use super::{PlanOperation, PlanRequest};
@@ -62,6 +62,50 @@ pub fn lower_operation(
             FragmentOrigin::Change {
                 subject: node,
                 description: "create partition at exact byte extent".to_owned(),
+            }
+        }
+        PlanRequest::FormatLuks {
+            backing,
+            version,
+            credential,
+        } => {
+            let node = operation
+                .created_node
+                .ok_or_else(|| fail("draft.created_node", "missing LUKS container output ID"))?;
+            operations.push(ProviderAction::Luks(LuksAction::Format {
+                target: *backing,
+                planned_node_id: node,
+                version: *version,
+                credential: *credential,
+            }));
+            requirements.push(ExternalRequirement {
+                action: LocalActionId::new(0),
+                prerequisite: ActionPrerequisite::Writable(*backing),
+            });
+            FragmentOrigin::Change {
+                subject: node,
+                description: "format LUKS container".to_owned(),
+            }
+        }
+        PlanRequest::OpenLuks {
+            container,
+            mapping_name,
+            credential,
+            read_only,
+        } => {
+            let node = operation
+                .created_node
+                .ok_or_else(|| fail("draft.created_node", "missing dm-crypt mapping output ID"))?;
+            operations.push(ProviderAction::Luks(LuksAction::Open {
+                container: *container,
+                planned_node_id: node,
+                mapping_name: mapping_name.clone(),
+                credential: *credential,
+                read_only: *read_only,
+            }));
+            FragmentOrigin::Change {
+                subject: node,
+                description: "open LUKS mapping".to_owned(),
             }
         }
         PlanRequest::CreateLv {

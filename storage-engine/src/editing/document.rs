@@ -206,9 +206,9 @@ mod tests {
     }
 }
 
-/// Version of persisted editable requests; version 2 adds exact partition creation.
-/// Legacy version 1 remains readable with its original request catalogue.
-pub const DRAFT_SCHEMA_VERSION: u32 = 2;
+/// Version of persisted editable requests; version 3 adds LUKS format/open.
+/// Versions 1 and 2 remain readable with their original request catalogues.
+pub const DRAFT_SCHEMA_VERSION: u32 = 3;
 
 /// Maximum UTF-8 size accepted by the draft JSON boundary, including its historical snapshot.
 pub const MAX_DRAFT_JSON_BYTES: usize = 1024 * 1024;
@@ -274,8 +274,7 @@ impl DraftDocument {
         if let Some(version) = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
-            && version != 1
-            && version != u64::from(DRAFT_SCHEMA_VERSION)
+            && !(1..=u64::from(DRAFT_SCHEMA_VERSION)).contains(&version)
         {
             return Err(DraftDocumentError::SchemaVersion(version));
         }
@@ -299,21 +298,21 @@ impl DraftDocument {
 
     /// Checks public/deserialized data again before it can become a live editing session.
     pub(super) fn validate(&self) -> Result<(), DraftDocumentError> {
-        if self.schema_version != 1 && self.schema_version != DRAFT_SCHEMA_VERSION {
+        if !(1..=DRAFT_SCHEMA_VERSION).contains(&self.schema_version) {
             return Err(DraftDocumentError::SchemaVersion(u64::from(
                 self.schema_version,
             )));
         }
-        if self.schema_version == 1
-            && let Some(operation) = self.draft.operations.iter().find(|operation| {
-                matches!(
-                    operation.request,
-                    super::PlanRequest::CreatePartition { .. }
-                )
-            })
-        {
+        if let Some(operation) = self.draft.operations.iter().find(|operation| {
+            let required_version = match operation.request {
+                super::PlanRequest::FormatLuks { .. } | super::PlanRequest::OpenLuks { .. } => 3,
+                super::PlanRequest::CreatePartition { .. } => 2,
+                _ => 1,
+            };
+            self.schema_version < required_version
+        }) {
             return Err(DraftDocumentError::RequestVersion {
-                version: 1,
+                version: self.schema_version,
                 operation: operation.id,
             });
         }
@@ -416,6 +415,57 @@ mod draft_tests {
             DraftDocument::from_json(&value.to_string()),
             Err(DraftDocumentError::Json(_))
         ));
+    }
+
+    /// Older catalogues reject LUKS requests, while unknown secret fields are never accepted.
+    #[test]
+    fn luks_requests_require_schema_three_and_opaque_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut document = PlanSession::new(baseline())?.draft_document();
+        let backing = lv_request().referenced_nodes()[0];
+        let credential = storage_provider::CredentialRef::from_uuid(Uuid::now_v7());
+        for request in [
+            PlanRequest::FormatLuks {
+                backing,
+                version: storage_core::model::LuksVersion::Luks2,
+                credential,
+            },
+            PlanRequest::OpenLuks {
+                container: backing,
+                mapping_name: "crypt-data".to_owned(),
+                credential,
+                read_only: false,
+            },
+        ] {
+            document.draft.operations = vec![PlanOperation::new(request)];
+            for version in [1, 2] {
+                document.schema_version = version;
+                assert!(
+                    matches!(DraftDocument::from_json(&serde_json::to_string(&document)?), Err(DraftDocumentError::RequestVersion { version: actual, .. }) if actual == version)
+                );
+                assert!(document.to_json().is_err());
+                assert!(PlanSession::from_document(document.clone()).is_err());
+            }
+            document.schema_version = DRAFT_SCHEMA_VERSION;
+            let json = document.to_json()?;
+            assert_eq!(DraftDocument::from_json(&json)?, document);
+            let mut value: serde_json::Value = serde_json::from_str(&json)?;
+            let variant = if matches!(
+                document.draft.operations[0].request,
+                PlanRequest::FormatLuks { .. }
+            ) {
+                "format_luks"
+            } else {
+                "open_luks"
+            };
+            value["draft"]["operations"][0]["request"][variant]["passphrase"] =
+                serde_json::json!("never persist secrets");
+            assert!(matches!(
+                DraftDocument::from_json(&value.to_string()),
+                Err(DraftDocumentError::Json(_))
+            ));
+        }
+        Ok(())
     }
 
     /// Resuming recalculates forecasts, retains all IDs/revisions, and starts with empty history.
