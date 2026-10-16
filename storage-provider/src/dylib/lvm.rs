@@ -9,7 +9,10 @@ use std::{
 use libloading::{Library, Symbol};
 
 use super::load_symbol;
-use crate::{LvmEntry, LvmLvEntry, LvmPvEntry, LvmSegmentEntry, LvmVgEntry, NativeProbeError};
+use crate::{
+    LinearLvRequest, LvmEntry, LvmLvEntry, LvmPvEntry, LvmSegmentEntry, LvmVgEntry, LvmWriteError,
+    NativeProbeError,
+};
 
 const MAX_NATIVE_ENTRIES: usize = 65_536;
 
@@ -208,13 +211,71 @@ pub(super) fn probe(library: &Library) -> Result<LvmEntry, NativeProbeError> {
         return Err(call_failed("bd_lvm_init"));
     }
     let _session = Session { api: &api };
-    let pvs = read_pvs(&api)?;
-    let vgs = read_vgs(&api)?;
+    read_state(&api)
+}
+
+/// Copies every record while the caller keeps the plugin session and loaded API alive.
+fn read_state(api: &Api<'_>) -> Result<LvmEntry, NativeProbeError> {
+    let pvs = read_pvs(api)?;
+    let vgs = read_vgs(api)?;
     let mut lvs = Vec::new();
     for vg in &vgs {
-        lvs.extend(read_lvs(&api, &vg.name)?);
+        lvs.extend(read_lvs(api, &vg.name)?);
     }
     Ok(LvmEntry { pvs, vgs, lvs })
+}
+
+/// Mutates only after fresh native identity/capacity checks inside one serialized plugin session.
+pub(super) fn create_linear_lv(
+    library: &Library,
+    request: &LinearLvRequest,
+) -> Result<String, LvmWriteError> {
+    let _exclusive = LVM_SESSION
+        .lock()
+        .map_err(|_| call_failed("LVM plugin session lock"))?;
+    let api = Api::load(library)?;
+    let create = load_create(library)?;
+    // SAFETY: exact lvm.h ABI; all symbols remain borrowed from the retained library.
+    let available: Symbol<'_, TechAvailable> =
+        unsafe { load_symbol(library, b"bd_lvm_is_tech_avail\0") }?;
+    // SAFETY: standalone init takes no arguments and no other adapter session can run here.
+    if unsafe { (api.init)() } == 0 {
+        return Err(call_failed("bd_lvm_init").into());
+    }
+    let _session = Session { api: &api };
+    check_create_technology(&available, &api.g_error_free)?;
+    let before = read_state(&api)?;
+    request.check_target(&before)?;
+    invoke_create(&create, &api.g_error_free, request)?;
+    request.created_uuid(&before, &read_state(&api)?)
+}
+
+/// Supplies only terminated validated strings, linear layout, exact bytes, and no extra native options.
+fn invoke_create(
+    create: &Create,
+    free: &GErrorFree,
+    request: &LinearLvRequest,
+) -> Result<(), NativeProbeError> {
+    let vg = CString::new(request.vg_name.as_str()).map_err(|_| invalid("bd_lvm_lvcreate"))?;
+    let lv = CString::new(request.lv_name.as_str()).map_err(|_| invalid("bd_lvm_lvcreate"))?;
+    let mut error = ErrorGuard::new(free);
+    // SAFETY: lvm.h takes borrowed strings and optional NULL PV/extra arrays; GError starts null.
+    let result = unsafe {
+        create(
+            vg.as_ptr(),
+            lv.as_ptr(),
+            request.size,
+            c"linear".as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut error.pointer,
+        )
+    };
+    error.check("bd_lvm_lvcreate")?;
+    if result == 0 {
+        return Err(call_failed("bd_lvm_lvcreate"));
+    }
+    Ok(())
 }
 
 /// Copies the null-terminated PV array.
@@ -534,6 +595,38 @@ mod tests {
         let missing: TechAvailable = unavailable_technology;
         assert!(check_create_technology(&supported, &free).is_ok());
         assert!(check_create_technology(&missing, &free).is_err());
+    }
+
+    /// Records native call arguments without accessing any disks; bad flags return failure.
+    unsafe extern "C" fn mock_create(
+        vg: *const c_char,
+        lv: *const c_char,
+        size: u64,
+        layout: *const c_char,
+        pvs: *const *const c_char,
+        extra: *const *const c_void,
+        _error: *mut *mut GErrorRaw,
+    ) -> c_int {
+        // SAFETY: invoke_create supplies live terminated borrowed strings for this synchronous call.
+        let names_match = unsafe {
+            CStr::from_ptr(vg) == c"vg"
+                && CStr::from_ptr(lv) == c"data"
+                && CStr::from_ptr(layout) == c"linear"
+        };
+        i32::from(names_match && size == 4096 && pvs.is_null() && extra.is_null())
+    }
+
+    /// The FFI wrapper sends exact bytes, linear layout and no caller-controlled native options.
+    #[test]
+    fn create_uses_exact_typed_arguments_and_rejects_false()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let create: Create = mock_create;
+        let free: GErrorFree = free_error;
+        let request = LinearLvRequest::new("vg", "vg-uuid", "data", 4096)?;
+        invoke_create(&create, &free, &request)?;
+        let different = LinearLvRequest::new("vg", "vg-uuid", "data", 8192)?;
+        assert!(invoke_create(&create, &free, &different).is_err());
+        Ok(())
     }
 
     /// Number of simulated GError releases; only the error-guard test uses this counter.

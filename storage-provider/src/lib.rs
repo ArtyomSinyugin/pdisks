@@ -330,6 +330,25 @@ impl RegisteredBackend {
         }
     }
 
+    /// Creates a linear LV after native VG UUID, capacity and name checks, returning its observed UUID.
+    /// Caller must retain the host lease and durable checkpoint and establish scope/authorization.
+    /// External LVM writers must be excluded by the host; the native name-based API is not atomic
+    /// with the UUID check. Every error may require incident review; never retry automatically.
+    /// The returned UUID never replaces independent runtime postcondition verification.
+    pub fn create_linear_lv(&self, request: &LinearLvRequest) -> Result<String, LvmWriteError> {
+        if !self
+            .manifest
+            .capabilities
+            .contains(&BackendCapability::Execute)
+        {
+            return Err(LvmWriteError::ExecutionNotDeclared);
+        }
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.create_linear_lv(request),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
+        }
+    }
+
     /// Reads Btrfs subvolumes below mounted filesystem roots.
     pub fn probe_btrfs(
         &self,

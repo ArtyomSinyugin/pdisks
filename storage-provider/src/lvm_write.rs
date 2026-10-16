@@ -91,7 +91,71 @@ impl LinearLvRequest {
         {
             return Err(LvmWriteError::TargetChanged);
         }
+        let members: Vec<_> = state
+            .pvs
+            .iter()
+            .filter(|pv| {
+                pv.vg_name.as_deref() == Some(self.vg_name.as_str())
+                    || pv.vg_uuid.as_deref() == Some(self.vg_uuid.as_str())
+            })
+            .collect();
+        let mut uuids = std::collections::HashSet::new();
+        if vg.pv_count == 0
+            || members.len() as u64 != vg.pv_count
+            || members.iter().any(|pv| {
+                pv.vg_name.as_deref() != Some(self.vg_name.as_str())
+                    || pv.vg_uuid.as_deref() != Some(self.vg_uuid.as_str())
+                    || pv.missing
+                    || pv.uuid.is_empty()
+                    || !uuids.insert(&pv.uuid)
+                    || pv.size == 0
+                    || pv.free > pv.size
+            })
+        {
+            return Err(LvmWriteError::TargetChanged);
+        }
         Ok(())
+    }
+
+    /// Returns a newly observed unique linear LV UUID; any ambiguity after invocation is an incident.
+    pub(crate) fn created_uuid(
+        &self,
+        before: &LvmEntry,
+        after: &LvmEntry,
+    ) -> Result<String, LvmWriteError> {
+        let mut vgs = after
+            .vgs
+            .iter()
+            .filter(|vg| vg.name == self.vg_name || vg.uuid == self.vg_uuid);
+        let vg = vgs.next().ok_or(LvmWriteError::TargetChanged)?;
+        if vgs.next().is_some() || vg.name != self.vg_name || vg.uuid != self.vg_uuid || vg.exported
+        {
+            return Err(LvmWriteError::TargetChanged);
+        }
+        let mut matches = after
+            .lvs
+            .iter()
+            .filter(|lv| lv.vg_name == self.vg_name && lv.name == self.lv_name);
+        let lv = matches.next().ok_or(LvmWriteError::TargetChanged)?;
+        if matches.next().is_some()
+            || lv.size != self.size
+            || lv.segment_type.as_deref() != Some("linear")
+            || lv.uuid.is_empty()
+            || !lv
+                .uuid
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || after
+                .lvs
+                .iter()
+                .filter(|other| other.uuid == lv.uuid)
+                .count()
+                != 1
+            || before.lvs.iter().any(|other| other.uuid == lv.uuid)
+        {
+            return Err(LvmWriteError::TargetChanged);
+        }
+        Ok(lv.uuid.clone())
     }
 }
 
@@ -110,6 +174,63 @@ fn valid_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A receipt requires a new unique native UUID, exact size/layout, and the same owning VG.
+    #[test]
+    fn receipt_rejects_reused_or_ambiguous_native_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = LinearLvRequest::new("vg", "vg-uuid", "data", 4096)?;
+        let before = LvmEntry::default();
+        let after = LvmEntry {
+            pvs: vec![],
+            vgs: vec![crate::LvmVgEntry {
+                name: "vg".into(),
+                uuid: "vg-uuid".into(),
+                size: 16384,
+                extent_size: 4096,
+                free: 4096,
+                pv_count: 1,
+                exported: false,
+            }],
+            lvs: vec![crate::LvmLvEntry {
+                name: "data".into(),
+                vg_name: "vg".into(),
+                uuid: "new-uuid".into(),
+                size: 4096,
+                segment_type: Some("linear".into()),
+                attributes: None,
+                origin: None,
+                pool: None,
+                data: None,
+                metadata: None,
+                roles: None,
+                data_percent: 0,
+                metadata_percent: 0,
+                copy_percent: 0,
+                segments: vec![],
+            }],
+        };
+        assert_eq!(request.created_uuid(&before, &after)?, "new-uuid");
+        assert!(request.created_uuid(&after, &after).is_err());
+        for case in 0..8 {
+            let mut changed = after.clone();
+            match case {
+                0 => changed.lvs.clear(),
+                1 => changed.lvs.push(after.lvs[0].clone()),
+                2 => changed.lvs[0].size = 8192,
+                3 => changed.lvs[0].segment_type = Some("thin".into()),
+                4 => changed.lvs[0].uuid.clear(),
+                5 => changed.lvs[0].vg_name = "foreign".into(),
+                6 => changed.vgs[0].uuid = "replacement".into(),
+                _ => changed.lvs[0].uuid = "invalid uuid".into(),
+            }
+            assert!(
+                request.created_uuid(&before, &changed).is_err(),
+                "case {case}"
+            );
+        }
+        Ok(())
+    }
 
     /// Native names and exact extent sizing fail closed before calling any C function.
     #[test]
@@ -146,12 +267,21 @@ mod tests {
             exported: false,
         };
         let state = LvmEntry {
-            pvs: vec![],
+            pvs: vec![crate::LvmPvEntry {
+                device: "/dev/fixture".into(),
+                uuid: "pv-uuid".into(),
+                vg_name: Some("vg".into()),
+                vg_uuid: Some("vg-uuid".into()),
+                size: 16384,
+                free: 8192,
+                data_offset: 4096,
+                missing: false,
+            }],
             vgs: vec![vg.clone()],
             lvs: vec![],
         };
         assert!(request.check_target(&state).is_ok());
-        for case in 0..7 {
+        for case in 0..11 {
             let mut changed = state.clone();
             match case {
                 0 => changed.vgs.clear(),
@@ -160,7 +290,11 @@ mod tests {
                 3 => changed.vgs[0].exported = true,
                 4 => changed.vgs[0].extent_size = 8192,
                 5 => changed.vgs[0].free = 0,
-                _ => changed.vgs[0].extent_size = 0,
+                6 => changed.vgs[0].extent_size = 0,
+                7 => changed.pvs.clear(),
+                8 => changed.pvs[0].missing = true,
+                9 => changed.pvs[0].vg_uuid = Some("replacement".into()),
+                _ => changed.pvs.push(changed.pvs[0].clone()),
             }
             assert!(request.check_target(&changed).is_err(), "case {case}");
         }

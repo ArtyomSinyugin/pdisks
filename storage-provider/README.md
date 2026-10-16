@@ -349,6 +349,19 @@ manifest `execute` capability, all read/create symbols, successful plugin init,
 and libblockdev BASIC CREATE/QUERY support. It never supplies scope or approval
 evidence; ordinary probe-only manifests remain unable to execute.
 
+`RegisteredBackend::create_linear_lv()` is the explicit native mutation boundary.
+It repeats technology checks and reads PV/VG/LV state in one serialized plugin
+session before `bd_lvm_lvcreate`. Missing PVs, changed UUIDs, occupied names,
+insufficient capacity and extent rounding abort before the call. No extra args
+or caller-selected PV list are passed. A subsequent native query must establish
+a new unique LV UUID with the requested owner, size and linear layout.
+The runtime must retain its lease/checkpoint and independently probe/verify the
+result. External LVM writers must also be excluded: libblockdev's name-based
+create call cannot atomically bind the earlier UUID check. No automatic retry
+or fallback is provided, and normal probe manifests do not opt into writes.
+The disk-free ABI regression test builds a mock shared library with `cc` and
+checks pre-call rejection and post-call ambiguity without loading system LVM.
+
 One operation has one owning backend. A second library may enrich discovery,
 but it must not become an alternative executor for the same action.
 

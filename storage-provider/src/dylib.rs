@@ -153,6 +153,14 @@ impl LoadedLibrary {
         lvm::check_linear_lv_support(&self.handle)
     }
 
+    /// Calls the guarded narrow native write recipe; callers must already own admission/checkpoint.
+    pub(super) fn create_linear_lv(
+        &self,
+        request: &crate::LinearLvRequest,
+    ) -> Result<String, crate::LvmWriteError> {
+        lvm::create_linear_lv(&self.handle, request)
+    }
+
     /// Reads Btrfs subvolumes below mounted filesystem roots.
     pub(super) fn probe_btrfs(
         &self,
