@@ -1,5 +1,8 @@
 //! Synthetic runtime recipes exercise real locks and checkpoints, never native storage writes.
 
+#[path = "../../storage-provider/tests/support/lvm.rs"]
+mod mock_lvm;
+
 use std::{cell::RefCell, error::Error, rc::Rc};
 use storage_core::model::{Bytes, ExternalId, NodeId, NodeKind};
 use storage_engine::{
@@ -1372,4 +1375,74 @@ fn physical_scope_checks_geometry_and_writable_evidence() -> Result<(), Box<dyn 
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+mod native_lvm {
+    use super::*;
+    use storage_engine::{ActionRunState, LiveCheckStatus};
+    use storage_provider::{LvmAction, ProviderAction};
+    use storage_runtime::{
+        capability::{BackendCapabilityCheck, OperationAvailability},
+        checkpoint::CheckpointStore,
+        coordinator::ExecutionCoordinator,
+        dispatcher::BackendDispatcher,
+        host::LinuxLiveHost,
+        lease::ExecutionRoot,
+        native_lvm::NativeLvmAdapter,
+    };
+
+    /// Native symbol support alone cannot grant admission or create an active checkpoint.
+    #[test]
+    fn native_adapter_requires_independent_scope_and_rejects_unsupported_operations()
+    -> Result<(), Box<dyn Error>> {
+        let library = mock_lvm::Fixture::new(0)?;
+        let backend = library.registry.backends().next().ok_or("mock backend")?;
+        let adapter = NativeLvmAdapter::new(backend)?;
+        let (state, frozen) = fixture()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let shared = Rc::new(RefCell::new(state));
+        let observed = ProbedObservation::collect(&probe(shared.clone()))?;
+        let action = &run.context().plan.actions()[0].operation;
+        assert_eq!(
+            adapter.availability(action, observed.observation()),
+            OperationAvailability::Available(backend.manifest().id.clone())
+        );
+        assert!(matches!(
+            adapter.availability(
+                &ProviderAction::Lvm(LvmAction::SetActivation {
+                    target: shared.borrow().lvm_vgs[0].node,
+                    active: true,
+                }),
+                observed.observation()
+            ),
+            OperationAvailability::Unavailable(_)
+        ));
+        let resolved = resolve_action(
+            &run,
+            ActionId::new(0),
+            observed.observation(),
+            adapter.backend_id().clone(),
+        )?;
+        assert!(matches!(
+            adapter.check_scope(&run.context(), &resolved, observed.observation()),
+            LiveCheckStatus::Unknown { .. }
+        ));
+        let scratch = admission::Scratch::new()?;
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let authorization = admission::authorization(&run)?;
+        let approval_calls = authorization.calls.clone();
+        let host = LinuxLiveHost::new(probe(shared), adapter, authorization);
+        let mut coordinator =
+            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, adapter, &run);
+        assert_eq!(
+            coordinator.execute_action(&mut run, ActionId::new(0), None)?,
+            ActionRunState::Checking
+        );
+        assert_eq!(approval_calls.get(), 0);
+        assert_eq!(backend.probe_lvm()?.vgs[0].free, 8192);
+        let lock = root.try_lock_host()?;
+        assert!(CheckpointStore::new(&lock).inspect()?.is_none());
+        Ok(())
+    }
 }

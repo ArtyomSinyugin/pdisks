@@ -2,13 +2,13 @@
 
 use crate::checkpoint::TargetFingerprint;
 use std::collections::HashMap;
-use storage_core::model::{CurrentState, ExternalId, MountSource, NodeId, NodeKind};
+use storage_core::model::{CurrentState, ExternalId, LvmLvKind, MountSource, NodeId, NodeKind};
 use storage_engine::{
     ActionId, ExecutionRun, ExecutionRunError, LiveObservation, ObservationReference,
     editing::{CorrelationError, correlate_nodes},
     live::ObservationError,
 };
-use storage_provider::{BackendId, LvmAction, ProviderAction};
+use storage_provider::{BackendId, LinearLvRequest, LvmAction, LvmWriteError, ProviderAction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -27,6 +27,9 @@ pub enum TargetError {
     /// Native endpoint resolution currently supports only CreateLv in an existing VG.
     #[error("target resolution does not support this action")]
     UnsupportedAction,
+    /// The resolved native endpoint or parameters fail the narrow recipe's validation.
+    #[error(transparent)]
+    NativeRequest(#[from] LvmWriteError),
     /// A reviewed property, dependency, relation, or mount changed in the affected component.
     #[error("live storage scope differs from the reviewed plan")]
     ScopeChanged,
@@ -119,7 +122,14 @@ pub fn resolve_action(
         .iter()
         .find(|item| item.id == action)
         .ok_or(ExecutionRunError::UnknownAction(action))?;
-    let ProviderAction::Lvm(LvmAction::CreateLv { vg, name, .. }) = &planned.operation else {
+    let ProviderAction::Lvm(LvmAction::CreateLv {
+        vg,
+        name,
+        size,
+        layout: LvmLvKind::Linear,
+        ..
+    }) = &planned.operation
+    else {
         return Err(TargetError::UnsupportedAction);
     };
     let baseline = &context.historical_baseline.snapshot;
@@ -135,6 +145,8 @@ pub fn resolve_action(
     else {
         return Err(TargetError::UnsupportedAction);
     };
+    // Validate the exact UUID-qualified C endpoint before authorization and checkpoint publication.
+    LinearLvRequest::new(vg_name, uuid, name, size.as_u64())?;
     if observed
         .snapshot
         .graph

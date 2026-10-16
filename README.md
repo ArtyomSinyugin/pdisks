@@ -476,6 +476,13 @@ API libblockdev адресует VG по имени, поэтому внешни
 исключены host-политикой: UUID check и native create не атомарны.
 Тесты вызывают подставную C-библиотеку; реальные VG пока не проверены.
 
+`storage_runtime::native_lvm::NativeLvmAdapter` связывает этот зарегистрированный
+backend с `BackendCapabilityCheck` и `BackendDispatcher`. Он поддерживает только
+linear CreateLv; resolver проверяет точные native-параметры до arm. SetActivation
+и другие операции получают Unavailable. Полноту scope adapter по умолчанию
+оценивает как Unknown: host обязан отдельно доказать coverage, отсутствие
+внешних writers и авторизацию. Само создание adapter не разрешает запись.
+
 ## Аварийный checkpoint вместо истории выполнения
 
 Старый JSONL-журнал удалён. Импорт исторических `.jsonl`, восстановление run и

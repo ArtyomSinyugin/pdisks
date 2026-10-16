@@ -1,4 +1,4 @@
-//! Typed synchronous dispatch boundary; no native write implementation is registered yet.
+//! Typed synchronous dispatch boundary; concrete adapters require explicit host configuration.
 
 use crate::targets::ResolvedAction;
 use storage_engine::{BackendOutcome, ExecutionRunError};

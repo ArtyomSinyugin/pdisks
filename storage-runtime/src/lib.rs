@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Trusted host-side execution infrastructure; native storage writes remain disabled.
+//! Trusted host-side execution infrastructure; native writes require explicit policies and adapters.
 
 #[cfg(target_os = "linux")]
 pub mod lease;
@@ -21,6 +21,8 @@ pub mod coordinator;
 pub mod dispatcher;
 
 pub mod bindings;
+
+pub mod native_lvm;
 
 #[cfg(target_os = "linux")]
 pub mod incident;

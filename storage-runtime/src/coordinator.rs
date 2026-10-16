@@ -43,7 +43,7 @@ pub enum CoordinatorError {
 }
 
 /// Owns the only host-side sequence around a synchronous backend call.
-/// Native writes remain unavailable until capability, target, and result adapters are implemented.
+/// Native writes require explicit operation capability, scope, authorization, and result evidence.
 pub struct ExecutionCoordinator<H, D> {
     /// Shared configured execution root; different roots cannot coordinate with each other.
     root: ExecutionRoot,
