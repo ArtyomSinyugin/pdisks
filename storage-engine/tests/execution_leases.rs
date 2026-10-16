@@ -106,6 +106,7 @@ fn lease_rejects_untrusted_paths_and_nonchecking_actions() -> Result<(), Box<dyn
     assert!(ExecutionLease::try_acquire(&root.0, &run, action).is_err());
     assert_eq!(fs::read(&target)?, b"keep");
     fs::remove_file(&lock)?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
     fs::hard_link(&target, &lock)?;
     assert!(matches!(
         ExecutionLease::try_acquire(&root.0, &run, action),
@@ -114,6 +115,20 @@ fn lease_rejects_untrusted_paths_and_nonchecking_actions() -> Result<(), Box<dyn
     fs::remove_file(&lock)?;
     fs::create_dir(&lock)?;
     assert!(ExecutionLease::try_acquire(&root.0, &run, action).is_err());
+    fs::remove_dir(&lock)?;
+    fs::write(&lock, b"persistent lock inode")?;
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600))?;
+    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    drop(lease);
+    assert_eq!(fs::read(&lock)?, b"persistent lock inode");
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644))?;
+    assert!(matches!(
+        ExecutionLease::try_acquire(&root.0, &run, action),
+        Err(LeaseError::InvalidLockFile)
+    ));
+    let alias = root.0.join("alias");
+    symlink(&root.0, &alias)?;
+    assert!(ExecutionLease::try_acquire(&alias, &run, action).is_err());
     Ok(())
 }
 
@@ -293,5 +308,59 @@ fn lease_remains_held_through_journal_and_result_verification() -> Result<(), Bo
     drop(lease);
     let next = ExecutionLease::try_acquire(&root.0, &other, action)?;
     drop(next);
+    Ok(())
+}
+
+/// Child entry point selected only by the parent test below; uses a test-owned temporary root.
+#[test]
+#[ignore = "subprocess helper invoked by lease_excludes_other_processes_and_survives_process_exit"]
+fn lease_subprocess_child() -> Result<(), Box<dyn Error>> {
+    let root = std::env::var_os("PDISKS_LEASE_TEST_ROOT").ok_or("missing subprocess root")?;
+    let mode = std::env::var("PDISKS_LEASE_TEST_MODE")?;
+    let (_, run) = fixture()?;
+    let guard = ExecutionLease::try_acquire(PathBuf::from(root), &run, ActionId::new(0));
+    match mode.as_str() {
+        "busy" => assert!(matches!(guard, Err(LeaseError::Busy))),
+        "exit_holding" => {
+            let _guard = guard?;
+            // Bypass Rust destructors: the kernel, rather than RAII cleanup, releases this lock.
+            std::process::exit(0);
+        }
+        _ => return Err("unknown subprocess mode".into()),
+    }
+    Ok(())
+}
+
+/// Actual child processes see contention and release the kernel lock even without Rust cleanup.
+#[test]
+fn lease_excludes_other_processes_and_survives_process_exit() -> Result<(), Box<dyn Error>> {
+    let root = Scratch::new()?;
+    let (_, run) = fixture()?;
+    let action = ActionId::new(0);
+    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let spawn = |mode: &str| -> Result<(), Box<dyn Error>> {
+        let result = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "lease_subprocess_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PDISKS_LEASE_TEST_ROOT", &root.0)
+            .env("PDISKS_LEASE_TEST_MODE", mode)
+            .output()?;
+        assert!(
+            result.status.success(),
+            "child {mode}: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Ok(())
+    };
+    spawn("busy")?;
+    drop(lease);
+    spawn("exit_holding")?;
+    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    drop(lease);
     Ok(())
 }
