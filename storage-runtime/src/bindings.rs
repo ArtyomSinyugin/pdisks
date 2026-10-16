@@ -2,7 +2,10 @@
 
 use crate::targets::{ResolvedAction, TargetError, check_scope};
 use std::collections::HashMap;
-use storage_core::model::{DependencyKind, ExternalId, NodeId, NodeKind, NodeSpec, Presence};
+use storage_core::model::{
+    CurrentState, Dependency, DependencyKind, ExternalId, Node, NodeFacts, NodeId, NodeKind,
+    NodeSpec, Presence,
+};
 use storage_engine::{
     ActionId, ActionRunState, ExecutionRun, ExecutionRunError, LiveObservation,
     ObservationReference, VerificationReport,
@@ -22,6 +25,9 @@ pub enum BindingError {
     /// Receipt UUID is absent, ambiguous, preexisting, or points outside the admitted VG.
     #[error("created LV identity or ownership is not established by fresh evidence")]
     Identity,
+    /// Activation did not establish the contract's actual writable block interface.
+    #[error("activation requires a freshly observed writable block interface with known geometry")]
+    InterfaceUnknown,
     /// An actual result changed the reviewed scope beyond the new LV.
     #[error(transparent)]
     Scope(#[from] TargetError),
@@ -106,6 +112,72 @@ impl OutputBindings {
         Ok(id)
     }
 
+    /// Revalidates every verified UUID against this publication before passing correlations to engine.
+    pub(crate) fn correlations(
+        &self,
+        run: &ExecutionRun,
+        observed: &LiveObservation,
+    ) -> Result<Vec<NodeCorrelation>, BindingError> {
+        if self.run_id != run.run_id() {
+            return Err(BindingError::NotVerified);
+        }
+        self.entries
+            .iter()
+            .map(|(planned, binding)| {
+                Ok(NodeCorrelation {
+                    source: *planned,
+                    target: self.resolve(run, *planned, observed)?,
+                    identity: ExternalId::LvmLvUuid(binding.uuid.clone()),
+                })
+            })
+            .collect()
+    }
+
+    /// Extends reviewed scope only with independently verified outputs, never with arbitrary live nodes.
+    /// Actual topology is compared against these expectations separately; copying live topology would hide drift.
+    pub(crate) fn reviewed_scope(
+        &self,
+        run: &ExecutionRun,
+        observed: &LiveObservation,
+    ) -> Result<CurrentState, BindingError> {
+        self.correlations(run, observed)?;
+        let mut expected = run.context().historical_baseline.snapshot.clone();
+        for (planned, binding) in &self.entries {
+            let mut parents = expected.graph.nodes().filter(|(_, node)| {
+                matches!(node.kind.kind, NodeKind::LvmVg { .. })
+                    && node
+                        .size
+                        .identities
+                        .contains(&ExternalId::LvmVgUuid(binding.vg_uuid.clone()))
+            });
+            let parent = *parents.next().ok_or(BindingError::Identity)?.0;
+            if parents.next().is_some() {
+                return Err(BindingError::Identity);
+            }
+            drop(parents);
+            expected
+                .graph
+                .insert_new(
+                    *planned,
+                    Node {
+                        kind: binding.spec.clone(),
+                        size: NodeFacts {
+                            presence: Presence::Present,
+                            identities: vec![ExternalId::LvmLvUuid(binding.uuid.clone())],
+                            ..NodeFacts::default()
+                        },
+                    },
+                )
+                .map_err(|_| BindingError::Identity)?;
+            expected.graph.insert_dependency(Dependency {
+                from: parent,
+                to: *planned,
+                kind: DependencyKind::Provides,
+            });
+        }
+        Ok(expected)
+    }
+
     /// Publishes only a candidate bound to the exact completion just accepted as Verified.
     pub(crate) fn record_verified(
         &mut self,
@@ -138,6 +210,7 @@ pub(crate) fn verify_created_lv(
     run: &ExecutionRun,
     action: ActionId,
     resolved: &ResolvedAction,
+    bindings: &OutputBindings,
     before: &LiveObservation,
     created_uuid: Option<&str>,
 ) -> Result<(VerificationReport, Option<PendingLvBinding>), BindingError> {
@@ -193,7 +266,7 @@ pub(crate) fn verify_created_lv(
         }
         remaining.graph.remove_node(&observed_id);
         check_scope(
-            &context.historical_baseline.snapshot,
+            &bindings.reviewed_scope(run, before)?,
             &remaining,
             resolved.target().planned_id,
         )?;
@@ -227,6 +300,56 @@ pub(crate) fn verify_created_lv(
         },
         pending,
     ))
+}
+
+/// Verifies activation and the promised writable interface without accepting a created-UUID receipt.
+pub(crate) fn verify_activation(
+    run: &ExecutionRun,
+    action: ActionId,
+    resolved: &ResolvedAction,
+    bindings: &OutputBindings,
+    before: &LiveObservation,
+    created_uuid: Option<&str>,
+) -> Result<VerificationReport, BindingError> {
+    if created_uuid.is_some() {
+        return Err(BindingError::Identity);
+    }
+    let completion = run.completion(action)?.ok_or(BindingError::NotVerified)?;
+    let actual = &completion.observation;
+    check_scope(
+        &bindings.reviewed_scope(run, before)?,
+        &actual.snapshot,
+        resolved.target().planned_id,
+    )?;
+    let correlations = bindings.correlations(run, actual)?;
+    let lv = resolved.lv_target().ok_or(BindingError::Identity)?;
+    let id = bindings.resolve(run, lv.planned_id, actual)?;
+    let node = actual
+        .snapshot
+        .graph
+        .node(&id)
+        .ok_or(BindingError::Identity)?;
+    // Activation's contract publishes a read-write block interface; an active flag alone is insufficient.
+    if !node.size.block.as_ref().is_some_and(|block| {
+        block.read_only == Some(false) && block.geometry.is_some() && !block.paths.is_empty()
+    }) {
+        return Err(BindingError::InterfaceUnknown);
+    }
+    let context = run.context();
+    let report = check_observed_postconditions_with_bindings(
+        context.historical_baseline,
+        actual,
+        &context.plan.actions()[action.get() as usize]
+            .informational_contract
+            .postconditions,
+        &correlations,
+    )?;
+    Ok(VerificationReport {
+        run_id: run.run_id(),
+        action,
+        observation: report.observation,
+        checks: report.checks,
+    })
 }
 
 /// Requires one present LV, one UUID, and one Provides edge from the unique admitted VG UUID.

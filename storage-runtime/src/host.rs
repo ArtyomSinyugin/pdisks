@@ -2,11 +2,12 @@
 
 use crate::{
     authorization::{ApprovalRequest, AuthorizationContext},
+    bindings::{BindingError, OutputBindings},
     capability::{BackendCapabilityCheck, OperationAvailability},
     checkpoint::{CheckpointError, CheckpointStore, plan_digest},
     lease::ExecutionLease,
     probe::{ProbeObservationError, ProbedObservation},
-    targets::{ResolvedAction, resolve_action},
+    targets::{ResolvedAction, resolve_action_with_bindings},
 };
 use storage_engine::{
     ActionId, ActionRunState, AdmissionReport, ExecutionRun, ExecutionRunError, LiveCheckStatus,
@@ -18,6 +19,9 @@ use thiserror::Error;
 /// Failures leave admission without permission to dispatch.
 #[derive(Debug, Error)]
 pub enum HostError {
+    /// A previously verified output can no longer be identified safely.
+    #[error(transparent)]
+    Binding(#[from] BindingError),
     /// The OS lease belongs to another action or attempt.
     #[error("execution lease does not match this run and action")]
     LeaseMismatch,
@@ -60,6 +64,7 @@ pub trait RuntimeHost {
         run: &ExecutionRun,
         action: ActionId,
         observed: &ProbedObservation,
+        bindings: &OutputBindings,
         lease: &ExecutionLease,
     ) -> Result<AdmissionDecision, HostError>;
 }
@@ -104,6 +109,7 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
         run: &ExecutionRun,
         action: ActionId,
         observed: &ProbedObservation,
+        bindings: &OutputBindings,
         lease: &ExecutionLease,
     ) -> Result<AdmissionDecision, HostError> {
         if lease.run_id() != run.run_id() || lease.action() != action {
@@ -130,10 +136,12 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
         }
         let context = run.context();
         let planned = &context.plan.actions()[action.get() as usize];
+        let correlations = bindings.correlations(run, observed.observation())?;
         let checks = observed
-            .check_prerequisites(
+            .check_prerequisites_with_bindings(
                 context.historical_baseline,
                 &planned.informational_contract.prerequisites,
+                &correlations,
             )
             .map_err(ProbeObservationError::from)?
             .checks;
@@ -151,7 +159,13 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                 (LiveCheckStatus::Violated { reason }, None)
             }
             OperationAvailability::Available(backend) => {
-                match resolve_action(run, action, observed.observation(), backend) {
+                match resolve_action_with_bindings(
+                    run,
+                    action,
+                    observed.observation(),
+                    backend,
+                    bindings,
+                ) {
                     Ok(resolved) => (LiveCheckStatus::Satisfied, Some(resolved)),
                     Err(error) => (
                         LiveCheckStatus::Violated {

@@ -422,7 +422,9 @@ Backs от однозначно найденного физического ди
 backend или привязку к probe после resolution. Сохранённое имя VG — endpoint
 рядом с проверенным UUID; оно само по себе не разрешает dispatch. Проверка
 полноты provider/namespace coverage и авторизация остаются обязанностью host.
-Пока resolver не поддерживает `SetActivation` и остальные write-рецепты.
+Resolver поддерживает linear `CreateLv` и `SetActivation(active=true)` только
+для LV, созданного и подтверждённого в этом run. Deactivation, существующие LV
+без output binding и остальные write-рецепты пока отклоняются.
 
 Runtime сверяет число PV из same-pass VG measurement с MemberOf edges, требует
 present PV с уникальными UUID и физическим диском/namespace в backing ancestry.
@@ -463,7 +465,7 @@ checkpoint. Последующие обращения к binding повторн�
 
 Coordinator привязан к одному `ExecutionRun`. Успешный синтетический `CreateLv`
 проверен до `Verified` и удаления checkpoint, но `run.is_verified()` остаётся false:
-SetActivation, исполнение всего DAG и отдельная финальная goal/preservation
+Native SetActivation, исполнение всего DAG и отдельная финальная goal/preservation
 verification ещё не подключены. Корреляция PV/физических устройств расширена, но production admission и native
 write всё ещё требуют проверки полной физической области; неизвестный scope
 отклоняется.
@@ -478,8 +480,8 @@ API libblockdev адресует VG по имени, поэтому внешни
 
 `storage_runtime::native_lvm::NativeLvmAdapter` связывает этот зарегистрированный
 backend с `BackendCapabilityCheck` и `BackendDispatcher`. Он поддерживает только
-linear CreateLv; resolver проверяет точные native-параметры до arm. SetActivation
-и другие операции получают Unavailable. Полноту scope adapter по умолчанию
+linear CreateLv; resolver проверяет точные native-параметры до arm. Native SetActivation
+и другие операции пока получают Unavailable. Полноту scope adapter по умолчанию
 оценивает как Unknown: host обязан отдельно доказать coverage, отсутствие
 внешних writers и авторизацию. Само создание adapter не разрешает запись.
 Disk-free интеграционный тест проходит через настоящий FFI adapter и отдельные
@@ -487,6 +489,14 @@ native queries в fresh probe: проверяет наличие checkpoint и �
 вызова, Verified/binding/clear при успехе и сохранение checkpoint с запретом
 retry при ошибке вызова, чтения или результата. Это проверка ABI и runtime
 порядка на mock-библиотеке, а не готовности host-политик или реального LVM.
+
+Runtime admission передаёт подтверждённые `OutputBindings` в pure prerequisite
+checks и заново сопоставляет UUID каждого output при каждом probe. Ожидаемая
+область расширяется только проверенными LV и их Provides edge, не копируется
+из текущей топологии. Синтетическая цепочка CreateLv → SetActivation проходит
+до двух Verified; успех активации дополнительно требует наблюдаемого writable
+block interface с известной геометрией. Unknown activation или read-only endpoint
+оставляют checkpoint, а UUID replacement отклоняется до dispatch.
 
 ## Аварийный checkpoint вместо истории выполнения
 

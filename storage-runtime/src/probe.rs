@@ -159,4 +159,20 @@ impl ProbedObservation {
             prerequisites,
         )
     }
+
+    /// Checks the same facts with UUID correlations validated by this run's output bindings.
+    pub(crate) fn check_prerequisites_with_bindings(
+        &self,
+        baseline: &HistoricalBaseline,
+        prerequisites: &[ActionPrerequisite],
+        bindings: &[storage_engine::editing::NodeCorrelation],
+    ) -> Result<ObservedPrerequisites, ObservationError> {
+        storage_engine::live::check_observed_prerequisites_with_bindings(
+            baseline,
+            &self.observation,
+            &self.capacity,
+            prerequisites,
+            bindings,
+        )
+    }
 }

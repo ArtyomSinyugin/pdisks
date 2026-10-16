@@ -1,6 +1,6 @@
 //! Resolve the first LVM recipe by stable identity before selecting any native endpoint.
 
-use crate::checkpoint::TargetFingerprint;
+use crate::{bindings::OutputBindings, checkpoint::TargetFingerprint};
 use std::collections::HashMap;
 use storage_core::model::{CurrentState, ExternalId, LvmLvKind, MountSource, NodeId, NodeKind};
 use storage_engine::{
@@ -27,6 +27,9 @@ pub enum TargetError {
     /// Native endpoint resolution currently supports only linear CreateLv in an existing VG.
     #[error("target resolution does not support this action")]
     UnsupportedAction,
+    /// A planned LV has no verified identity in this attempt, or that identity changed.
+    #[error("activation target is not an unchanged verified output of this run")]
+    UnverifiedOutput,
     /// The resolved native endpoint or parameters fail the narrow recipe's validation.
     #[error(transparent)]
     NativeRequest(#[from] LvmWriteError),
@@ -54,6 +57,19 @@ pub struct ResolvedTarget {
     pub vg_name: String,
 }
 
+/// UUID-qualified LV endpoint from a verified output and this exact provider publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLvTarget {
+    /// Output node reserved by the frozen plan.
+    pub planned_id: NodeId,
+    /// Freshly correlated transient node identity.
+    pub observed_id: NodeId,
+    /// Immutable LV UUID, never inferred from its name or block path.
+    pub lv_uuid: String,
+    /// Native LV name observed alongside the UUID and owning VG.
+    pub lv_name: String,
+}
+
 /// An operation bound to one run, action, probe publication, and concrete backend.
 /// Fields are private so consumers cannot replace the operation after admission.
 #[derive(Debug)]
@@ -70,6 +86,8 @@ pub struct ResolvedAction {
     observation: ObservationReference,
     /// The sole existing metadata target in the initial recipe.
     target: ResolvedTarget,
+    /// Present only for activation of a verified created LV.
+    lv_target: Option<ResolvedLvTarget>,
 }
 
 impl ResolvedAction {
@@ -97,12 +115,23 @@ impl ResolvedAction {
     pub fn target(&self) -> &ResolvedTarget {
         &self.target
     }
+    /// Returns the verified UUID-qualified LV endpoint for activation, if this recipe uses one.
+    pub fn lv_target(&self) -> Option<&ResolvedLvTarget> {
+        self.lv_target.as_ref()
+    }
     /// Produces the minimal non-secret pre-dispatch fingerprint for the checkpoint.
     pub fn fingerprints(&self) -> Vec<TargetFingerprint> {
-        vec![TargetFingerprint {
+        let mut targets = vec![TargetFingerprint {
             planned_id: self.target.planned_id,
             external_ids: vec![ExternalId::LvmVgUuid(self.target.vg_uuid.clone())],
-        }]
+        }];
+        if let Some(lv) = &self.lv_target {
+            targets.push(TargetFingerprint {
+                planned_id: lv.planned_id,
+                external_ids: vec![ExternalId::LvmLvUuid(lv.lv_uuid.clone())],
+            });
+        }
+        targets
     }
 }
 
@@ -114,6 +143,18 @@ pub fn resolve_action(
     observed: &LiveObservation,
     backend: BackendId,
 ) -> Result<ResolvedAction, TargetError> {
+    resolve_action_with_bindings(run, action, observed, backend, &OutputBindings::new(run))
+}
+
+/// Resolves linear creation or activation of verified outputs and checks the entire accumulated scope.
+/// An output binding never adopts arbitrary live consumers or changes to existing reviewed devices.
+pub fn resolve_action_with_bindings(
+    run: &ExecutionRun,
+    action: ActionId,
+    observed: &LiveObservation,
+    backend: BackendId,
+    bindings: &OutputBindings,
+) -> Result<ResolvedAction, TargetError> {
     observed.validate()?;
     let context = run.context();
     let planned = context
@@ -122,18 +163,63 @@ pub fn resolve_action(
         .iter()
         .find(|item| item.id == action)
         .ok_or(ExecutionRunError::UnknownAction(action))?;
-    let ProviderAction::Lvm(LvmAction::CreateLv {
-        vg,
-        name,
-        size,
-        layout: LvmLvKind::Linear,
-        ..
-    }) = &planned.operation
-    else {
-        return Err(TargetError::UnsupportedAction);
+    let baseline = bindings
+        .reviewed_scope(run, observed)
+        .map_err(|_| TargetError::UnverifiedOutput)?;
+    let (vg, lv_target) = match &planned.operation {
+        ProviderAction::Lvm(LvmAction::CreateLv {
+            vg,
+            layout: LvmLvKind::Linear,
+            ..
+        }) => (*vg, None),
+        ProviderAction::Lvm(LvmAction::SetActivation {
+            target,
+            active: true,
+        }) => {
+            let id = bindings
+                .resolve(run, *target, observed)
+                .map_err(|_| TargetError::UnverifiedOutput)?;
+            let node = observed
+                .snapshot
+                .graph
+                .node(&id)
+                .ok_or(TargetError::UnverifiedOutput)?;
+            let NodeKind::LvmLv(lv) = &node.kind.kind else {
+                return Err(TargetError::UnsupportedAction);
+            };
+            if lv.kind != LvmLvKind::Linear {
+                return Err(TargetError::UnsupportedAction);
+            }
+            let mut parents = baseline
+                .graph
+                .dependencies()
+                .filter(|edge| edge.to == *target);
+            let parent = parents.next().ok_or(TargetError::UnverifiedOutput)?;
+            if parents.next().is_some() {
+                return Err(TargetError::UnverifiedOutput);
+            }
+            let uuid = node
+                .size
+                .identities
+                .iter()
+                .find_map(|identity| match identity {
+                    ExternalId::LvmLvUuid(uuid) => Some(uuid.clone()),
+                    _ => None,
+                })
+                .ok_or(TargetError::UnverifiedOutput)?;
+            (
+                parent.from,
+                Some(ResolvedLvTarget {
+                    planned_id: *target,
+                    observed_id: id,
+                    lv_uuid: uuid,
+                    lv_name: lv.name.clone(),
+                }),
+            )
+        }
+        _ => return Err(TargetError::UnsupportedAction),
     };
-    let baseline = &context.historical_baseline.snapshot;
-    let mapping = correlate_nodes(baseline, &observed.snapshot, &[*vg])?;
+    let mapping = correlate_nodes(&baseline, &observed.snapshot, &[vg])?;
     let target = &mapping[0];
     let node = observed
         .snapshot
@@ -145,23 +231,25 @@ pub fn resolve_action(
     else {
         return Err(TargetError::UnsupportedAction);
     };
-    // Validate the exact UUID-qualified C endpoint before authorization and checkpoint publication.
-    LinearLvRequest::new(vg_name, uuid, name, size.as_u64())?;
-    if observed
-        .snapshot
-        .graph
-        .dependencies()
-        .filter(|edge| edge.from == target.target)
-        .any(|edge| {
-            observed.snapshot.graph.node(&edge.to).is_some_and(|node| {
-                matches!(&node.kind.kind,
+    if let ProviderAction::Lvm(LvmAction::CreateLv { name, size, .. }) = &planned.operation {
+        // Validate the exact UUID-qualified C endpoint before authorization and checkpoint publication.
+        LinearLvRequest::new(vg_name, uuid, name, size.as_u64())?;
+        if observed
+            .snapshot
+            .graph
+            .dependencies()
+            .filter(|edge| edge.from == target.target)
+            .any(|edge| {
+                observed.snapshot.graph.node(&edge.to).is_some_and(|node| {
+                    matches!(&node.kind.kind,
             NodeKind::LvmLv(lv) if lv.name == *name)
+                })
             })
-        })
-    {
-        return Err(TargetError::NameConflict);
+        {
+            return Err(TargetError::NameConflict);
+        }
     }
-    check_scope(baseline, &observed.snapshot, *vg)?;
+    check_scope(&baseline, &observed.snapshot, vg)?;
     Ok(ResolvedAction {
         run_id: run.run_id(),
         action_id: action,
@@ -169,11 +257,12 @@ pub fn resolve_action(
         backend,
         observation: observed.reference,
         target: ResolvedTarget {
-            planned_id: *vg,
+            planned_id: vg,
             observed_id: target.target,
             vg_uuid: uuid.clone(),
             vg_name: vg_name.clone(),
         },
+        lv_target,
     })
 }
 

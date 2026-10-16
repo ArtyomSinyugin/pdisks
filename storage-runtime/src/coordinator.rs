@@ -1,7 +1,7 @@
 //! Single synchronous admission/checkpoint/dispatch/completion path for the first LVM action.
 
 use crate::{
-    bindings::{BindingError, OutputBindings, verify_created_lv},
+    bindings::{BindingError, OutputBindings, verify_activation, verify_created_lv},
     checkpoint::{ActiveAttempt, CheckpointError, CheckpointStore},
     dispatcher::{BackendDispatcher, ExecutionReceipt},
     host::{HostError, RuntimeHost},
@@ -103,7 +103,9 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             return Err(HostError::ActiveAttempt.into());
         }
         let observed = self.host.probe()?;
-        let decision = self.host.check_admission(run, action, &observed, &lease)?;
+        let decision = self
+            .host
+            .check_admission(run, action, &observed, &self.bindings, &lease)?;
         if let Some(resolved) = &decision.resolved
             && (resolved.run_id() != run.run_id()
                 || resolved.action_id() != action
@@ -167,13 +169,27 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         }
         let mut pending = None;
         if run.state(action)? == ActionRunState::Verifying {
-            let (report, candidate) = match verify_created_lv(
-                run,
-                action,
-                &resolved,
-                observed.observation(),
-                receipt.created_lv_uuid.as_deref(),
-            ) {
+            let verification = if resolved.lv_target().is_some() {
+                verify_activation(
+                    run,
+                    action,
+                    &resolved,
+                    &self.bindings,
+                    observed.observation(),
+                    receipt.created_lv_uuid.as_deref(),
+                )
+                .map(|report| (report, None))
+            } else {
+                verify_created_lv(
+                    run,
+                    action,
+                    &resolved,
+                    &self.bindings,
+                    observed.observation(),
+                    receipt.created_lv_uuid.as_deref(),
+                )
+            };
+            let (report, candidate) = match verification {
                 Ok(result) => result,
                 Err(error) => {
                     run.mark_outcome_unknown(action, error.to_string())?;

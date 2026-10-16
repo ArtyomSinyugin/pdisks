@@ -275,7 +275,12 @@ mod admission {
             if request.plan_digest != self.digest
                 || request.run_id != self.run_id
                 || request.backend != backend()
-                || request.targets.len() != 1
+                || (request.targets.len() != 1
+                    && !(request.targets.len() == 2
+                        && matches!(
+                            request.targets[1].external_ids.as_slice(),
+                            [ExternalId::LvmLvUuid(_)]
+                        )))
                 || request.observation.probe_instance.is_nil()
                 || request.targets[0].external_ids
                     != vec![ExternalId::LvmVgUuid("example-vg-uuid".into())]
@@ -341,7 +346,13 @@ mod admission {
             }
             let mut host = LinuxLiveHost::new(probe(state), capability, authorization);
             let observed = host.probe()?;
-            let decision = host.check_admission(&run, action, &observed, &lease)?;
+            let decision = host.check_admission(
+                &run,
+                action,
+                &observed,
+                &storage_runtime::bindings::OutputBindings::new(&run),
+                &lease,
+            )?;
             assert_eq!(decision.resolved.is_some(), case == 0);
             assert_eq!(run.record_admission(decision.report)?, case == 0);
             assert_eq!(
@@ -384,20 +395,44 @@ mod admission {
         );
         let observed = host.probe()?;
         assert!(matches!(
-            host.check_admission(&other, action, &observed, &lease),
+            host.check_admission(
+                &other,
+                action,
+                &observed,
+                &storage_runtime::bindings::OutputBindings::new(&other),
+                &lease
+            ),
             Err(HostError::LeaseMismatch)
         ));
         let foreign = ProbedObservation::collect(&probe(state))?;
         assert!(matches!(
-            host.check_admission(&run, action, &foreign, &lease),
+            host.check_admission(
+                &run,
+                action,
+                &foreign,
+                &storage_runtime::bindings::OutputBindings::new(&run),
+                &lease
+            ),
             Err(HostError::ObservationMismatch)
         ));
         let latest = host.probe()?;
         assert!(matches!(
-            host.check_admission(&run, action, &observed, &lease),
+            host.check_admission(
+                &run,
+                action,
+                &observed,
+                &storage_runtime::bindings::OutputBindings::new(&run),
+                &lease
+            ),
             Err(HostError::ObservationMismatch)
         ));
-        let decision = host.check_admission(&run, action, &latest, &lease)?;
+        let decision = host.check_admission(
+            &run,
+            action,
+            &latest,
+            &storage_runtime::bindings::OutputBindings::new(&run),
+            &lease,
+        )?;
         assert_eq!(decision.report.run_id, run.run_id());
         assert_eq!(decision.report.held_resources, lease.held_resources());
         Ok(())
@@ -467,6 +502,46 @@ mod coordination {
             assert_eq!(attempt.targets, action.fingerprints());
             self.calls.set(self.calls.get() + 1);
             progress("synthetic adapter completed".into())?;
+            if let storage_provider::ProviderAction::Lvm(
+                storage_provider::LvmAction::SetActivation { active, .. },
+            ) = action.operation()
+            {
+                let target = action
+                    .lv_target()
+                    .ok_or_else(|| DispatchError::Adapter("missing verified LV".into()))?;
+                let mut state = self.state.borrow_mut();
+                let mut node = state
+                    .current
+                    .graph
+                    .node(&target.observed_id)
+                    .cloned()
+                    .ok_or_else(|| DispatchError::Adapter("missing fixture LV".into()))?;
+                node.size.lvm_active = if self.result_case == 8 {
+                    None
+                } else {
+                    Some(*active)
+                };
+                node.size.block = state.current.graph.nodes().find_map(|(_, node)| {
+                    if matches!(node.kind.kind, NodeKind::Disk) {
+                        node.size.block.clone()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(block) = &mut node.size.block {
+                    block.paths = vec!["/dev/fixture-lv".into()];
+                    block.read_only = Some(self.result_case == 9);
+                }
+                state
+                    .current
+                    .graph
+                    .replace_existing(target.observed_id, node)
+                    .map_err(|error| DispatchError::Adapter(error.to_string()))?;
+                return Ok(ExecutionReceipt {
+                    outcome: BackendOutcome::Succeeded,
+                    created_lv_uuid: None,
+                });
+            }
             if self.break_probe {
                 self.state.borrow_mut().current.graph.insert_dependency(
                     storage_core::model::Dependency {
@@ -1714,6 +1789,116 @@ mod native_execution {
                 assert_eq!(calls.get(), 1);
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod activation {
+    use super::*;
+    use storage_engine::ActionRunState;
+    use storage_runtime::{
+        coordinator::ExecutionCoordinator, lease::ExecutionRoot,
+        targets::resolve_action_with_bindings,
+    };
+
+    /// A verified LV survives transient IDs; replacement, unknown activation and read-only results fail closed.
+    #[test]
+    fn activation_uses_verified_output_and_checks_actual_interface() -> Result<(), Box<dyn Error>> {
+        for case in 0..6 {
+            let (state, frozen) = fixture()?;
+            let state = Rc::new(RefCell::new(state));
+            let scratch = admission::Scratch::new()?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let mut fake = coordination::dispatcher(&scratch, state.clone());
+            fake.created_uuid = Some("created-lv".into());
+            fake.result_case = match case {
+                3 => 8,
+                4 => 9,
+                _ => 0,
+            };
+            let calls = fake.calls.clone();
+            let mut coordinator = ExecutionCoordinator::new(
+                ExecutionRoot::open(&scratch.0)?,
+                coordination::host(state.clone(), &run)?,
+                fake,
+                &run,
+            );
+            assert_eq!(
+                coordinator.execute_action(&mut run, ActionId::new(0), None)?,
+                ActionRunState::Verified
+            );
+            let old = state
+                .borrow()
+                .current
+                .graph
+                .nodes()
+                .find(|(_, node)| matches!(node.kind.kind, NodeKind::LvmLv(_)))
+                .map(|(id, _)| *id)
+                .ok_or("created LV")?;
+            if case == 1 {
+                let remapped = serde_json::to_string(&*state.borrow())?.replace(
+                    &old.as_uuid().to_string(),
+                    &NodeId::new().as_uuid().to_string(),
+                );
+                *state.borrow_mut() = serde_json::from_str(&remapped)?;
+            } else if case == 2 {
+                let mut node = state.borrow().current.graph.node(&old).ok_or("LV")?.clone();
+                node.size.identities = vec![ExternalId::LvmLvUuid("replacement".into())];
+                state
+                    .borrow_mut()
+                    .current
+                    .graph
+                    .replace_existing(old, node)?;
+            }
+            if case == 5 {
+                let mut node = state.borrow().current.graph.node(&old).ok_or("LV")?.clone();
+                if let NodeKind::LvmLv(lv) = &mut node.kind.kind {
+                    lv.name = "foreign".into();
+                }
+                node.size.identities = vec![ExternalId::LvmLvUuid("foreign-lv".into())];
+                let id = NodeId::new();
+                let vg = state.borrow().lvm_vgs[0].node;
+                state.borrow_mut().current.graph.insert_new(id, node)?;
+                state.borrow_mut().current.graph.insert_dependency(
+                    storage_core::model::Dependency {
+                        from: vg,
+                        to: id,
+                        kind: storage_core::model::DependencyKind::Provides,
+                    },
+                );
+            }
+            let result = coordinator.execute_action(&mut run, ActionId::new(1), None);
+            if case <= 1 {
+                assert_eq!(result?, ActionRunState::Verified);
+                assert_eq!(calls.get(), 2);
+                assert!(!scratch.0.join("active-attempt.json").exists());
+                assert!(!run.is_verified());
+            } else if case == 2 || case == 5 {
+                assert!(result.is_err() || result? != ActionRunState::Verified);
+                assert_eq!(calls.get(), 1);
+                assert!(!scratch.0.join("active-attempt.json").exists());
+            } else {
+                assert!(result.is_err() || result? == ActionRunState::OutcomeUnknown);
+                assert_eq!(calls.get(), 2);
+                assert_eq!(run.state(ActionId::new(1))?, ActionRunState::OutcomeUnknown);
+                assert!(scratch.0.join("active-attempt.json").exists());
+            }
+        }
+        // An identically named planned output is unusable without a verified binding from this run.
+        let (state, frozen) = fixture()?;
+        let run = ExecutionRun::new(frozen.document())?;
+        let observed = ProbedObservation::collect(&probe(Rc::new(RefCell::new(state))))?;
+        assert!(
+            resolve_action_with_bindings(
+                &run,
+                ActionId::new(1),
+                observed.observation(),
+                backend(),
+                &storage_runtime::bindings::OutputBindings::new(&run)
+            )
+            .is_err()
+        );
         Ok(())
     }
 }
