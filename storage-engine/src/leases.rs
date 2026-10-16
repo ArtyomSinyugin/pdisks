@@ -8,16 +8,11 @@ use rustix::{
     io::Errno,
     process::geteuid,
 };
-use storage_provider::{ActionPrerequisite, ResourceAccess};
+use storage_provider::ResourceAccess;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{
-    ActionId, ActionRunState, AdmissionReport, BackendCompletion, BackendOutcome, ExecutionRun,
-    ExecutionRunError, LiveCheck, LiveCheckStatus, LiveObservation, VerificationReport,
-    journal::{DurableJournal, JournalError},
-    live::{ProbeObservationError, ProbedObservation, check_observed_postconditions},
-};
+use crate::{ActionId, ActionRunState, ExecutionRun, ExecutionRunError};
 
 /// Permanent name shared by every cooperating host, regardless of transient plan/node IDs.
 const LOCK_FILE: &str = "execution.lock";
@@ -40,18 +35,9 @@ pub enum LeaseError {
     /// Acquisition is permitted only for the active Checking action.
     #[error("action must be Checking before acquiring its execution lease")]
     NotChecking,
-    /// A guard acquired for one attempt cannot attest another attempt over the same plan.
-    #[error("execution lease belongs to another run")]
-    RunMismatch,
     /// The requested action or run lifecycle is invalid.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
-    /// Intent was not durably acknowledged; the host must not dispatch.
-    #[error(transparent)]
-    Journal(#[from] JournalError),
-    /// Collection or interpretation of the actual provider pass failed before admission.
-    #[error(transparent)]
-    Probe(#[from] ProbeObservationError),
 }
 
 /// Exclusive cooperative lease bound to one run/action; dropping it releases the OS lock.
@@ -146,168 +132,5 @@ impl ExecutionLease {
     /// Describes logical resources covered by the stronger global cooperative exclusion.
     pub fn held_resources(&self) -> &[ResourceAccess] {
         &self.resources
-    }
-
-    /// Records host-supplied evidence with resources covered by this still-held OS guard.
-    /// The host must probe after acquisition and retain the guard through result verification.
-    /// This supplies exclusion only; the host remains responsible for evidence and applicability.
-    pub fn record_admission(
-        &self,
-        run: &mut ExecutionRun,
-        observation: LiveObservation,
-        applicability: LiveCheckStatus,
-        checks: Vec<LiveCheck<ActionPrerequisite>>,
-    ) -> Result<bool, LeaseError> {
-        self.check_run(run)?;
-        Ok(run.record_admission(AdmissionReport {
-            run_id: self.run_id,
-            action: self.action,
-            observation,
-            applicability,
-            held_resources: self.resources.clone(),
-            checks,
-        })?)
-    }
-
-    /// Collects a new provider pass under this guard and records conservative preflight evidence.
-    /// This never admits dispatch: native capabilities and authorization remain unimplemented.
-    /// Known prerequisite violations still stop the run; incomplete checks retain Checking.
-    pub fn record_probe_preflight(
-        &self,
-        run: &mut ExecutionRun,
-        probe: &storage_probe::LinuxProbe<'_>,
-    ) -> Result<(), LeaseError> {
-        self.check_run(run)?;
-        if run.state(self.action)? != ActionRunState::Checking {
-            return Err(LeaseError::NotChecking);
-        }
-        if run
-            .latest_observation()
-            .is_some_and(|latest| latest.reference.probe_instance != probe.instance_id())
-        {
-            return Err(ExecutionRunError::StaleObservation.into());
-        }
-        let publication = ProbedObservation::collect(probe)?;
-        let context = run.context();
-        let prerequisites = &context.plan.actions()[self.action.get() as usize]
-            .informational_contract
-            .prerequisites;
-        let report = publication
-            .check_prerequisites(context.historical_baseline, prerequisites)
-            .map_err(ProbeObservationError::from)?;
-        // shortcut: keep applicability unknown until native capability and authorization checks exist.
-        self.record_admission(run, publication.into_observation(), LiveCheckStatus::Unknown {
-            required_evidence: "native capability, scope applicability, and authorization checks are not configured".into(),
-        }, report.checks)?;
-        Ok(())
-    }
-
-    /// Collects and journals the actual result after the host's backend invocation returns.
-    /// The host supplies its classified outcome; this method never invokes a storage backend.
-    /// Probe/identity failure stops as OutcomeUnknown while preserving the last actual snapshot.
-    pub fn record_probed_completion(
-        &self,
-        journal: &mut DurableJournal,
-        run: &mut ExecutionRun,
-        probe: &storage_probe::LinuxProbe<'_>,
-        outcome: BackendOutcome,
-    ) -> Result<(), LeaseError> {
-        self.check_run(run)?;
-        let state = run.state(self.action)?;
-        if state != ActionRunState::Running {
-            return Err(ExecutionRunError::InvalidTransition {
-                action: self.action,
-                state,
-            }
-            .into());
-        }
-        journal.require_dispatch_intent(run, self.action)?;
-        let result = ProbedObservation::collect(probe)
-            .map_err(LeaseError::from)
-            .and_then(|publication| {
-                run.record_completion(BackendCompletion {
-                    run_id: self.run_id,
-                    action: self.action,
-                    outcome,
-                    observation: publication.into_observation(),
-                })?;
-                Ok(())
-            });
-        if let Err(error) = result {
-            run.mark_outcome_unknown(self.action, error.to_string())?;
-            journal.flush_events(run)?;
-            return Err(error);
-        }
-        if let Err(error) = journal.record_completion(run, self.action) {
-            if run.state(self.action)? == ActionRunState::Verifying {
-                run.mark_outcome_unknown(
-                    self.action,
-                    format!("completion journal acknowledgment failed: {error}"),
-                )?;
-            }
-            return Err(error.into());
-        }
-        Ok(())
-    }
-
-    /// Records observed postconditions using only this action's retained, journaled completion.
-    /// No later probe or predicted effect substitutes for that publication.
-    /// The host must flush resulting events before releasing the guard or starting successors;
-    /// any journal error forbids continuation even if in-memory verification has succeeded.
-    pub fn record_observed_verification(
-        &self,
-        journal: &DurableJournal,
-        run: &mut ExecutionRun,
-    ) -> Result<bool, LeaseError> {
-        self.check_run(run)?;
-        let state = run.state(self.action)?;
-        if state != ActionRunState::Verifying {
-            return Err(ExecutionRunError::InvalidTransition {
-                action: self.action,
-                state,
-            }
-            .into());
-        }
-        journal.require_completion(run, self.action)?;
-        let completion = run
-            .completion(self.action)?
-            .ok_or(ExecutionRunError::ReportMismatch)?;
-        let context = run.context();
-        let postconditions = &context.plan.actions()[self.action.get() as usize]
-            .informational_contract
-            .postconditions;
-        let report = check_observed_postconditions(
-            context.historical_baseline,
-            &completion.observation,
-            postconditions,
-        )
-        .map_err(ProbeObservationError::from)?;
-        Ok(run.record_verification(VerificationReport {
-            run_id: self.run_id,
-            action: self.action,
-            observation: report.observation,
-            checks: report.checks,
-        })?)
-    }
-
-    /// Syncs this admitted action's invocation intent while the OS lease remains held.
-    /// Dispatch requires success here and separate complete live authorization.
-    /// Keep this guard through completion probing, journaling, and verification.
-    pub fn record_dispatch_intent(
-        &self,
-        journal: &mut DurableJournal,
-        run: &ExecutionRun,
-    ) -> Result<(), LeaseError> {
-        self.check_run(run)?;
-        journal.record_dispatch_intent(run, self.action)?;
-        Ok(())
-    }
-
-    /// Rejects accidental reuse of a lease with another attempt before changing any run state.
-    fn check_run(&self, run: &ExecutionRun) -> Result<(), LeaseError> {
-        if run.run_id() != self.run_id {
-            return Err(LeaseError::RunMismatch);
-        }
-        Ok(())
     }
 }

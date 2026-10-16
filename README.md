@@ -120,8 +120,8 @@ resize-переходы, общий расход ёмкости, доступн�
 `ExecutionRun` хранит отдельные статусы попытки и события прогресса. Допуск требует
 полного live-отчёта, зависимые действия ждут `Verified`, а конечная цель проверяется
 отдельно по новому наблюдению. `LiveExecutionChecks` задаёт контракт будущего
-доверенного исполнителя; native live-checkers, блокировки ОС и write-dispatch
-пока не подключены. Добавлен durable journal и read-only incident review;
+доверенного исполнителя; полный admission и native write-dispatch
+пока не подключены. История выполнения на диск не записывается;
 универсальный resolver всех desired-diff также не реализован.
 
 ## Редактирование плана без доступа к дискам
@@ -313,7 +313,7 @@ cargo run -p storage-engine --example observed_checks
 
 `LiveObservation::validate()` проверяет граф, non-nil IDs, явно заданные epochs
 узлов и ссылки typed mount sources. Проверка применяется перед admission,
-completion/final verification и при чтении completion из журнала; ошибка
+completion/final verification; ошибка
 сохраняет прежние runtime evidence/events. Missing placeholders и unstamped
 узлы допускаются как неполные данные. Свежесть и происхождение снимка обязан
 подтверждать доверенный host: JSON и счётчик сами этого не доказывают.
@@ -353,45 +353,21 @@ symlink; lock должен быть regular, private и иметь ровно о
 удалять, пока hosts могут работать: новый inode создаст другую область блокировки.
 Разные каталоги и произвольные внешние disk tools этой блокировкой не исключаются.
 
-Порядок доверенного host:
-
-1. Создать run/journal, вызвать `begin_check(action)`.
-2. Получить `ExecutionLease::try_acquire(directory, &run, action)`; `Busy` оставляет
-   запуск в Checking. Блокировка привязана к одному run/action.
-3. Под guard получить свежий probe, проверить applicability и полную авторизацию.
-   `guard.record_admission(...)` добавляет реально покрытые logical resources,
-   сохраняя все проверки `ExecutionRun`; сам guard не доказывает остальные условия.
-4. После допуска вызвать `guard.record_dispatch_intent(&mut journal, &run)` и
-   дождаться успешного sync перед backend. При ошибке backend вызывать нельзя.
-5. Удерживать guard до actual completion probe, записи результата и verification,
-   затем отпустить. Ошибка/unknown требуют журнала и явного recovery, без auto retry.
-
-Для уже реализованной части есть `guard.record_probe_preflight(&mut run, &probe)`:
-он сам собирает новую публикацию под удерживаемым lock и записывает observed
-checks с same-pass capacity. Foreign run, смена probe instance и неподходящая
-фаза отклоняются до вызова adapters. Повреждённый результат не меняет сохранённые
-runtime evidence/events. Known violation переводит run в Failed; остальные
-preflight оставляют Checking: applicability пока всегда Unknown до реализации
-native capability/scope/authorization checks. Метод не включает dispatch.
-
-Drop и завершение процесса освобождают OS lock. Освобождение после падения не
-доказывает завершения операции; старый journal нужно разобрать до нового dispatch.
-Безопасный `rustix` API сохраняет MSRV 1.88, новый unsafe в проекте не добавлен.
+Lease отвечает только за OS-блокировку и список ресурсов одного run/action.
+Сбор наблюдений, admission и verification выполняются отдельно через `ExecutionRun`.
+Drop и завершение процесса освобождают lock, но не доказывают завершения операции.
+Реальный write остаётся отключён до готовности runtime и аварийного checkpoint.
 
 ```sh
-cargo run -p storage-engine --example lease_plan
-# Или готовый постоянный private local root:
-cargo run -p storage-engine --example lease_plan -- /path/to/private/leases
+cargo run -p storage-engine --example lease_checkpoint
 ```
 
-[Пример](storage-engine/examples/lease_plan.rs) использует frozen fixture и
-настоящую блокировку обычного файла. Второй run получает Busy. Под guard
-выполняется recorded probe: новое измерение с нулём свободных extents запрещает
-исторически допустимое создание LV, run становится Failed, intent отклоняется.
-По умолчанию остаётся новый изолированный temp-каталог с
-lock/journal для просмотра; такой отдельный root служит только демонстрации.
-Native backend и native probe не вызываются. Межпроцессная конкуренция и
-освобождение lock при exit без Rust drop проверяются отдельным subprocess-тестом.
+[Пример](storage-engine/examples/lease_checkpoint.rs) удерживает настоящий lock,
+проверяет конкуренцию и отклоняет создание LV по свежему recorded probe с нулём
+свободных extents. В новом изолированном каталоге остаётся только `execution.lock`:
+история и checkpoint при отказе admission не создаются. Native probe и backend
+не вызываются. Межпроцессная конкуренция и освобождение lock при exit без Rust
+Drop проверяются отдельным subprocess-тестом.
 
 ## Фактический результат: C3
 
@@ -405,82 +381,23 @@ filesystem mount в Host. Существующий узел/edge/mount опро�
 не подменяются успехом backend или prediction. Blocking diagnostics отзывают
 положительные checks.
 
-После реального вызова backend доверенный host может использовать guard:
+`ExecutionRun::record_completion()` сохраняет outcome и новый actual snapshot в
+памяти без обязательного файла. Для `Succeeded` host проверяет postconditions
+по сохранённому completion и передаёт `VerificationReport`. Поздний probe не
+заменяет этот снимок. Известное расхождение даёт Failed, недостаток evidence —
+OutcomeUnknown. Итоговая цель проверяется отдельно; автоматический retry запрещён.
 
-1. `record_probed_completion(&mut journal, &mut run, &probe, outcome)` требует
-   Running и уже подтверждённый intent. Он получает новый probe и сохраняет actual
-   completion даже при Failed/OutcomeUnknown. Сам метод backend не вызывает.
-2. При невозможности получить/принять снимок run останавливается как OutcomeUnknown,
-   прежнее actual observation сохраняется, retry запрещён. Ошибка подтверждения
-   completion в журнале также запрещает продолжение; полученный actual snapshot
-   остаётся в памяти, а журнал может сохранить только неподтверждённый intent.
-3. Для Succeeded вызвать `record_observed_verification(&journal, &mut run)`.
-   Метод требует healthy matching journal с подтверждённым completion и проверяет
-   только сохранённый post-backend snapshot. Поздний probe его не заменяет.
-4. Вызвать `journal.flush_events(&run)` до освобождения guard и до следующего
-   действия. Ошибка sync запрещает продолжение, даже если in-memory state уже
-   Verified. Это обязанность host; helper не является полным runtime coordinator.
+## Аварийный checkpoint вместо истории выполнения
 
-Известное расхождение даёт Failed, недостаток evidence — OutcomeUnknown. Verified
-одного action не подтверждает весь run: final goal/preservation проверяются отдельно.
-Полный native runtime с авторизацией, capabilities, разрешением planned outputs,
-dispatch и final goal verification остаётся следующей частью C3.
+Старый JSONL-журнал удалён. Импорт исторических `.jsonl`, восстановление run и
+автоматический повтор действий больше не поддерживаются. Существующие файлы
+пользователя не удаляются и не преобразуются автоматически.
 
-`observed_checks` дополнительно сравнивает два result fixtures: прежняя метка
-не удовлетворяет postcondition, запрошенная — удовлетворяет. Эти fixtures не
-передаются как backend completion/admission и не включают исполнение.
-
-## Durable journal: первый шаг C3
-
-`storage_engine::journal` записывает историю попытки, не вызывая backend:
-
-```sh
-cargo run -p storage-engine --example journal_plan
-# Необязательный аргумент — новый путь, существующий файл не перезаписывается:
-cargo run -p storage-engine --example journal_plan -- /tmp/my-new-run.jsonl
-```
-
-[Пример](storage-engine/examples/journal_plan.rs) создаёт обычный файл журнала
-(по умолчанию новый UUID-путь в temp directory) и оставляет его для просмотра.
-Он фиксирует header и событие `Checking`; live-отчёты и resource leases не
-выдумываются. Без допуска попытка записать dispatch intent отвергается.
-Ни probe, ни backend в этом примере не вызываются.
-
-`DurableJournal::create(path, frozen, run)` связывает ровно один новый run с
-точным frozen-документом, session/revision и исходной картой ActionId → OperationId.
-Файл создаётся через `create_new`, на Unix с mode 0600; header и родительский
-каталог синхронизируются. Открытия существующего журнала для append/resume нет.
-Позднее редактирование черновика не меняет зафиксированную карту операций.
-
-Порядок будущего доверенного host:
-
-1. Создать журнал до admission, получить свежие live checks и реальные leases.
-2. Передать допуск в `ExecutionRun`, затем вызвать `record_dispatch_intent`.
-   Только после успешного sync host может вызвать backend под удерживаемыми leases.
-3. Получить fresh probe даже при failure/unknown, передать actual completion в run
-   и сохранить его через `record_completion`. Прогноз не накладывается на snapshot.
-4. Отдельно проверить postconditions и конечную цель; `flush_events` сохраняет
-   исходные `RunEvent` и их sequence для просмотра после переподключения.
-
-Намерение записывается только для `Running` и единожды. Записанный intent ещё
-не доказывает факт вызова backend. Ошибка write/sync отравляет handle: дальнейшие
-append запрещены, dispatch после ошибки не допускается. Предварительная проверка
-размера/count происходит до записи batch; пределы — 16 МиБ и 16 384 записи,
-rotation пока нет. Блокировки устройств и авторизация этим API не реализуются.
-
-`JournalLog::read()` / `from_bytes()` читают bounded JSONL: версии, IDs, полный
-source map, sequence, переходы состояний, порядок предшественников и привязка
-completion проверяются. Незавершённая последняя строка отмечается как
-`incomplete_tail`; повреждённая полная строка отклоняется. Read-only `review()`
-возвращает исторические сведения: отсутствие записи о вызове, неподтверждённую
-попытку либо записанный outcome с actual observation reference. Даже `Succeeded`
-не считается доказательством postconditions или конечного успеха. Файл может быть
-изменён извне; его claims не становятся live evidence. Импорта в `ExecutionRun`,
-автоматического retry и восстановления права на запись нет.
-
-Следующая часть C3 — доверенный live-checker, реальные resource leases и узкий
-native dispatch. Сейчас запись выполняется только в обычный файл журнала;
-изменение устройств и незавершённый disks preview остаются выключенными.
+Следующий этап — один ограниченный `active-attempt.json` под тем же глобальным
+lock: перед native dispatch файл должен быть надёжно опубликован; после полной
+проверки результата — удалён. Неопределённая попытка оставляет checkpoint для
+явного разбора. Пока store и доверенный coordinator не готовы, реальное
+исполнение и незавершённый disks preview остаются выключенными.
 
 ## Наблюдения для нового baseline
 

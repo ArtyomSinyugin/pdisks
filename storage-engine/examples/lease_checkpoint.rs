@@ -1,5 +1,5 @@
-//! Real Linux advisory lease and journal preparation over a synthetic plan; no storage writes.
-//! Run with `cargo run -p storage-engine --example lease_plan -- [EXISTING_PRIVATE_DIRECTORY]`.
+//! Real Linux advisory lease and rejected admission over a synthetic plan; no storage writes.
+//! Run with `cargo run -p storage-engine --example lease_checkpoint -- [EXISTING_PRIVATE_DIRECTORY]`.
 
 /// Explicit fixture adapter; this exercises probe collection without observing host devices.
 #[cfg(target_os = "linux")]
@@ -41,17 +41,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
     use storage_core::model::Bytes;
     use storage_engine::{
-        ActionId, ActionRunState, ExecutionRun, HistoricalBaseline, LiveCheckStatus,
+        ActionId, ActionRunState, AdmissionReport, ExecutionRun, HistoricalBaseline,
+        LiveCheckStatus,
         editing::PlanSession,
-        journal::{DurableJournal, JournalLog, RecoveryStatus},
         leases::{ExecutionLease, LeaseError},
+        live::ProbedObservation,
     };
     use uuid::Uuid;
 
     let mut arguments = std::env::args_os().skip(1);
     let supplied = arguments.next().map(PathBuf::from);
     if arguments.next().is_some() {
-        return Err("usage: lease_plan [EXISTING_PRIVATE_DIRECTORY]".into());
+        return Err("usage: lease_checkpoint [EXISTING_PRIVATE_DIRECTORY]".into());
     }
     let directory = match supplied {
         Some(path) => path,
@@ -74,12 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     session.add_lv(session.revision(), vg, "data", Bytes::new(16 * 1024 * 1024))?;
     let frozen = session.freeze(session.revision())?;
     let mut run = ExecutionRun::new(frozen.document())?;
-    let journal_path = directory.join(format!("run-{}.jsonl", run.run_id()));
-    let mut journal = DurableJournal::create(&journal_path, &frozen, &run)?;
     let action = ActionId::new(0);
     run.begin_check(action)?;
     let guard = ExecutionLease::try_acquire(&directory, &run, action)?;
-    journal.flush_events(&run)?;
     let mut contender = ExecutionRun::new(frozen.document())?;
     contender.begin_check(action)?;
     assert!(matches!(
@@ -90,8 +88,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     publication.lvm_vgs[0].vg.free = 0;
     let probe =
         storage_probe::LinuxProbe::from_providers(vec![Box::new(RecordedProvider { publication })]);
-    guard.record_probe_preflight(&mut run, &probe)?;
-    assert!(guard.record_dispatch_intent(&mut journal, &run).is_err());
+    let publication = ProbedObservation::collect(&probe)?;
+    let context = run.context();
+    let checks = publication
+        .check_prerequisites(
+            context.historical_baseline,
+            &context.plan.actions()[0]
+                .informational_contract
+                .prerequisites,
+        )?
+        .checks;
+    assert!(!run.record_admission(AdmissionReport {
+        run_id: guard.run_id(),
+        action: guard.action(),
+        observation: publication.into_observation(),
+        applicability: LiveCheckStatus::Unknown {
+            required_evidence: "native capability and authorization".into()
+        },
+        held_resources: guard.held_resources().to_vec(),
+        checks,
+    })?);
+    assert!(!directory.join("active-attempt.json").exists());
     assert_eq!(run.state(action)?, ActionRunState::Failed);
     assert_eq!(
         run.latest_observation()
@@ -107,22 +124,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .any(|check| matches!(check.status, LiveCheckStatus::Violated { .. }))
     );
-    journal.flush_events(&run)?;
-    let review = JournalLog::read(&journal_path)?.review()?;
-    assert!(
-        review
-            .actions
-            .iter()
-            .all(|action| action.status == RecoveryStatus::NoInvocationRecorded)
-    );
     drop(guard);
     let next = ExecutionLease::try_acquire(&directory, &contender, action)?;
     drop(next);
     println!("lease root: {}", directory.display());
-    println!("journal: {}", journal_path.display());
     println!("real flock: contender gets Busy until guard drops; persistent lock file retained");
     println!(
-        "recorded probe under lease: fresh free capacity is zero; run Failed, dispatch intent rejected"
+        "recorded probe under lease: fresh free capacity is zero; run Failed, no checkpoint or dispatch"
     );
     println!(
         "no native probe or storage backend invoked; isolated default root is for this example only"
