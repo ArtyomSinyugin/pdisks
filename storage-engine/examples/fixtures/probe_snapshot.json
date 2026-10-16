@@ -1,0 +1,61 @@
+{
+  "generation": 1,
+  "current": {
+    "graph": {
+      "nodes": {
+        "00000000-0000-7000-8000-000000000002": {
+          "kind": {
+            "kind": {
+              "LvmVg": {
+                "name": "vg0",
+                "extent_size": 4194304
+              }
+            },
+            "size": 68719476736
+          },
+          "size": {
+            "observed_in": null,
+            "presence": "Present",
+            "identities": [
+              {
+                "LvmVgUuid": "example-vg-uuid"
+              }
+            ],
+            "block": null,
+            "device": null
+          }
+        }
+      },
+      "dependencies": [],
+      "relations": []
+    },
+    "mounts": {
+      "entries": []
+    },
+    "environment": {
+      "host": {
+        "os_release": null,
+        "architecture": null,
+        "kernel_release": null,
+        "tools": [],
+        "kernel_modules": []
+      },
+      "target": null
+    },
+    "diagnostics": []
+  },
+  "lvm_vgs": [
+    {
+      "node": "00000000-0000-7000-8000-000000000002",
+      "vg": {
+        "name": "vg0",
+        "uuid": "example-vg-uuid",
+        "size": 68719476736,
+        "extent_size": 4194304,
+        "free": 68719476736,
+        "pv_count": 1,
+        "exported": false
+      }
+    }
+  ]
+}

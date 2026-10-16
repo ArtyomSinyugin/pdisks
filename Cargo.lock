@@ -219,6 +219,7 @@ dependencies = [
  "serde",
  "serde_json",
  "storage-core",
+ "storage-probe",
  "storage-provider",
  "thiserror",
  "uuid",

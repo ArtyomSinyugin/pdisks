@@ -166,6 +166,51 @@ cargo run -p storage-engine --example edit_plan
 100 ГиБ, undo/redo и явную отмену зависимых запросов. Root, probe и native backend
 ему не нужны. Незавершённый disks preview остаётся выключенным.
 
+## Наблюдения для нового baseline
+
+`ProviderState.lvm_vgs` и `ProbeSnapshot.lvm_vgs` сохраняют исходные LVM VG
+records с соответствующими `NodeId` из того же прохода. `LinuxProbe` вызывает
+каждый адаптер один раз и публикует граф вместе с этими записями; конфликтующие
+узлы не предоставляют ёмкость. Старый JSON snapshot без `lvm_vgs` читается
+с неизвестной ёмкостью. Native-адаптеры могут заимствовать регистрации backend-ов
+на время жизни `LinuxProbe`.
+
+Прикладной код передаёт `snapshot.current` и `snapshot.lvm_vgs` в
+`HistoricalBaseline::from_lvm_observations()`. Engine проверяет присутствие и тип
+VG, уникальность UUID и привязки, имя, полный размер и ненулевой extent size.
+Свободные байты должны точно делиться на размер extent и не превышать размер VG.
+Экспортированная VG, дубликаты, неточные или несогласованные данные оставляют
+ёмкость неизвестной с диагностикой; известный ноль остаётся нулём.
+`storage-provider` и `storage-probe` не зависят от engine.
+
+`baseline.has_same_observations(&candidate)` позволяет показать изменение
+наблюдений независимо от UUID публикации и локального generation probe.
+Сравнение не подтверждает актуальность системы и не заменяет корреляцию
+устройств. Исторический `PlanDocument::analyse_against()` по-прежнему требует
+исходный ID baseline. Открытая сессия сама не меняет свой baseline: сохраните
+черновик и явно создайте `PlanSession::new(candidate)` для нового контекста.
+Перенос запросов с корреляцией объектов и rebase пока не реализован.
+
+Проверяемый пример интеграции:
+
+```sh
+cargo run -p storage-engine --example probe_plan
+```
+
+По умолчанию используется записанная искусственная публикация. Пример проверяет
+путь через `StateProvider`, assembler, `LinuxProbe`, capacity evidence и сессию,
+включая сохранение старого черновика/документа при открытии нового baseline.
+Для чтения реальной системы укажите manifest со всеми native backend-ами
+`NativeSystemProvider`; отсутствующие зависимости приводят к явной ошибке:
+
+```sh
+cargo run -p storage-engine --example probe_plan -- /path/to/providers.json
+```
+
+Native-режим выполняет read-only probe и выводит preview пустого плана с
+диагностикой. Он не выбирает устройства для изменения и не исполняет actions.
+Доступ к probe нужен только examples/tests; runtime-зависимость engine не менялась.
+
 ## Готовность этапов 3 и 4
 
 Этапы завершены в объёме поддерживаемых типизированных действий: проверка
