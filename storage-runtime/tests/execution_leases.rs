@@ -184,6 +184,7 @@ fn lease_remains_held_through_result_verification() -> Result<(), Box<dyn Error>
         held_resources: lease.held_resources().to_vec(),
     };
     assert!(run.record_admission(report)?);
+    run.mark_dispatch_started(action)?;
     run.record_completion(BackendCompletion {
         run_id: run.run_id(),
         action,

@@ -386,6 +386,13 @@ filesystem mount в Host. Существующий узел/edge/mount опро�
 не подменяются успехом backend или prediction. Blocking diagnostics отзывают
 положительные checks.
 
+Полный `record_admission()` переводит действие в `Admitted`, сохраняя разделение
+допуска и вызова backend. После надёжной публикации checkpoint host вызывает
+`mark_dispatch_started()` (`Running`); при ошибке подготовки —
+`mark_pre_dispatch_failed()` (`Failed`) с сохранённой причиной. В `Admitted`
+progress/completion и запуск другого действия запрещены. Engine сам не выполняет
+файловые операции и не подтверждает наличие checkpoint.
+
 `ExecutionRun::record_completion()` сохраняет outcome и новый actual snapshot в
 памяти без обязательного файла. Для `Succeeded` host проверяет postconditions
 по сохранённому completion и передаёт `VerificationReport`. Поздний probe не

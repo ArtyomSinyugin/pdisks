@@ -19,7 +19,9 @@ pub enum ActionRunState {
     Waiting,
     /// Live evidence is being collected before any invocation attempt.
     Checking,
-    /// Admission passed and the invocation attempt was recorded; its effect is still unverified.
+    /// Live admission passed; the host has not yet crossed the checkpoint/dispatch boundary.
+    Admitted,
+    /// The host marked dispatch started after durable checkpoint preparation; effects are unverified.
     Running,
     /// Backend reported success and fresh observations await postcondition verification.
     Verifying,
@@ -254,6 +256,8 @@ struct ActionRun {
     completion: Option<BackendCompletion>,
     /// Complete actual postcondition report.
     verification: Option<VerificationReport>,
+    /// Failure before dispatch, without claiming any backend invocation.
+    pre_dispatch_failure: Option<String>,
     /// Failure to observe or classify an invocation result.
     unknown_reason: Option<String>,
 }
@@ -306,7 +310,7 @@ pub enum ExecutionRunError {
         predecessor: ActionId,
     },
     /// The minimal runtime model allows one active action at a time.
-    #[error("another action is checking, running, or verifying")]
+    #[error("another action is checking, admitted, running, or verifying")]
     ActiveAction,
     /// A failure or unknown outcome forbids ordinary continuation and automatic retry.
     #[error("run stopped after failed or unknown action outcome")]
@@ -344,6 +348,7 @@ impl ExecutionRun {
                 admission: None,
                 completion: None,
                 verification: None,
+                pre_dispatch_failure: None,
                 unknown_reason: None,
             })
             .collect();
@@ -369,7 +374,7 @@ impl ExecutionRun {
         self.run_id
     }
 
-    /// Returns the frozen description for durable recording, never a mutable editing draft.
+    /// Returns the immutable reviewed description, never a mutable editing draft.
     pub const fn document(&self) -> &PlanDocument {
         &self.document
     }
@@ -420,6 +425,14 @@ impl ExecutionRun {
         Ok(self.action(action)?.verification.as_ref())
     }
 
+    /// Returns the host's reason for stopping an admitted action before dispatch.
+    pub fn pre_dispatch_failure(
+        &self,
+        action: ActionId,
+    ) -> Result<Option<&str>, ExecutionRunError> {
+        Ok(self.action(action)?.pre_dispatch_failure.as_deref())
+    }
+
     /// Returns why an invocation was left unclassified when a new probe could not be obtained.
     pub fn unknown_reason(&self, action: ActionId) -> Result<Option<&str>, ExecutionRunError> {
         Ok(self.action(action)?.unknown_reason.as_deref())
@@ -459,7 +472,10 @@ impl ExecutionRun {
         if self.actions.iter().any(|action| {
             matches!(
                 action.state,
-                ActionRunState::Checking | ActionRunState::Running | ActionRunState::Verifying
+                ActionRunState::Checking
+                    | ActionRunState::Admitted
+                    | ActionRunState::Running
+                    | ActionRunState::Verifying
             )
         }) {
             return Err(ExecutionRunError::ActiveAction);
@@ -468,9 +484,9 @@ impl ExecutionRun {
         Ok(())
     }
 
-    /// Records complete live evidence and, on admission, records the invocation attempt.
+    /// Records live evidence, entering `Admitted` only when every requirement is satisfied.
     /// Unknown evidence stays in `Checking`; a known violation stops the run before invocation.
-    /// The host must dispatch immediately under retained leases; this method never calls a backend.
+    /// The host must prepare its checkpoint before marking dispatch started under retained leases.
     pub fn record_admission(&mut self, report: AdmissionReport) -> Result<bool, ExecutionRunError> {
         let action = report.action;
         self.require_state(action, ActionRunState::Checking)?;
@@ -490,8 +506,8 @@ impl ExecutionRun {
         }
         let statuses = std::iter::once(&report.applicability)
             .chain(report.checks.iter().map(|check| &check.status));
-        let state = evidence_state(statuses, ActionRunState::Running, ActionRunState::Checking);
-        let admitted = state == ActionRunState::Running;
+        let state = evidence_state(statuses, ActionRunState::Admitted, ActionRunState::Checking);
+        let admitted = state == ActionRunState::Admitted;
         self.latest_observation = Some(report.observation.clone());
         self.actions[action.get() as usize].admission = Some(report);
         self.push_event(RunEventKind::Admission { action, admitted });
@@ -499,6 +515,26 @@ impl ExecutionRun {
             self.set_state(action, state);
         }
         Ok(admitted)
+    }
+
+    /// Marks the invocation boundary after the trusted host has durably armed its checkpoint.
+    /// This transition neither creates a checkpoint nor proves that a backend was actually called.
+    pub fn mark_dispatch_started(&mut self, action: ActionId) -> Result<(), ExecutionRunError> {
+        self.require_state(action, ActionRunState::Admitted)?;
+        self.set_state(action, ActionRunState::Running);
+        Ok(())
+    }
+
+    /// Stops an admitted action when checkpoint preparation fails, before any backend invocation.
+    pub fn mark_pre_dispatch_failed(
+        &mut self,
+        action: ActionId,
+        reason: String,
+    ) -> Result<(), ExecutionRunError> {
+        self.require_state(action, ActionRunState::Admitted)?;
+        self.actions[action.get() as usize].pre_dispatch_failure = Some(reason);
+        self.set_state(action, ActionRunState::Failed);
+        Ok(())
     }
 
     /// Records backend completion and a newer actual snapshot before any postcondition success.
@@ -825,6 +861,8 @@ mod tests {
             run.record_admission(report)
                 .unwrap_or_else(|error| panic!("record admission: {error}"))
         );
+        run.mark_dispatch_started(action)
+            .unwrap_or_else(|error| panic!("mark dispatch: {error}"));
         let report = completion(run, action, instance, epoch + 1, BackendOutcome::Succeeded);
         run.record_completion(report)
             .unwrap_or_else(|error| panic!("record completion: {error}"));
@@ -856,6 +894,8 @@ mod tests {
             run.record_admission(report)
                 .unwrap_or_else(|error| panic!("admit action: {error}"))
         );
+        run.mark_dispatch_started(action)
+            .unwrap_or_else(|error| panic!("mark dispatch: {error}"));
         assert!(matches!(
             run.begin_check(successor),
             Err(ExecutionRunError::PredecessorNotVerified { .. })
@@ -1081,6 +1121,7 @@ mod tests {
         let mut run = ExecutionRun::new(&document)?;
         run.begin_check(action)?;
         run.record_admission(admission(&run, action, instance, 1))?;
+        run.mark_dispatch_started(action)?;
         let mut report = completion(&run, action, instance, 2, BackendOutcome::Succeeded);
         report
             .observation
@@ -1149,6 +1190,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("begin check: {error}"));
             run.record_admission(admission(&run, action, instance, 1))
                 .unwrap_or_else(|error| panic!("admit action: {error}"));
+            run.mark_dispatch_started(action)
+                .unwrap_or_else(|error| panic!("mark dispatch: {error}"));
             let mut report = completion(&run, action, instance, 2, outcome.clone());
             report.observation.snapshot.graph = storage_core::model::NodeGraph::new();
             let actual = report.observation.clone();
@@ -1179,6 +1222,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("begin check: {error}"));
         run.record_admission(admission(&run, action, instance, 1))
             .unwrap_or_else(|error| panic!("admit action: {error}"));
+        run.mark_dispatch_started(action)
+            .unwrap_or_else(|error| panic!("mark dispatch: {error}"));
         let actual = run.latest_observation().cloned();
         assert!(matches!(
             run.record_completion(completion(
@@ -1213,6 +1258,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("begin check: {error}"));
             run.record_admission(admission(&run, action, instance, 1))
                 .unwrap_or_else(|error| panic!("admit action: {error}"));
+            run.mark_dispatch_started(action)
+                .unwrap_or_else(|error| panic!("mark dispatch: {error}"));
             run.record_completion(completion(
                 &run,
                 action,
@@ -1355,6 +1402,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("begin clean check: {error}"));
         run.record_admission(admission(&run, action, instance, 1))
             .unwrap_or_else(|error| panic!("admit check: {error}"));
+        run.mark_dispatch_started(action)
+            .unwrap_or_else(|error| panic!("mark dispatch: {error}"));
         run.record_completion(completion(
             &run,
             action,
@@ -1406,5 +1455,98 @@ mod tests {
             run.begin_check(ActionId::new(1)),
             Err(ExecutionRunError::ActiveAction)
         ));
+        let action = ActionId::new(0);
+        run.record_admission(admission(&run, action, Uuid::now_v7(), 1))
+            .unwrap_or_else(|error| panic!("admit first action: {error}"));
+        assert_eq!(run.state(action).ok(), Some(ActionRunState::Admitted));
+        assert!(matches!(
+            run.begin_check(ActionId::new(1)),
+            Err(ExecutionRunError::ActiveAction)
+        ));
+    }
+
+    /// Admission alone cannot accept progress/completion, and checkpoint failure stops successors.
+    #[test]
+    fn admitted_action_requires_dispatch_or_pre_dispatch_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let document = inspection_document(false);
+        let action = ActionId::new(0);
+        let instance = Uuid::now_v7();
+        let mut run = ExecutionRun::new(&document)?;
+        for state in [ActionRunState::Waiting, ActionRunState::Checking] {
+            let events = run.events_since(0).count();
+            assert!(run.mark_dispatch_started(action).is_err());
+            assert!(
+                run.mark_pre_dispatch_failed(action, "checkpoint error".into())
+                    .is_err()
+            );
+            assert_eq!(run.state(action)?, state);
+            assert_eq!(run.events_since(0).count(), events);
+            if state == ActionRunState::Waiting {
+                run.begin_check(action)?;
+            }
+        }
+        assert!(run.record_admission(admission(&run, action, instance, 1))?);
+        let events = run.events_since(0).count();
+        assert_eq!(run.state(action)?, ActionRunState::Admitted);
+        assert!(run.record_progress(action, "not running".into()).is_err());
+        assert!(
+            run.record_completion(completion(
+                &run,
+                action,
+                instance,
+                2,
+                BackendOutcome::Succeeded
+            ))
+            .is_err()
+        );
+        assert!(
+            run.mark_outcome_unknown(action, "not dispatched".into())
+                .is_err()
+        );
+        assert_eq!(run.events_since(0).count(), events);
+        let retained = run.latest_observation().cloned();
+        run.mark_pre_dispatch_failed(action, "checkpoint fsync failed".into())?;
+        assert_eq!(run.state(action)?, ActionRunState::Failed);
+        assert_eq!(
+            run.pre_dispatch_failure(action)?,
+            Some("checkpoint fsync failed")
+        );
+        assert_eq!(run.latest_observation(), retained.as_ref());
+        assert!(run.completion(action)?.is_none());
+        assert!(run.unknown_reason(action)?.is_none());
+        assert!(matches!(
+            run.begin_check(ActionId::new(1)),
+            Err(ExecutionRunError::RunStopped)
+        ));
+        assert!(run.mark_dispatch_started(action).is_err());
+
+        let mut run = ExecutionRun::new(&document)?;
+        run.begin_check(action)?;
+        run.record_admission(admission(&run, action, instance, 1))?;
+        run.mark_dispatch_started(action)?;
+        assert!(run.mark_dispatch_started(action).is_err());
+        assert!(
+            run.mark_pre_dispatch_failed(action, "too late".into())
+                .is_err()
+        );
+        assert_eq!(run.state(action)?, ActionRunState::Running);
+        let events: Vec<_> = run.events_since(0).cloned().collect();
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            RunEventKind::ActionState {
+                state: ActionRunState::Admitted,
+                ..
+            }
+        )));
+        assert_eq!(
+            serde_json::from_str::<Vec<RunEvent>>(&serde_json::to_string(&events)?)?,
+            events
+        );
+        assert_eq!(
+            serde_json::to_string(&ActionRunState::Admitted)?,
+            "\"admitted\""
+        );
+        Ok(())
     }
 }
