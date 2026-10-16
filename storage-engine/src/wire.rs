@@ -30,6 +30,20 @@ pub struct HistoricalBaseline {
     pub capacity_evidence: Vec<CapacityEvidence>,
 }
 
+impl HistoricalBaseline {
+    /// Compares observation content independently of baseline UUID or local probe generation.
+    /// Graph edges, mount entries and capacity are compared without ordering; options and multiplicity matter.
+    /// Equality neither validates these inputs nor proves freshness or live execution eligibility.
+    pub fn has_same_observations(&self, other: &Self) -> Result<bool, PlanDocumentError> {
+        let mut capacity = serde_json::to_value(&self.capacity_evidence)?;
+        let mut other_capacity = serde_json::to_value(&other.capacity_evidence)?;
+        sort_json_array(&mut capacity, false);
+        sort_json_array(&mut other_capacity, false);
+        Ok(capacity == other_capacity
+            && canonical_snapshot(&self.snapshot)? == canonical_snapshot(&other.snapshot)?)
+    }
+}
+
 /// Serializable, untrusted representation of a frozen plan and its review context.
 /// Public fields and deserialization do not establish validity; analysis recalculates contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,22 +261,7 @@ impl PlanDocument {
         &self,
         expected: &HistoricalBaseline,
     ) -> Result<HistoricalAnalysis, PlanDocumentError> {
-        let evidence_matches = self.baseline.capacity_evidence.len()
-            == expected.capacity_evidence.len()
-            && self
-                .baseline
-                .capacity_evidence
-                .iter()
-                .all(|item| expected.capacity_evidence.contains(item))
-            && expected
-                .capacity_evidence
-                .iter()
-                .all(|item| self.baseline.capacity_evidence.contains(item));
-        if self.baseline.id != expected.id
-            || canonical_snapshot(&self.baseline.snapshot)?
-                != canonical_snapshot(&expected.snapshot)?
-            || !evidence_matches
-        {
+        if self.baseline.id != expected.id || !self.baseline.has_same_observations(expected)? {
             return Err(PlanDocumentError::BaselineMismatch);
         }
         self.analyse_historical()
@@ -759,6 +758,104 @@ pub(crate) mod tests {
                 CompositionError::AmbiguousResourceOrder { .. }
             ))
         ));
+    }
+
+    /// A new publication identity alone is not a content change or a historic baseline match.
+    #[test]
+    fn baseline_content_comparison_is_independent_of_publication_identity() {
+        let document = document_fixture();
+        let original = &document.baseline;
+        let mut candidate = original.clone();
+        candidate.id = Uuid::now_v7();
+        assert!(
+            original
+                .has_same_observations(&candidate)
+                .unwrap_or_else(|error| panic!("compare: {error}"))
+        );
+        assert!(matches!(
+            document.analyse_against(&candidate),
+            Err(PlanDocumentError::BaselineMismatch)
+        ));
+        candidate.snapshot.mounts.entries.reverse();
+        assert!(
+            original
+                .has_same_observations(&candidate)
+                .unwrap_or_else(|error| panic!("mount order: {error}"))
+        );
+        candidate.snapshot.mounts.entries[0]
+            .options
+            .push("ro".to_owned());
+        assert!(
+            !original
+                .has_same_observations(&candidate)
+                .unwrap_or_else(|error| panic!("options: {error}"))
+        );
+        candidate = original.clone();
+        candidate.capacity_evidence[0].available = AllocationQuantity::new(0);
+        assert!(
+            !original
+                .has_same_observations(&candidate)
+                .unwrap_or_else(|error| panic!("capacity: {error}"))
+        );
+        let mut unknown = candidate.clone();
+        unknown.capacity_evidence.clear();
+        assert!(
+            !candidate
+                .has_same_observations(&unknown)
+                .unwrap_or_else(|error| panic!("unknown vs zero: {error}"))
+        );
+        candidate = original.clone();
+        candidate
+            .capacity_evidence
+            .push(candidate.capacity_evidence[0].clone());
+        assert!(
+            !original
+                .has_same_observations(&candidate)
+                .unwrap_or_else(|error| panic!("duplicate capacity: {error}"))
+        );
+    }
+
+    /// A fresh session is an explicit baseline switch, retaining the original draft and review.
+    #[test]
+    fn new_baseline_session_does_not_rewrite_an_existing_draft_or_frozen_plan() {
+        let mut document = crate::editing::PlanSession::new(document_fixture().baseline)
+            .unwrap_or_else(|error| panic!("session: {error}"))
+            .draft_document();
+        let AllocationDomain::LvmVolumeGroup(vg) = document.baseline.capacity_evidence[0].domain;
+        document
+            .draft
+            .operations
+            .push(crate::editing::PlanOperation::new(
+                crate::editing::PlanRequest::CreateLv {
+                    vg,
+                    name: "new-data".to_owned(),
+                    size: Bytes::new(10),
+                    layout: LvmLvKind::Linear,
+                    activate: true,
+                },
+            ));
+        let session = crate::editing::PlanSession::from_document(document)
+            .unwrap_or_else(|error| panic!("open: {error}"));
+        let saved = session.draft_document();
+        let frozen = session
+            .freeze(session.revision())
+            .unwrap_or_else(|error| panic!("freeze: {error}"));
+        let mut candidate = session.baseline().clone();
+        candidate.id = Uuid::now_v7();
+        candidate.capacity_evidence[0].available = AllocationQuantity::new(0);
+        assert!(
+            !session
+                .baseline()
+                .has_same_observations(&candidate)
+                .unwrap_or_else(|error| panic!("compare: {error}"))
+        );
+        let next = crate::editing::PlanSession::new(candidate)
+            .unwrap_or_else(|error| panic!("new baseline: {error}"));
+        assert_ne!(next.id(), session.id());
+        assert!(next.draft().operations.is_empty());
+        assert_eq!(session.draft_document(), saved);
+        assert_eq!(frozen.document().baseline, *session.baseline());
+        assert_ne!(next.baseline().id, session.baseline().id);
     }
 
     /// Saved baseline identities and evidence are checked separately from historical replay.
