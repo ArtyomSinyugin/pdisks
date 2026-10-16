@@ -287,6 +287,39 @@ Rebase удаления LV сопоставляет UUID и повторно п�
 отклоняется явно. Сохранение и freeze не разрешают реальную запись или закрытие
 mapping. Native dispatch и проверка фактических потребителей остаются работой runtime.
 
+## Проверки наблюдений: C3
+
+`storage_engine::live::check_observed_prerequisites` проверяет часть frozen
+prerequisites по отдельно полученному `LiveObservation`. Результат привязан к
+probe instance/epoch, условия сохраняют исходные NodeId. Сопоставление использует
+существующую строгую корреляцию UUID для VG/LV и обычных ФС; совпадение пути или
+NodeId само по себе ничего не доказывает. Неподдержанные объекты и будущие outputs
+дают `Unknown`.
+
+Проверяются наблюдаемые наличие, тип и read-only флаг прямого block endpoint.
+Обнаруженный потребитель, связь или mount запрещает соответствующее offline
+действие. Их отсутствие в частичном снимке остаётся `Unknown`: модель пока не
+доказывает полноту provider/namespace coverage. Capacity, credentials, approval,
+результат fsck и прочие внешние доказательства также остаются `Unknown`.
+
+```sh
+cargo run -p storage-engine --example observed_checks
+```
+
+[Пример](storage-engine/examples/observed_checks.rs) использует только fixtures:
+фиксирует смену метки ФС, меняет NodeId LV и его read-only флаг во втором снимке,
+показывает отказ без изменения frozen-документа. Реальный probe не вызывается.
+Полученный частичный отчёт не передаётся как полный admission.
+
+`LiveObservation::validate()` проверяет граф, non-nil IDs, явно заданные epochs
+узлов и ссылки typed mount sources. Проверка применяется перед admission,
+completion/final verification и при чтении completion из журнала; ошибка
+сохраняет прежние runtime evidence/events. Missing placeholders и unstamped
+узлы допускаются как неполные данные. Свежесть и происхождение снимка обязан
+подтверждать доверенный host: JSON и счётчик сами этого не доказывают.
+
+Полного `LiveExecutionChecks`, OS leases и native dispatch пока нет.
+
 ## Durable journal: первый шаг C3
 
 `storage_engine::journal` записывает историю попытки, не вызывая backend:
