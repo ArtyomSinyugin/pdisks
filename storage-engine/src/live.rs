@@ -10,8 +10,8 @@ use crate::{
     editing::correlate_nodes, prerequisites::matches_kind,
 };
 
-mod probe;
-pub use probe::{ProbeObservationError, ProbedObservation};
+mod capacity;
+pub use capacity::check_observed_prerequisites_with_capacity;
 mod verify;
 pub use verify::{ObservedPostconditions, check_observed_postconditions};
 

@@ -11,8 +11,10 @@ workspace = true
 [dependencies]
 storage-core.workspace = true
 storage-provider.workspace = true
-storage-probe.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+storage-probe.workspace = true

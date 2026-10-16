@@ -5,11 +5,12 @@ use std::{
     error::Error,
 };
 use storage_core::model::{Bytes, NodeId, NodeKind};
-use storage_engine::{HistoricalBaseline, LiveCheckStatus, live::ProbedObservation};
+use storage_engine::{HistoricalBaseline, LiveCheckStatus};
 use storage_probe::{LinuxProbe, ProbeSnapshot, ProviderProbeError, ProviderState, StateProvider};
 use storage_provider::{
     ActionPrerequisite, AllocationDomain, AllocationQuantity, ProviderConnectionKind,
 };
+use storage_runtime::probe::ProbedObservation;
 
 /// Borrows mutable fixture measurements to prove each collection performs exactly one new pass.
 struct Recorded<'a> {
@@ -48,7 +49,7 @@ impl StateProvider for Recorded<'_> {
 /// Reads one synthetic present VG with exact free-space measurements.
 fn fixture() -> Result<ProbeSnapshot, Box<dyn Error>> {
     Ok(serde_json::from_str(include_str!(
-        "../examples/fixtures/probe_snapshot.json"
+        "../../storage-engine/examples/fixtures/probe_snapshot.json"
     ))?)
 }
 

@@ -6,3 +6,5 @@
 pub mod lease;
 
 pub mod checkpoint;
+
+pub mod probe;

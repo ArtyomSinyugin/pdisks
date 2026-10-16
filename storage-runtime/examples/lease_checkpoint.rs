@@ -42,11 +42,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use storage_core::model::Bytes;
     use storage_engine::{
         ActionId, ActionRunState, AdmissionReport, ExecutionRun, HistoricalBaseline,
-        LiveCheckStatus, editing::PlanSession, live::ProbedObservation,
+        LiveCheckStatus, editing::PlanSession,
     };
     use storage_runtime::{
         checkpoint::CheckpointStore,
         lease::{ExecutionLease, ExecutionRoot, LeaseError},
+        probe::ProbedObservation,
     };
     use uuid::Uuid;
 

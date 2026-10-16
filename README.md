@@ -321,7 +321,7 @@ completion/final verification; ошибка
 Полного `LiveExecutionChecks` и native dispatch пока нет.
 
 `LinuxProbe::instance_id()` отличает независимые экземпляры probe при одинаковых
-generations; старые fixture JSON не меняются. `ProbedObservation::collect(&probe)`
+generations; старые fixture JSON не меняются. `storage_runtime::probe::ProbedObservation::collect(&probe)`
 вызывает выбранные adapters ровно один раз, связывает snapshot с этим instance и
 generation, использует raw LVM records того же прохода. Импорта такого объекта
 из JSON нет. Выбор настоящих native adapters остаётся ответственностью host;
@@ -356,7 +356,9 @@ symlink; lock должен быть regular, private и иметь ровно о
 `ExecutionRoot::open()` фиксирует проверенный directory fd.
 `try_lock_host()` получает тот же lock без `ExecutionRun` для будущей инспекции
 checkpoint; `ExecutionLease::host_lock()` даёт заимствованный guard этого lock.
-`storage-runtime` зависит от engine; engine не зависит от runtime или `rustix`.
+`storage-runtime` зависит от engine; engine не зависит от runtime, `rustix` или `storage-probe` в production dependencies.
+Сбор provider-pass находится в runtime; engine выполняет чистую проверку
+`live::check_observed_prerequisites_with_capacity()` над переданными фактами.
 
 Lease отвечает только за OS-блокировку и список ресурсов одного run/action.
 Сбор наблюдений, admission и verification выполняются отдельно через `ExecutionRun`.
