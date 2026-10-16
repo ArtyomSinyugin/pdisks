@@ -7,7 +7,7 @@ use storage_engine::{
     ActionId, ActionRunState, ExecutionRun, HistoricalBaseline, LiveCheckStatus, LiveObservation,
     ObservationReference,
     editing::{PlanEdit, PlanRequest, PlanSession},
-    live::check_observed_prerequisites,
+    live::{check_observed_postconditions, check_observed_prerequisites},
 };
 use storage_provider::ActionPrerequisite;
 use uuid::Uuid;
@@ -84,9 +84,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(run.state(action)?, ActionRunState::Checking);
     assert!(run.latest_observation().is_none());
     assert_eq!(frozen.document().canonical_json()?, original);
+    let postconditions = &run.context().plan.actions()[0]
+        .informational_contract
+        .postconditions;
+    let unchanged = check_observed_postconditions(&baseline, &observation, postconditions)?;
+    assert!(
+        unchanged
+            .checks
+            .iter()
+            .any(|check| matches!(check.status, LiveCheckStatus::Violated { .. }))
+    );
+    // A separately edited result fixture demonstrates verification only, never a backend invocation.
+    let mut result = observation.clone();
+    result.reference.epoch = ProbeEpoch::new(2);
+    let mut filesystem_node = result
+        .snapshot
+        .graph
+        .node(&filesystem)
+        .ok_or("fixture filesystem")?
+        .clone();
+    let NodeKind::Filesystem { label, .. } = &mut filesystem_node.kind.kind else {
+        return Err("filesystem kind".into());
+    };
+    *label = Some("renamed".into());
+    result
+        .snapshot
+        .graph
+        .replace_existing(filesystem, filesystem_node)?;
+    let changed = check_observed_postconditions(&baseline, &result, postconditions)?;
+    assert!(
+        changed
+            .checks
+            .iter()
+            .all(|check| check.status == LiveCheckStatus::Satisfied)
+    );
+    assert_eq!(run.state(action)?, ActionRunState::Checking);
+    assert!(run.latest_observation().is_none());
     println!("synthetic fixture only: UUID correlation survives a changed NodeId");
     println!("{}", serde_json::to_string_pretty(&report)?);
     println!("fresh fixture read-only status vetoes the label edit; run remains Checking");
+    println!(
+        "result fixtures: unchanged label fails; requested observed label passes its postcondition"
+    );
+    println!(
+        "these checks prove neither invocation nor final goal; no synthetic admission was recorded"
+    );
     println!(
         "actual probe, applicability, authorization, leases, and native dispatch remain unconfigured"
     );

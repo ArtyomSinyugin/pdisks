@@ -393,6 +393,43 @@ lock/journal для просмотра; такой отдельный root сл�
 Native backend и native probe не вызываются. Межпроцессная конкуренция и
 освобождение lock при exit без Rust drop проверяются отдельным subprocess-тестом.
 
+## Фактический результат: C3
+
+`live::check_observed_postconditions(baseline, observation, conditions)` проверяет
+результат по отдельному фактическому снимку, сохраняя frozen IDs и его точный
+instance/epoch. UUID correlation поддерживает существующие VG/LV и обычные ФС.
+Проверяются size, node spec, label, reprobe, наблюдаемая dependency и точный
+filesystem mount в Host. Существующий узел/edge/mount опровергает требуемое
+отсутствие; исчезновение из неполного снимка даёт Unknown. Planned outputs,
+результаты fsck, activation, persistent config и остальные неподдержанные факты
+не подменяются успехом backend или prediction. Blocking diagnostics отзывают
+положительные checks.
+
+После реального вызова backend доверенный host может использовать guard:
+
+1. `record_probed_completion(&mut journal, &mut run, &probe, outcome)` требует
+   Running и уже подтверждённый intent. Он получает новый probe и сохраняет actual
+   completion даже при Failed/OutcomeUnknown. Сам метод backend не вызывает.
+2. При невозможности получить/принять снимок run останавливается как OutcomeUnknown,
+   прежнее actual observation сохраняется, retry запрещён. Ошибка подтверждения
+   completion в журнале также запрещает продолжение; полученный actual snapshot
+   остаётся в памяти, а журнал может сохранить только неподтверждённый intent.
+3. Для Succeeded вызвать `record_observed_verification(&journal, &mut run)`.
+   Метод требует healthy matching journal с подтверждённым completion и проверяет
+   только сохранённый post-backend snapshot. Поздний probe его не заменяет.
+4. Вызвать `journal.flush_events(&run)` до освобождения guard и до следующего
+   действия. Ошибка sync запрещает продолжение, даже если in-memory state уже
+   Verified. Это обязанность host; helper не является полным runtime coordinator.
+
+Известное расхождение даёт Failed, недостаток evidence — OutcomeUnknown. Verified
+одного action не подтверждает весь run: final goal/preservation проверяются отдельно.
+Полный native runtime с авторизацией, capabilities, разрешением planned outputs,
+dispatch и final goal verification остаётся следующей частью C3.
+
+`observed_checks` дополнительно сравнивает два result fixtures: прежняя метка
+не удовлетворяет postcondition, запрошенная — удовлетворяет. Эти fixtures не
+передаются как backend completion/admission и не включают исполнение.
+
 ## Durable journal: первый шаг C3
 
 `storage_engine::journal` записывает историю попытки, не вызывая backend:
