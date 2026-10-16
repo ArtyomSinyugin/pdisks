@@ -4,6 +4,7 @@
 //! rebuilds its preview through the existing composer and simulation checks.
 
 mod build;
+mod correlate;
 mod coverage;
 mod document;
 mod draft;
@@ -31,3 +32,5 @@ pub use document::{
     DRAFT_SCHEMA_VERSION, DraftDocument, DraftDocumentError, FreezeError, FrozenPlan,
     MAX_DRAFT_JSON_BYTES, MAX_DRAFT_OPERATIONS, PREVIEW_SCHEMA_VERSION, PreviewDocument,
 };
+
+pub use correlate::{CorrelationError, NodeCorrelation, correlate_nodes};
