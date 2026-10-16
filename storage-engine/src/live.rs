@@ -1,9 +1,112 @@
 //! Checks over actual observations; these do not grant authorization or acquire resources.
 
-use storage_core::model::{GraphError, MountSource, NodeId};
+use serde::Serialize;
+use storage_core::model::{GraphError, MountSource, Node, NodeId};
+use storage_provider::{ActionPrerequisite, NodeKindClass};
 use thiserror::Error;
 
-use crate::LiveObservation;
+use crate::{
+    HistoricalBaseline, LiveCheck, LiveCheckStatus, LiveObservation, ObservationReference,
+    editing::correlate_nodes, prerequisites::matches_kind,
+};
+
+/// Partial prerequisite evidence bound to one publication, without applicability or lease claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObservedPrerequisites {
+    /// Publication actually used for all checks below.
+    pub observation: ObservationReference,
+    /// Exactly the supplied conditions, in their original frozen identity space and order.
+    pub checks: Vec<LiveCheck<ActionPrerequisite>>,
+}
+
+/// Checks observable facts after conservative UUID correlation with the historical baseline.
+/// The host must supply an actual fresh probe; JSON or a simulation cannot establish provenance.
+/// Unsupported facts, planned outputs, and failed correlation remain unknown, preventing dispatch.
+pub fn check_observed_prerequisites(
+    baseline: &HistoricalBaseline,
+    observation: &LiveObservation,
+    prerequisites: &[ActionPrerequisite],
+) -> Result<ObservedPrerequisites, ObservationError> {
+    observation.validate()?;
+    baseline.snapshot.graph.validate_structure()?;
+    Ok(ObservedPrerequisites {
+        observation: observation.reference,
+        checks: prerequisites
+            .iter()
+            .map(|condition| LiveCheck {
+                condition: condition.clone(),
+                status: check_node_fact(baseline, observation, condition),
+            })
+            .collect(),
+    })
+}
+
+/// Resolves one existing node without trusting transient IDs, paths, or display names.
+fn correlated_node<'a>(
+    baseline: &HistoricalBaseline,
+    observation: &'a LiveObservation,
+    source: NodeId,
+) -> Result<(NodeId, &'a Node), LiveCheckStatus> {
+    let mappings = correlate_nodes(&baseline.snapshot, &observation.snapshot, &[source])
+        .map_err(|error| unknown(format!("fresh identity correlation: {error}")))?;
+    let target = mappings
+        .first()
+        .ok_or_else(|| unknown("missing identity correlation"))?
+        .target;
+    let node = observation
+        .snapshot
+        .graph
+        .node(&target)
+        .ok_or_else(|| unknown("correlated node is absent"))?;
+    Ok((target, node))
+}
+
+/// Evaluates only direct observed facts; external authority and missing evidence stay unknown.
+fn check_node_fact(
+    baseline: &HistoricalBaseline,
+    observation: &LiveObservation,
+    condition: &ActionPrerequisite,
+) -> LiveCheckStatus {
+    let source = match condition {
+        ActionPrerequisite::NodeExists(node)
+        | ActionPrerequisite::NodeKind { node, .. }
+        | ActionPrerequisite::Writable(node) => *node,
+        _ => return unknown("runtime provider evidence is required for this condition"),
+    };
+    let (_, node) = match correlated_node(baseline, observation, source) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    match condition {
+        ActionPrerequisite::NodeExists(_) => LiveCheckStatus::Satisfied,
+        ActionPrerequisite::NodeKind { expected, .. } => {
+            if matches_kind(&node.kind.kind, *expected) {
+                LiveCheckStatus::Satisfied
+            } else {
+                LiveCheckStatus::Violated {
+                    reason: "observed node kind does not satisfy the frozen condition".into(),
+                }
+            }
+        }
+        ActionPrerequisite::Writable(_) if matches_kind(&node.kind.kind, NodeKindClass::Block) => {
+            match node.size.block.as_ref().and_then(|block| block.read_only) {
+                Some(false) => LiveCheckStatus::Satisfied,
+                Some(true) => LiveCheckStatus::Violated {
+                    reason: "observed block endpoint is read-only".into(),
+                },
+                None => unknown("fresh block read-only status is required"),
+            }
+        }
+        _ => unknown("a supported observed block endpoint is required"),
+    }
+}
+
+/// Keeps evidence gaps distinct from observed contradictions.
+fn unknown(reason: impl Into<String>) -> LiveCheckStatus {
+    LiveCheckStatus::Unknown {
+        required_evidence: reason.into(),
+    }
+}
 
 /// Invalid observation envelopes are rejected before they can advance a run.
 #[derive(Debug, Error)]
