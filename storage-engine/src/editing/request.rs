@@ -97,3 +97,97 @@ impl PlanRequest {
         }
     }
 }
+
+impl PlanRequest {
+    /// Rebinds only typed inputs after correlation; output IDs and path text are never rewritten.
+    pub(super) fn remap_nodes(&mut self, mapping: &std::collections::HashMap<NodeId, NodeId>) {
+        let remap = |node: &mut NodeId| {
+            if let Some(target) = mapping.get(node) {
+                *node = *target;
+            }
+        };
+        match self {
+            Self::CreateLv { vg, .. } => remap(vg),
+            Self::CreateFilesystem { backing, .. } => remap(backing),
+            Self::SetFilesystemLabel { filesystem, .. } => remap(filesystem),
+            Self::Mount(entry) | Self::PersistMount(entry) => match &mut entry.source {
+                MountSource::Filesystem(node)
+                | MountSource::BtrfsSubvolume(node)
+                | MountSource::ZfsDataset(node) => remap(node),
+                MountSource::Bind(_)
+                | MountSource::Tmpfs
+                | MountSource::Network(_)
+                | MountSource::Other(_) => {}
+            },
+            Self::Unmount { .. } | Self::RemovePersistentMount { .. } => {}
+            Self::Maintenance(intent) => match intent {
+                OperationIntent::Reformat { target, .. }
+                | OperationIntent::Check { target, .. }
+                | OperationIntent::Repair { target, .. }
+                | OperationIntent::SetActivation { target, .. } => remap(target),
+                OperationIntent::ReplaceMember { group, old, new } => {
+                    remap(group);
+                    remap(old);
+                    remap(new);
+                }
+                OperationIntent::ConvertBtrfsProfiles { filesystem, .. } => remap(filesystem),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use super::*;
+
+    /// Rebinding changes typed inputs only, preserving options, namespace, and path strings.
+    #[test]
+    fn remapping_preserves_path_and_mount_semantics() {
+        let source = NodeId::new();
+        let target = NodeId::new();
+        let mapping = std::collections::HashMap::from([(source, target)]);
+        let entry = MountEntry {
+            source: MountSource::Filesystem(source),
+            target: "/data".into(),
+            options: vec!["ro".to_owned(), "rw".to_owned()],
+            context: MountContext::Host,
+        };
+        for mut request in [
+            PlanRequest::Mount(entry.clone()),
+            PlanRequest::PersistMount(entry.clone()),
+            PlanRequest::SetFilesystemLabel {
+                filesystem: source,
+                label: Some("data".to_owned()),
+            },
+            PlanRequest::Maintenance(OperationIntent::ReplaceMember {
+                group: source,
+                old: source,
+                new: source,
+            }),
+            PlanRequest::Maintenance(OperationIntent::Check {
+                target: source,
+                force: true,
+            }),
+        ] {
+            request.remap_nodes(&mapping);
+            assert!(
+                request
+                    .referenced_nodes()
+                    .iter()
+                    .all(|node| *node == target)
+            );
+            if let PlanRequest::Mount(actual) | PlanRequest::PersistMount(actual) = request {
+                assert_eq!(actual.target, entry.target);
+                assert_eq!(actual.options, entry.options);
+                assert_eq!(actual.context, entry.context);
+            }
+        }
+        let mut bind = PlanRequest::Mount(MountEntry {
+            source: MountSource::Bind("/dev/old".into()),
+            ..entry
+        });
+        let original = bind.clone();
+        bind.remap_nodes(&mapping);
+        assert_eq!(bind, original);
+    }
+}

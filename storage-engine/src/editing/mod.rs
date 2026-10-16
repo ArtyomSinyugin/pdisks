@@ -10,6 +10,7 @@ mod document;
 mod draft;
 mod lower;
 mod preview;
+mod rebase;
 mod request;
 mod session;
 
@@ -34,3 +35,5 @@ pub use document::{
 };
 
 pub use correlate::{CorrelationError, NodeCorrelation, correlate_nodes};
+
+pub use rebase::{RebaseError, remap_draft};
