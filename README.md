@@ -318,7 +318,53 @@ completion/final verification и при чтении completion из журна�
 узлы допускаются как неполные данные. Свежесть и происхождение снимка обязан
 подтверждать доверенный host: JSON и счётчик сами этого не доказывают.
 
-Полного `LiveExecutionChecks`, OS leases и native dispatch пока нет.
+Полного `LiveExecutionChecks` и native dispatch пока нет.
+
+## Execution leases: C3, Linux
+
+`storage_engine::leases::ExecutionLease` удерживает настоящий неблокирующий
+`flock` на `execution.lock`. Одна эксклюзивная блокировка последовательно
+пропускает все действия сотрудничающих hosts. Она покрывает весь logical resource
+set frozen action и не зависит от transient NodeId, plan UUID или путей устройств.
+Раздельная конкурентная работа с независимыми ресурсами пока не реализуется.
+
+Все hosts одного effective user должны использовать **один и тот же постоянный
+локальный каталог** с правами 0700 под доверенным родителем. API требует готовый
+каталог, проверяет ownership/permissions и открывает directory/lock без следования
+symlink; lock должен быть regular, private и иметь ровно одну hard link.
+`execution.lock` не удаляется и не обнуляется. Каталог и lock нельзя заменять или
+удалять, пока hosts могут работать: новый inode создаст другую область блокировки.
+Разные каталоги и произвольные внешние disk tools этой блокировкой не исключаются.
+
+Порядок доверенного host:
+
+1. Создать run/journal, вызвать `begin_check(action)`.
+2. Получить `ExecutionLease::try_acquire(directory, &run, action)`; `Busy` оставляет
+   запуск в Checking. Блокировка привязана к одному run/action.
+3. Под guard получить свежий probe, проверить applicability и полную авторизацию.
+   `guard.record_admission(...)` добавляет реально покрытые logical resources,
+   сохраняя все проверки `ExecutionRun`; сам guard не доказывает остальные условия.
+4. После допуска вызвать `guard.record_dispatch_intent(&mut journal, &run)` и
+   дождаться успешного sync перед backend. При ошибке backend вызывать нельзя.
+5. Удерживать guard до actual completion probe, записи результата и verification,
+   затем отпустить. Ошибка/unknown требуют журнала и явного recovery, без auto retry.
+
+Drop и завершение процесса освобождают OS lock. Освобождение после падения не
+доказывает завершения операции; старый journal нужно разобрать до нового dispatch.
+Безопасный `rustix` API сохраняет MSRV 1.88, новый unsafe в проекте не добавлен.
+
+```sh
+cargo run -p storage-engine --example lease_plan
+# Или готовый постоянный private local root:
+cargo run -p storage-engine --example lease_plan -- /path/to/private/leases
+```
+
+[Пример](storage-engine/examples/lease_plan.rs) использует frozen fixture и
+настоящую блокировку обычного файла. Второй run получает Busy; без live evidence
+intent отклоняется. По умолчанию остаётся новый изолированный temp-каталог с
+lock/journal для просмотра; такой отдельный root служит только демонстрации.
+Native backend и реальный probe не вызываются. Межпроцессная конкуренция и
+освобождение lock при exit без Rust drop проверяются отдельным subprocess-тестом.
 
 ## Durable journal: первый шаг C3
 
