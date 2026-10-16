@@ -44,6 +44,8 @@ use crate::{
 /// Linux current-state probe; adapters may borrow backend registrations for its lifetime.
 pub struct LinuxProbe<'a> {
     providers: Vec<Box<dyn StateProvider + 'a>>,
+    /// Distinguishes publications from independent probe instances, even at equal generations.
+    instance_id: Uuid,
     /// Last published generation; interior mutation preserves the read-only probe API.
     generation: Cell<u64>,
 }
@@ -1932,8 +1934,14 @@ impl<'a> LinuxProbe<'a> {
     pub fn from_providers(providers: Vec<Box<dyn StateProvider + 'a>>) -> Self {
         Self {
             providers,
+            instance_id: Uuid::now_v7(),
             generation: Cell::new(0),
         }
+    }
+
+    /// Returns this service instance's identity; it does not authenticate its selected adapters.
+    pub const fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
     /// Creates a test probe from recorded CLI outputs.
@@ -2505,11 +2513,17 @@ mod tests {
     #[test]
     fn probe_generation_advances_for_each_publication() {
         let probe = LinuxProbe::from_providers(Vec::new());
+        let instance = probe.instance_id();
+        assert!(!instance.is_nil());
+        let other = LinuxProbe::from_providers(Vec::new());
         let first = probe.probe();
         assert_eq!(first.generation, 1);
+        assert_eq!(other.probe().generation, first.generation);
+        assert_ne!(other.instance_id(), instance);
         assert_eq!(probe.probe().generation, 2);
         assert_eq!(probe.probe().generation, 3);
         assert_eq!(first.generation, 1);
+        assert_eq!(probe.instance_id(), instance);
     }
 
     /// Exhaustion must not wrap to an identity already used by an earlier snapshot.
