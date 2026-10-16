@@ -1,4 +1,4 @@
-//! Explicit linear-only native adapter; scope and authorization remain independent host policies.
+//! Explicit native linear-create/activation adapter; scope and authorization are independent policies.
 
 use crate::{
     capability::{BackendCapabilityCheck, OperationAvailability},
@@ -8,7 +8,8 @@ use crate::{
 use storage_core::model::LvmLvKind;
 use storage_engine::{BackendOutcome, ExecutionRunError, LiveObservation};
 use storage_provider::{
-    BackendId, LinearLvRequest, LvmAction, LvmWriteError, ProviderAction, RegisteredBackend,
+    BackendId, LinearLvRequest, LvActivationRequest, LvmAction, LvmWriteError, ProviderAction,
+    RegisteredBackend,
 };
 
 /// One retained native registration used for both operation availability and synchronous dispatch.
@@ -34,18 +35,22 @@ impl BackendCapabilityCheck for NativeLvmAdapter<'_> {
         operation: &ProviderAction,
         _observed: &LiveObservation,
     ) -> OperationAvailability {
-        if !matches!(
-            operation,
+        let support = match operation {
             ProviderAction::Lvm(LvmAction::CreateLv {
                 layout: LvmLvKind::Linear,
                 ..
-            })
-        ) {
-            return OperationAvailability::Unavailable(
-                "native adapter supports only linear CreateLv".into(),
-            );
-        }
-        match self.backend.check_linear_lv_support() {
+            }) => self.backend.check_linear_lv_support(),
+            ProviderAction::Lvm(LvmAction::SetActivation { active: true, .. }) => {
+                self.backend.check_lv_activation_support()
+            }
+            _ => {
+                return OperationAvailability::Unavailable(
+                    "native adapter supports only linear CreateLv and verified LV activation"
+                        .into(),
+                );
+            }
+        };
+        match support {
             Ok(()) => OperationAvailability::Available(self.backend.manifest().id.clone()),
             Err(error) => OperationAvailability::Unavailable(error.to_string()),
         }
@@ -68,27 +73,49 @@ impl BackendDispatcher for NativeLvmAdapter<'_> {
         if action.backend() != self.backend_id() {
             return Err(DispatchError::Adapter("native backend mismatch".into()));
         }
-        let ProviderAction::Lvm(LvmAction::CreateLv {
-            name,
-            size,
-            layout: LvmLvKind::Linear,
-            ..
-        }) = action.operation()
-        else {
-            return Err(DispatchError::Adapter(
-                "unsupported native LVM operation".into(),
-            ));
-        };
         let target = action.target();
-        let request = LinearLvRequest::new(&target.vg_name, &target.vg_uuid, name, size.as_u64())
-            .map_err(|error| DispatchError::Adapter(error.to_string()))?;
-        let uuid = self
-            .backend
-            .create_linear_lv(&request)
-            .map_err(|error| DispatchError::Adapter(error.to_string()))?;
-        Ok(ExecutionReceipt {
-            outcome: BackendOutcome::Succeeded,
-            created_lv_uuid: Some(uuid),
-        })
+        match action.operation() {
+            ProviderAction::Lvm(LvmAction::CreateLv {
+                name,
+                size,
+                layout: LvmLvKind::Linear,
+                ..
+            }) => {
+                let request =
+                    LinearLvRequest::new(&target.vg_name, &target.vg_uuid, name, size.as_u64())
+                        .map_err(|error| DispatchError::Adapter(error.to_string()))?;
+                let uuid = self
+                    .backend
+                    .create_linear_lv(&request)
+                    .map_err(|error| DispatchError::Adapter(error.to_string()))?;
+                Ok(ExecutionReceipt {
+                    outcome: BackendOutcome::Succeeded,
+                    created_lv_uuid: Some(uuid),
+                })
+            }
+            ProviderAction::Lvm(LvmAction::SetActivation { active: true, .. }) => {
+                let lv = action.lv_target().ok_or_else(|| {
+                    DispatchError::Adapter("activation requires a verified LV endpoint".into())
+                })?;
+                let request = LvActivationRequest::new(
+                    &target.vg_name,
+                    &target.vg_uuid,
+                    &lv.lv_name,
+                    &lv.lv_uuid,
+                    lv.size.as_u64(),
+                )
+                .map_err(|error| DispatchError::Adapter(error.to_string()))?;
+                self.backend
+                    .activate_lv(&request)
+                    .map_err(|error| DispatchError::Adapter(error.to_string()))?;
+                Ok(ExecutionReceipt {
+                    outcome: BackendOutcome::Succeeded,
+                    created_lv_uuid: None,
+                })
+            }
+            _ => Err(DispatchError::Adapter(
+                "unsupported native LVM operation".into(),
+            )),
+        }
     }
 }

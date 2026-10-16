@@ -2,13 +2,17 @@
 
 use crate::{bindings::OutputBindings, checkpoint::TargetFingerprint};
 use std::collections::HashMap;
-use storage_core::model::{CurrentState, ExternalId, LvmLvKind, MountSource, NodeId, NodeKind};
+use storage_core::model::{
+    Bytes, CurrentState, ExternalId, LvmLvKind, MountSource, NodeId, NodeKind,
+};
 use storage_engine::{
     ActionId, ExecutionRun, ExecutionRunError, LiveObservation, ObservationReference,
     editing::{CorrelationError, correlate_nodes},
     live::ObservationError,
 };
-use storage_provider::{BackendId, LinearLvRequest, LvmAction, LvmWriteError, ProviderAction};
+use storage_provider::{
+    BackendId, LinearLvRequest, LvActivationRequest, LvmAction, LvmWriteError, ProviderAction,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -24,7 +28,7 @@ pub enum TargetError {
     /// The requested action does not belong to this run.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
-    /// Native endpoint resolution currently supports only linear CreateLv in an existing VG.
+    /// Only linear CreateLv and activation of its verified outputs are supported.
     #[error("target resolution does not support this action")]
     UnsupportedAction,
     /// A planned LV has no verified identity in this attempt, or that identity changed.
@@ -68,6 +72,8 @@ pub struct ResolvedLvTarget {
     pub lv_uuid: String,
     /// Native LV name observed alongside the UUID and owning VG.
     pub lv_name: String,
+    /// Exact reviewed capacity, rechecked natively before activation.
+    pub size: Bytes,
 }
 
 /// An operation bound to one run, action, probe publication, and concrete backend.
@@ -214,6 +220,7 @@ pub fn resolve_action_with_bindings(
                     observed_id: id,
                     lv_uuid: uuid,
                     lv_name: lv.name.clone(),
+                    size: node.kind.size.ok_or(TargetError::UnverifiedOutput)?,
                 }),
             )
         }
@@ -248,6 +255,9 @@ pub fn resolve_action_with_bindings(
         {
             return Err(TargetError::NameConflict);
         }
+    }
+    if let Some(lv) = &lv_target {
+        LvActivationRequest::new(vg_name, uuid, &lv.lv_name, &lv.lv_uuid, lv.size.as_u64())?;
     }
     check_scope(&baseline, &observed.snapshot, vg)?;
     Ok(ResolvedAction {

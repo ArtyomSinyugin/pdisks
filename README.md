@@ -465,7 +465,7 @@ checkpoint. Последующие обращения к binding повторн�
 
 Coordinator привязан к одному `ExecutionRun`. Успешный синтетический `CreateLv`
 проверен до `Verified` и удаления checkpoint, но `run.is_verified()` остаётся false:
-Native SetActivation, исполнение всего DAG и отдельная финальная goal/preservation
+Исполнение всего DAG и отдельная финальная goal/preservation
 verification ещё не подключены. Корреляция PV/физических устройств расширена, но production admission и native
 write всё ещё требуют проверки полной физической области; неизвестный scope
 отклоняется.
@@ -480,8 +480,9 @@ API libblockdev адресует VG по имени, поэтому внешни
 
 `storage_runtime::native_lvm::NativeLvmAdapter` связывает этот зарегистрированный
 backend с `BackendCapabilityCheck` и `BackendDispatcher`. Он поддерживает только
-linear CreateLv; resolver проверяет точные native-параметры до arm. Native SetActivation
-и другие операции пока получают Unavailable. Полноту scope adapter по умолчанию
+linear CreateLv и SetActivation(active=true) для его подтверждённого output;
+resolver проверяет точные native-параметры до arm. Deactivation и другие операции
+получают Unavailable. Полноту scope adapter по умолчанию
 оценивает как Unknown: host обязан отдельно доказать coverage, отсутствие
 внешних writers и авторизацию. Само создание adapter не разрешает запись.
 Disk-free интеграционный тест проходит через настоящий FFI adapter и отдельные
@@ -497,6 +498,12 @@ checks и заново сопоставляет UUID каждого output пр�
 до двух Verified; успех активации дополнительно требует наблюдаемого writable
 block interface с известной геометрией. Unknown activation или read-only endpoint
 оставляют checkpoint, а UUID replacement отклоняется до dispatch.
+Эта же цепочка проверяется через native C adapter на mock-библиотеке с fresh
+queries между действиями. Native activation отдельно проверяет MODIFY/QUERY,
+UUID VG/LV, размер и фактическую активацию после вызова; force-like options
+отключены. Ошибки native call/post-query сохраняют инцидент без retry; отсутствие
+поддержки или activation symbol отклоняется до arm. Эти тесты не заменяют VM/VG
+испытаний и не объявляют весь run успешным без отдельной final verification.
 
 ## Аварийный checkpoint вместо истории выполнения
 

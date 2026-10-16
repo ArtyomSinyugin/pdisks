@@ -1487,7 +1487,7 @@ mod native_lvm {
             adapter.availability(
                 &ProviderAction::Lvm(LvmAction::SetActivation {
                     target: shared.borrow().lvm_vgs[0].node,
-                    active: true,
+                    active: false,
                 }),
                 observed.observation()
             ),
@@ -1586,6 +1586,7 @@ mod native_execution {
             pv.size.identities = vec![ExternalId::LvmPvUuid(record.uuid.clone())];
             state.current.graph.replace_existing(pv_id, pv)?;
             for lv in native.lvs {
+                let active = lv.activation();
                 if lv.vg_name != vg.name || lv.segment_type.as_deref() != Some("linear") {
                     return Err("unsupported fixture LV".into());
                 }
@@ -1602,6 +1603,31 @@ mod native_execution {
                         },
                         size: NodeFacts {
                             presence: Presence::Present,
+                            lvm_active: active,
+                            // Private fixture geometry is independent of the plan and has no host endpoint.
+                            block: if active == Some(true) {
+                                self.template
+                                    .current
+                                    .graph
+                                    .nodes()
+                                    .find_map(|(_, node)| {
+                                        if matches!(node.kind.kind, NodeKind::Disk) {
+                                            node.size.block.clone()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .map(|mut block| {
+                                        block.paths = vec!["/dev/mock-lv".into()];
+                                        block.devno = storage_core::model::DeviceNumber {
+                                            major: 253,
+                                            minor: 17,
+                                        };
+                                        block
+                                    })
+                            } else {
+                                None
+                            },
                             identities: vec![ExternalId::LvmLvUuid(lv.uuid)],
                             ..NodeFacts::default()
                         },
@@ -1680,8 +1706,11 @@ mod native_execution {
             if request.run_id == self.run_id
                 && request.plan_digest == self.digest
                 && request.backend.as_str() == "mock-lvm"
-                && request.action_id == ActionId::new(0)
-                && request.targets.len() == 1
+                && ((request.action_id == ActionId::new(0) && request.targets.len() == 1)
+                    || (request.action_id == ActionId::new(1)
+                        && request.targets.len() == 2
+                        && request.targets[1].external_ids
+                            == vec![ExternalId::LvmLvUuid("new-uuid".into())]))
                 && request.targets[0].external_ids == vec![ExternalId::LvmVgUuid("vg-uuid".into())]
             {
                 LiveCheckStatus::Satisfied
@@ -1735,7 +1764,7 @@ mod native_execution {
     #[test]
     fn native_execution_observes_checkpoint_and_never_retries_uncertain_effects()
     -> Result<(), Box<dyn Error>> {
-        for scenario in [0, 7, 8, 9, 14] {
+        for scenario in [0, 7, 8, 9, 14, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29] {
             let library = mock_lvm::Fixture::new(scenario)?;
             let backend = library.registry.backends().next().ok_or("mock backend")?;
             let (template, _) = fixture()?;
@@ -1772,11 +1801,31 @@ mod native_execution {
                 ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
             let result = coordinator.execute_action(&mut run, ActionId::new(0), None);
             assert_eq!(calls.get(), 1, "scenario {scenario}: {result:?}");
-            if scenario == 0 {
+            if scenario == 0 || scenario >= 19 {
                 assert_eq!(result?, ActionRunState::Verified);
                 assert_eq!(coordinator.bindings().len(), 1);
                 assert!(!scratch.0.join("active-attempt.json").exists());
-                assert!(!run.is_verified());
+                let activated = coordinator.execute_action(&mut run, ActionId::new(1), None);
+                if scenario == 0 {
+                    assert_eq!(activated?, ActionRunState::Verified);
+                    assert_eq!(calls.get(), 2);
+                    assert!(!scratch.0.join("active-attempt.json").exists());
+                    assert!(!run.is_verified());
+                } else if scenario >= 28 {
+                    assert!(activated.is_err() || activated? != ActionRunState::Verified);
+                    assert_eq!(calls.get(), 1);
+                    assert!(!scratch.0.join("active-attempt.json").exists());
+                } else {
+                    assert_eq!(calls.get(), 2, "activation {scenario}: {activated:?}");
+                    assert!(activated.is_err() || activated? == ActionRunState::OutcomeUnknown);
+                    assert_eq!(run.state(ActionId::new(1))?, ActionRunState::OutcomeUnknown);
+                    assert!(scratch.0.join("active-attempt.json").exists());
+                    assert!(matches!(
+                        coordinator.execute_action(&mut run, ActionId::new(1), None),
+                        Err(CoordinatorError::Stopped)
+                    ));
+                    assert_eq!(calls.get(), 2);
+                }
             } else {
                 assert!(result.is_err() || result? != ActionRunState::Verified);
                 assert_eq!(run.state(ActionId::new(0))?, ActionRunState::OutcomeUnknown);
@@ -1879,8 +1928,8 @@ mod activation {
                 assert_eq!(calls.get(), 1);
                 assert!(!scratch.0.join("active-attempt.json").exists());
             } else {
+                assert_eq!(calls.get(), 2, "case {case}: {result:?}");
                 assert!(result.is_err() || result? == ActionRunState::OutcomeUnknown);
-                assert_eq!(calls.get(), 2);
                 assert_eq!(run.state(ActionId::new(1))?, ActionRunState::OutcomeUnknown);
                 assert!(scratch.0.join("active-attempt.json").exists());
             }
