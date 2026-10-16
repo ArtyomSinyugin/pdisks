@@ -12,6 +12,8 @@ use crate::{
 
 mod probe;
 pub use probe::{ProbeObservationError, ProbedObservation};
+mod verify;
+pub use verify::{ObservedPostconditions, check_observed_postconditions};
 
 /// Partial prerequisite evidence bound to one publication, without applicability or lease claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
