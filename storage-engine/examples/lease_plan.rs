@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => path,
         None => {
             let path =
-                std::env::temp_dir().join(format!("pdisks-leases-example-{}", Uuid::now_v7()));
+                std::env::temp_dir().join(format!("disksgraph-leases-example-{}", Uuid::now_v7()));
             fs::DirBuilder::new().mode(0o700).create(&path)?;
             path
         }

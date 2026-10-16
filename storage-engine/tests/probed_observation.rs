@@ -210,9 +210,10 @@ fn leased_preflight_publishes_fresh_checks_without_enabling_dispatch() -> Result
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    let root = Scratch(
-        std::env::temp_dir().join(format!("pdisks-preflight-test-{}", uuid::Uuid::now_v7())),
-    );
+    let root = Scratch(std::env::temp_dir().join(format!(
+        "disksgraph-preflight-test-{}",
+        uuid::Uuid::now_v7()
+    )));
     fs::DirBuilder::new().mode(0o700).create(&root.0)?;
     let source = fixture()?;
     let vg = source.lvm_vgs[0].node;

@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let path = arguments.next().map(PathBuf::from).unwrap_or_else(|| {
         std::env::temp_dir().join(format!(
-            "pdisks-journal-example-{}.jsonl",
+            "disksgraph-journal-example-{}.jsonl",
             uuid::Uuid::now_v7()
         ))
     });

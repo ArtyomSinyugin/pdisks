@@ -20,7 +20,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     /// Creates a unique app-owned lock root rather than using a shared writable temp root directly.
     fn new() -> Result<Self, Box<dyn Error>> {
-        let path = std::env::temp_dir().join(format!("pdisks-leases-{}", Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!("disksgraph-leases-{}", Uuid::now_v7()));
         fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
     }
@@ -315,8 +315,8 @@ fn lease_remains_held_through_journal_and_result_verification() -> Result<(), Bo
 #[test]
 #[ignore = "subprocess helper invoked by lease_excludes_other_processes_and_survives_process_exit"]
 fn lease_subprocess_child() -> Result<(), Box<dyn Error>> {
-    let root = std::env::var_os("PDISKS_LEASE_TEST_ROOT").ok_or("missing subprocess root")?;
-    let mode = std::env::var("PDISKS_LEASE_TEST_MODE")?;
+    let root = std::env::var_os("DISKSGRAPH_LEASE_TEST_ROOT").ok_or("missing subprocess root")?;
+    let mode = std::env::var("DISKSGRAPH_LEASE_TEST_MODE")?;
     let (_, run) = fixture()?;
     let guard = ExecutionLease::try_acquire(PathBuf::from(root), &run, ActionId::new(0));
     match mode.as_str() {
@@ -346,8 +346,8 @@ fn lease_excludes_other_processes_and_survives_process_exit() -> Result<(), Box<
                 "--ignored",
                 "--nocapture",
             ])
-            .env("PDISKS_LEASE_TEST_ROOT", &root.0)
-            .env("PDISKS_LEASE_TEST_MODE", mode)
+            .env("DISKSGRAPH_LEASE_TEST_ROOT", &root.0)
+            .env("DISKSGRAPH_LEASE_TEST_MODE", mode)
             .output()?;
         assert!(
             result.status.success(),

@@ -1,4 +1,4 @@
-//! Linux advisory exclusion for cooperating pdisks hosts using one shared private directory.
+//! Linux advisory exclusion for cooperating disksgraph hosts using one shared private directory.
 
 use std::{io, path::Path};
 

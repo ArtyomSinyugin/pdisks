@@ -18,7 +18,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     /// Reserves a unique name; DurableJournal itself must create the file exclusively.
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("pdisks-journal-{}.jsonl", Uuid::now_v7())))
+        Self(std::env::temp_dir().join(format!("disksgraph-journal-{}.jsonl", Uuid::now_v7())))
     }
 }
 impl Drop for Scratch {

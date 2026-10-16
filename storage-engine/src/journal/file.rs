@@ -269,8 +269,8 @@ mod tests {
     impl Directory {
         /// Creates a new owned scratch directory without overwriting any path.
         fn new() -> std::io::Result<Self> {
-            let path =
-                std::env::temp_dir().join(format!("pdisks-journal-test-{}", uuid::Uuid::now_v7()));
+            let path = std::env::temp_dir()
+                .join(format!("disksgraph-journal-test-{}", uuid::Uuid::now_v7()));
             std::fs::create_dir(&path)?;
             Ok(Self(path))
         }
