@@ -3,6 +3,7 @@
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     path::PathBuf,
+    sync::Mutex,
 };
 
 use libloading::{Library, Symbol};
@@ -11,6 +12,20 @@ use super::load_symbol;
 use crate::{LvmEntry, LvmLvEntry, LvmPvEntry, LvmSegmentEntry, LvmVgEntry, NativeProbeError};
 
 const MAX_NATIVE_ENTRIES: usize = 65_536;
+
+/// Standalone plugin init/close operate on process-global LVM state, including across loaded handles.
+static LVM_SESSION: Mutex<()> = Mutex::new(());
+
+/// GLib's owned GError prefix; only its numeric code is copied into the public probe error.
+#[repr(C)]
+struct GErrorRaw {
+    /// GLib error domain quark.
+    domain: u32,
+    /// Domain-specific error code.
+    code: c_int,
+    /// Owned native message, freed together with the error by g_error_free.
+    message: *mut c_char,
+}
 
 /// C prefix of `BDLVMPVdata` through the fields consumed here.
 #[repr(C)]
@@ -81,13 +96,17 @@ struct LvRaw {
 
 type Init = unsafe extern "C" fn() -> c_int;
 type Close = unsafe extern "C" fn();
-type Pvs = unsafe extern "C" fn(*mut *mut c_void) -> *mut *mut PvRaw;
-type Vgs = unsafe extern "C" fn(*mut *mut c_void) -> *mut *mut VgRaw;
-type Lvs = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> *mut *mut LvRaw;
+type Pvs = unsafe extern "C" fn(*mut *mut GErrorRaw) -> *mut *mut PvRaw;
+type Vgs = unsafe extern "C" fn(*mut *mut GErrorRaw) -> *mut *mut VgRaw;
+type Lvs = unsafe extern "C" fn(*const c_char, *mut *mut GErrorRaw) -> *mut *mut LvRaw;
 type PvFree = unsafe extern "C" fn(*mut PvRaw);
 type VgFree = unsafe extern "C" fn(*mut VgRaw);
 type LvFree = unsafe extern "C" fn(*mut LvRaw);
 type GFree = unsafe extern "C" fn(*mut c_void);
+/// Releases the complete GLib error allocation, including its message.
+type GErrorFree = unsafe extern "C" fn(*mut GErrorRaw);
+/// Releases one record owned by a terminated native array.
+type ItemFree<T> = unsafe extern "C" fn(*mut T);
 
 /// Symbols used by the libblockdev LVM adapter.
 struct Api<'library> {
@@ -100,6 +119,8 @@ struct Api<'library> {
     vg_free: Symbol<'library, VgFree>,
     lv_free: Symbol<'library, LvFree>,
     g_free: Symbol<'library, GFree>,
+    /// GLib destructor retained with the same loaded library dependency lifetime.
+    g_error_free: Symbol<'library, GErrorFree>,
 }
 
 impl<'library> Api<'library> {
@@ -118,6 +139,7 @@ impl<'library> Api<'library> {
                 vg_free: load_symbol(library, b"bd_lvm_vgdata_free\0")?,
                 lv_free: load_symbol(library, b"bd_lvm_lvdata_free\0")?,
                 g_free: load_symbol(library, b"g_free\0")?,
+                g_error_free: load_symbol(library, b"g_error_free\0")?,
             })
         }
     }
@@ -125,6 +147,9 @@ impl<'library> Api<'library> {
 
 /// Reads all visible PVs, VGs, and LVs.
 pub(super) fn probe(library: &Library) -> Result<LvmEntry, NativeProbeError> {
+    let _exclusive = LVM_SESSION
+        .lock()
+        .map_err(|_| call_failed("LVM plugin session lock"))?;
     let api = Api::load(library)?;
     // SAFETY: standalone plugin initialization takes no arguments.
     if unsafe { (api.init)() } == 0 {
@@ -142,13 +167,14 @@ pub(super) fn probe(library: &Library) -> Result<LvmEntry, NativeProbeError> {
 
 /// Copies the null-terminated PV array.
 fn read_pvs(api: &Api<'_>) -> Result<Vec<LvmPvEntry>, NativeProbeError> {
-    // SAFETY: null GError storage is accepted by GLib; the returned outer
-    // array and each element are caller-owned.
-    let pointer = unsafe { (api.pvs)(std::ptr::null_mut()) };
+    let mut error = ErrorGuard::new(&api.g_error_free);
+    // SAFETY: error storage is initialized null; the terminated array and all records are owned.
+    let pointer = unsafe { (api.pvs)(&mut error.pointer) };
+    let _array = ArrayGuard::new(pointer, &api.pv_free, &api.g_free);
+    error.check("bd_lvm_pvs")?;
     if pointer.is_null() {
         return Ok(Vec::new());
     }
-    let array = ArrayGuard::new(pointer.cast::<c_void>(), api);
     let mut entries = Vec::new();
     for index in 0..MAX_NATIVE_ENTRIES {
         // SAFETY: array is null-terminated and remains live.
@@ -156,42 +182,40 @@ fn read_pvs(api: &Api<'_>) -> Result<Vec<LvmPvEntry>, NativeProbeError> {
         if raw.is_null() {
             return Ok(entries);
         }
-        let item = PvGuard { pointer: raw, api };
         // SAFETY: strings and fields belong to the live item and are copied.
         let (device, uuid) = unsafe {
             (
-                copied_string((*item.pointer).pv_name),
-                copied_string((*item.pointer).pv_uuid),
+                copied_required((*raw).pv_name, "bd_lvm_pvs")?,
+                copied_required((*raw).pv_uuid, "bd_lvm_pvs")?,
             )
         };
-        if let (Some(device), Some(uuid)) = (device, uuid) {
-            // SAFETY: remaining fields belong to the same live item.
-            entries.push(unsafe {
-                LvmPvEntry {
-                    device: PathBuf::from(device),
-                    uuid,
-                    vg_name: copied_nonempty((*item.pointer).vg_name),
-                    vg_uuid: copied_nonempty((*item.pointer).vg_uuid),
-                    size: (*item.pointer).pv_size,
-                    free: (*item.pointer).pv_free,
-                    data_offset: (*item.pointer).pe_start,
-                    missing: (*item.pointer).missing != 0,
-                }
-            });
-        }
+        // SAFETY: remaining fields belong to the same live item.
+        entries.push(unsafe {
+            LvmPvEntry {
+                device: PathBuf::from(device),
+                uuid,
+                vg_name: copied_nonempty((*raw).vg_name),
+                vg_uuid: copied_nonempty((*raw).vg_uuid),
+                size: (*raw).pv_size,
+                free: (*raw).pv_free,
+                data_offset: (*raw).pe_start,
+                missing: (*raw).missing != 0,
+            }
+        });
     }
-    drop(array);
     Err(invalid("bd_lvm_pvs"))
 }
 
 /// Copies the null-terminated VG array.
 fn read_vgs(api: &Api<'_>) -> Result<Vec<LvmVgEntry>, NativeProbeError> {
-    // SAFETY: null GError storage is accepted by GLib; returned data is owned.
-    let pointer = unsafe { (api.vgs)(std::ptr::null_mut()) };
+    let mut error = ErrorGuard::new(&api.g_error_free);
+    // SAFETY: error storage is initialized null; the terminated array and all records are owned.
+    let pointer = unsafe { (api.vgs)(&mut error.pointer) };
+    let _array = ArrayGuard::new(pointer, &api.vg_free, &api.g_free);
+    error.check("bd_lvm_vgs")?;
     if pointer.is_null() {
         return Ok(Vec::new());
     }
-    let array = ArrayGuard::new(pointer.cast::<c_void>(), api);
     let mut entries = Vec::new();
     for index in 0..MAX_NATIVE_ENTRIES {
         // SAFETY: array is null-terminated and remains live.
@@ -199,42 +223,40 @@ fn read_vgs(api: &Api<'_>) -> Result<Vec<LvmVgEntry>, NativeProbeError> {
         if raw.is_null() {
             return Ok(entries);
         }
-        let item = VgGuard { pointer: raw, api };
         // SAFETY: strings and fields belong to the live item and are copied.
         let (name, uuid) = unsafe {
             (
-                copied_string((*item.pointer).name),
-                copied_string((*item.pointer).uuid),
+                copied_required((*raw).name, "bd_lvm_vgs")?,
+                copied_required((*raw).uuid, "bd_lvm_vgs")?,
             )
         };
-        if let (Some(name), Some(uuid)) = (name, uuid) {
-            // SAFETY: scalar fields belong to the same live item.
-            entries.push(unsafe {
-                LvmVgEntry {
-                    name,
-                    uuid,
-                    size: (*item.pointer).size,
-                    extent_size: (*item.pointer).extent_size,
-                    free: (*item.pointer).free,
-                    pv_count: (*item.pointer).pv_count,
-                    exported: (*item.pointer).exported != 0,
-                }
-            });
-        }
+        // SAFETY: scalar fields belong to the same live item.
+        entries.push(unsafe {
+            LvmVgEntry {
+                name,
+                uuid,
+                size: (*raw).size,
+                extent_size: (*raw).extent_size,
+                free: (*raw).free,
+                pv_count: (*raw).pv_count,
+                exported: (*raw).exported != 0,
+            }
+        });
     }
-    drop(array);
     Err(invalid("bd_lvm_vgs"))
 }
 
 /// Copies the null-terminated LV array for one VG.
 fn read_lvs(api: &Api<'_>, vg_name: &str) -> Result<Vec<LvmLvEntry>, NativeProbeError> {
     let vg_name = CString::new(vg_name).map_err(|_| invalid("bd_lvm_lvs"))?;
-    // SAFETY: VG name is NUL-terminated and null GError storage is accepted.
-    let pointer = unsafe { (api.lvs)(vg_name.as_ptr(), std::ptr::null_mut()) };
+    let mut error = ErrorGuard::new(&api.g_error_free);
+    // SAFETY: VG name is terminated and error storage initialized null; returned records are owned.
+    let pointer = unsafe { (api.lvs)(vg_name.as_ptr(), &mut error.pointer) };
+    let _array = ArrayGuard::new(pointer, &api.lv_free, &api.g_free);
+    error.check("bd_lvm_lvs")?;
     if pointer.is_null() {
         return Ok(Vec::new());
     }
-    let array = ArrayGuard::new(pointer.cast::<c_void>(), api);
     let mut entries = Vec::new();
     for index in 0..MAX_NATIVE_ENTRIES {
         // SAFETY: array is null-terminated and remains live.
@@ -242,39 +264,35 @@ fn read_lvs(api: &Api<'_>, vg_name: &str) -> Result<Vec<LvmLvEntry>, NativeProbe
         if raw.is_null() {
             return Ok(entries);
         }
-        let item = LvGuard { pointer: raw, api };
         // SAFETY: strings and fields belong to the live item and are copied.
         let (name, vg_name, uuid) = unsafe {
             (
-                copied_string((*item.pointer).lv_name),
-                copied_string((*item.pointer).vg_name),
-                copied_string((*item.pointer).uuid),
+                copied_required((*raw).lv_name, "bd_lvm_lvs")?,
+                copied_required((*raw).vg_name, "bd_lvm_lvs")?,
+                copied_required((*raw).uuid, "bd_lvm_lvs")?,
             )
         };
-        if let (Some(name), Some(vg_name), Some(uuid)) = (name, vg_name, uuid) {
-            // SAFETY: remaining fields belong to the same live item.
-            entries.push(unsafe {
-                LvmLvEntry {
-                    name,
-                    vg_name,
-                    uuid,
-                    size: (*item.pointer).size,
-                    segment_type: copied_nonempty((*item.pointer).segtype),
-                    attributes: copied_nonempty((*item.pointer).attr),
-                    origin: copied_nonempty((*item.pointer).origin),
-                    pool: copied_nonempty((*item.pointer).pool_lv),
-                    data: copied_nonempty((*item.pointer).data_lv),
-                    metadata: copied_nonempty((*item.pointer).metadata_lv),
-                    roles: copied_nonempty((*item.pointer).roles),
-                    data_percent: (*item.pointer).data_percent,
-                    metadata_percent: (*item.pointer).metadata_percent,
-                    copy_percent: (*item.pointer).copy_percent,
-                    segments: copy_segments((*item.pointer).segments)?,
-                }
-            });
-        }
+        // SAFETY: remaining fields belong to the same live item.
+        entries.push(unsafe {
+            LvmLvEntry {
+                name,
+                vg_name,
+                uuid,
+                size: (*raw).size,
+                segment_type: copied_nonempty((*raw).segtype),
+                attributes: copied_nonempty((*raw).attr),
+                origin: copied_nonempty((*raw).origin),
+                pool: copied_nonempty((*raw).pool_lv),
+                data: copied_nonempty((*raw).data_lv),
+                metadata: copied_nonempty((*raw).metadata_lv),
+                roles: copied_nonempty((*raw).roles),
+                data_percent: (*raw).data_percent,
+                metadata_percent: (*raw).metadata_percent,
+                copy_percent: (*raw).copy_percent,
+                segments: copy_segments((*raw).segments)?,
+            }
+        });
     }
-    drop(array);
     Err(invalid("bd_lvm_lvs"))
 }
 
@@ -317,63 +335,96 @@ impl Drop for Session<'_, '_> {
     }
 }
 
-/// Owns a GLib-allocated outer pointer array.
-struct ArrayGuard<'api, 'library> {
-    pointer: *mut c_void,
-    api: &'api Api<'library>,
+/// Owns all records and the outer native array, including unread records after a parse error.
+struct ArrayGuard<'function, T> {
+    /// Terminated native allocation, or null for a successful empty result.
+    pointer: *mut *mut T,
+    /// Type-correct record destructor borrowed from the live API symbol.
+    free_item: &'function ItemFree<T>,
+    /// GLib destructor for the outer allocation.
+    free_array: &'function GFree,
 }
 
-impl<'api, 'library> ArrayGuard<'api, 'library> {
-    /// Wraps one non-null GLib allocation.
-    const fn new(pointer: *mut c_void, api: &'api Api<'library>) -> Self {
-        Self { pointer, api }
+impl<'function, T> ArrayGuard<'function, T> {
+    /// Wraps the complete caller-owned result before checking errors or parsing fields.
+    fn new(
+        pointer: *mut *mut T,
+        free_item: &'function ItemFree<T>,
+        free_array: &'function GFree,
+    ) -> Self {
+        Self {
+            pointer,
+            free_item,
+            free_array,
+        }
     }
 }
 
-impl Drop for ArrayGuard<'_, '_> {
+impl<T> Drop for ArrayGuard<'_, T> {
+    /// Frees even unvisited records exactly once while all borrowed destructor symbols remain live.
     fn drop(&mut self) {
-        // SAFETY: outer array was allocated by GLib and is released once.
-        unsafe { (self.api.g_free)(self.pointer) };
+        if self.pointer.is_null() {
+            return;
+        }
+        // Parse loops are bounded; cleanup must release the complete terminated native allocation.
+        for index in 0.. {
+            // SAFETY: the library returned a terminated array; each entry is uniquely owned here.
+            let record = unsafe { *self.pointer.add(index) };
+            if record.is_null() {
+                break;
+            }
+            // SAFETY: this matching native destructor owns this record and its nested allocations.
+            unsafe { (self.free_item)(record) };
+        }
+        // SAFETY: the complete outer array is a GLib allocation, freed once after its records.
+        unsafe { (self.free_array)(self.pointer.cast()) };
     }
 }
 
-/// Owns one PV result structure.
-struct PvGuard<'api, 'library> {
-    pointer: *mut PvRaw,
-    api: &'api Api<'library>,
+/// Owns one optional GLib error; a null data result alone cannot distinguish failure from empty state.
+struct ErrorGuard<'function> {
+    /// Initialized null before crossing the FFI boundary, then exclusively owned if populated.
+    pointer: *mut GErrorRaw,
+    /// Destructor borrowed from the live GLib dependency symbol.
+    free: &'function GErrorFree,
 }
 
-impl Drop for PvGuard<'_, '_> {
+impl<'function> ErrorGuard<'function> {
+    /// Supplies valid, initially empty GError storage for exactly one native call.
+    fn new(free: &'function GErrorFree) -> Self {
+        Self {
+            pointer: std::ptr::null_mut(),
+            free,
+        }
+    }
+    /// Reports native failure without converting it into an empty observation or trusting message text.
+    fn check(&self, operation: &'static str) -> Result<(), NativeProbeError> {
+        if self.pointer.is_null() {
+            return Ok(());
+        }
+        // SAFETY: a non-null pointer was returned as an owned live GError by the matching API.
+        let code = unsafe { (*self.pointer).code };
+        Err(NativeProbeError::CallFailed { operation, code })
+    }
+}
+
+impl Drop for ErrorGuard<'_> {
+    /// Releases an owned native error even if result validation exits early.
     fn drop(&mut self) {
-        // SAFETY: balances one PV result allocation.
-        unsafe { (self.api.pv_free)(self.pointer) };
+        if !self.pointer.is_null() {
+            // SAFETY: the matching GLib destructor owns the returned error and message exactly once.
+            unsafe { (self.free)(self.pointer) };
+        }
     }
 }
 
-/// Owns one VG result structure.
-struct VgGuard<'api, 'library> {
-    pointer: *mut VgRaw,
-    api: &'api Api<'library>,
-}
-
-impl Drop for VgGuard<'_, '_> {
-    fn drop(&mut self) {
-        // SAFETY: balances one VG result allocation.
-        unsafe { (self.api.vg_free)(self.pointer) };
-    }
-}
-
-/// Owns one LV result structure.
-struct LvGuard<'api, 'library> {
-    pointer: *mut LvRaw,
-    api: &'api Api<'library>,
-}
-
-impl Drop for LvGuard<'_, '_> {
-    fn drop(&mut self) {
-        // SAFETY: balances one LV result allocation.
-        unsafe { (self.api.lv_free)(self.pointer) };
-    }
+/// Rejects absent, empty, or invalid UTF-8 identities instead of silently dropping an observed record.
+unsafe fn copied_required(
+    pointer: *const c_char,
+    operation: &'static str,
+) -> Result<String, NativeProbeError> {
+    // SAFETY: the caller guarantees an optional terminated string borrowed from a live native record.
+    unsafe { copied_nonempty(pointer) }.ok_or_else(|| invalid(operation))
 }
 
 /// Copies an optional non-empty native string.
@@ -382,17 +433,16 @@ unsafe fn copied_nonempty(pointer: *const c_char) -> Option<String> {
     unsafe { copied_string(pointer) }.filter(|value| !value.is_empty())
 }
 
-/// Copies an optional native string as lossy UTF-8.
+/// Copies an optional native string without changing invalid UTF-8 into a different identity.
 unsafe fn copied_string(pointer: *const c_char) -> Option<String> {
     if pointer.is_null() {
         return None;
     }
     // SAFETY: caller guarantees a valid NUL-terminated borrowed C string.
-    Some(
-        unsafe { CStr::from_ptr(pointer) }
-            .to_string_lossy()
-            .into_owned(),
-    )
+    unsafe { CStr::from_ptr(pointer) }
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 /// Creates the shared error for a GLib boolean failure.
@@ -403,4 +453,108 @@ fn call_failed(operation: &'static str) -> NativeProbeError {
 /// Creates a malformed-native-data error.
 fn invalid(operation: &'static str) -> NativeProbeError {
     NativeProbeError::InvalidData { operation }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Number of simulated GError releases; only the error-guard test uses this counter.
+    static ERRORS_FREED: AtomicUsize = AtomicUsize::new(0);
+    /// Sum of uniquely freed fixture record values; catches skipped or duplicated destructors.
+    static RECORDS_FREED: AtomicUsize = AtomicUsize::new(0);
+    /// Number of outer-array release calls in the ownership test.
+    static ARRAYS_FREED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Mock error destructor observes release of a stack-owned fixture without deallocating it.
+    extern "C" fn free_error(_pointer: *mut GErrorRaw) {
+        ERRORS_FREED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A native numeric error is preserved and released; no-error empty output remains distinguishable.
+    #[test]
+    fn glib_error_is_not_an_empty_result_and_is_released_once() {
+        ERRORS_FREED.store(0, Ordering::SeqCst);
+        let free: GErrorFree = free_error;
+        {
+            let guard = ErrorGuard::new(&free);
+            assert!(guard.check("bd_lvm_pvs").is_ok());
+        }
+        assert_eq!(ERRORS_FREED.load(Ordering::SeqCst), 0);
+        let mut raw = GErrorRaw {
+            domain: 1,
+            code: 17,
+            message: c"native failure".as_ptr().cast_mut(),
+        };
+        {
+            let mut guard = ErrorGuard::new(&free);
+            guard.pointer = &mut raw;
+            assert!(matches!(
+                guard.check("bd_lvm_lvs"),
+                Err(NativeProbeError::CallFailed {
+                    operation: "bd_lvm_lvs",
+                    code: 17
+                })
+            ));
+        }
+        assert_eq!(ERRORS_FREED.load(Ordering::SeqCst), 1);
+    }
+
+    /// Invalid required strings cannot silently omit a PV/VG/LV or turn into another UTF-8 identity.
+    #[test]
+    fn required_native_identity_rejects_null_empty_and_invalid_utf8()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let invalid_utf8 = CString::new(vec![0xff])?;
+        for pointer in [std::ptr::null(), c"".as_ptr(), invalid_utf8.as_ptr()] {
+            // SAFETY: each non-null pointer is a live terminated fixture string for this call.
+            assert!(unsafe { copied_required(pointer, "bd_lvm_pvs") }.is_err());
+        }
+        // SAFETY: the fixture is a live static terminated C string.
+        let copied = unsafe { copied_required(c"pv-uuid".as_ptr(), "bd_lvm_pvs") }?;
+        assert_eq!(copied, "pv-uuid");
+        Ok(())
+    }
+
+    /// Minimal C-layout record used only by the array ownership test.
+    #[repr(C)]
+    struct Record {
+        /// Value summed when its allocation is released.
+        value: usize,
+    }
+
+    /// Mock native destructor receives exactly the Box allocation owned by one array element.
+    extern "C" fn free_record(pointer: *mut Record) {
+        // SAFETY: the test supplies each Box::into_raw pointer once to its sole array owner.
+        let record = unsafe { Box::from_raw(pointer) };
+        RECORDS_FREED.fetch_add(record.value, Ordering::SeqCst);
+    }
+
+    /// The test owns the array storage itself; this mock only observes the native outer-free call.
+    extern "C" fn free_array(_pointer: *mut c_void) {
+        ARRAYS_FREED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A required-field parse error still frees every unvisited record and the outer native array.
+    #[test]
+    fn array_guard_cleans_unvisited_records_on_parse_failure() {
+        RECORDS_FREED.store(0, Ordering::SeqCst);
+        ARRAYS_FREED.store(0, Ordering::SeqCst);
+        let mut pointers = [
+            Box::into_raw(Box::new(Record { value: 2 })),
+            Box::into_raw(Box::new(Record { value: 5 })),
+            std::ptr::null_mut(),
+        ];
+        let item_free: ItemFree<Record> = free_record;
+        let array_free: GFree = free_array;
+        let result = (|| {
+            let _guard = ArrayGuard::new(pointers.as_mut_ptr(), &item_free, &array_free);
+            // SAFETY: null is the documented missing optional native string representation.
+            unsafe { copied_required(std::ptr::null(), "bd_lvm_vgs") }?;
+            Ok::<_, NativeProbeError>(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(RECORDS_FREED.load(Ordering::SeqCst), 7);
+        assert_eq!(ARRAYS_FREED.load(Ordering::SeqCst), 1);
+    }
 }

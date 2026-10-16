@@ -167,6 +167,7 @@
           "bd_lvm_pvs",
           "bd_lvm_vgdata_free",
           "bd_lvm_vgs",
+          "g_error_free",
           "g_free"
         ]
       },

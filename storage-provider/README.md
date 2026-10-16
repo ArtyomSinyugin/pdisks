@@ -331,6 +331,13 @@ This strict test opens every declared library, resolves every required symbol,
 and checks that every declared command is a regular executable file. Runtime
 discovery remains permissive and skips unavailable optional providers.
 
+The LVM probe checks GLib `GError` for PV/VG/LV queries before interpreting a
+null result as an empty list. Missing, empty, or invalid UTF-8 required identities
+fail the whole query instead of silently omitting records. Native arrays own all
+records until parsing completes, so early errors also free unvisited entries.
+Standalone LVM init/query/close sessions are serialized within the process; this
+protects plugin lifecycle only and does not authorize storage writes.
+
 ## Backend ownership
 
 One operation has one owning backend. A second library may enrich discovery,

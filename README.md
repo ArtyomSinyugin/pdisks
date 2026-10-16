@@ -533,6 +533,12 @@ Unknown/Violated, подмена checkpoint даже с прежними run/act
 probe/clear запрещают продолжение. Acknowledge не меняет старый ExecutionRun и
 не запускает повтор. Если identity/NodeId или данные изменились, нужен новый review.
 
+Native LVM probe сохраняет ошибки `GError` из запросов PV/VG/LV: ошибка чтения
+больше не выглядит как пустая топология. Обязательные identity с null/пустой
+строкой или неверным UTF-8 отклоняются целиком; ранняя ошибка освобождает и
+непрочитанные native records. Init/query/close плагина сериализованы внутри
+процесса. Это подготовка достоверного read-only контура; native write не включён.
+
 ## Наблюдения для нового baseline
 
 `ProviderState.lvm_vgs` и `ProbeSnapshot.lvm_vgs` сохраняют исходные LVM VG
