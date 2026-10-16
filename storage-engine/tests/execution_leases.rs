@@ -116,3 +116,95 @@ fn lease_rejects_untrusted_paths_and_nonchecking_actions() -> Result<(), Box<dyn
     assert!(ExecutionLease::try_acquire(&root.0, &run, action).is_err());
     Ok(())
 }
+
+/// Builds test-only actual-state claims; production hosts must obtain these from a fresh probe.
+fn observation(run: &ExecutionRun, instance: Uuid, epoch: u64) -> storage_engine::LiveObservation {
+    storage_engine::LiveObservation {
+        reference: storage_engine::ObservationReference {
+            probe_instance: instance,
+            epoch: storage_core::model::ProbeEpoch::new(epoch),
+        },
+        snapshot: run.document().baseline.snapshot.clone(),
+    }
+}
+
+/// Synthetic prerequisite attestations test lifecycle wiring, never native checker correctness.
+fn checks(
+    run: &ExecutionRun,
+    status: storage_engine::LiveCheckStatus,
+) -> Vec<storage_engine::LiveCheck<storage_provider::ActionPrerequisite>> {
+    run.context().plan.actions()[0]
+        .informational_contract
+        .prerequisites
+        .iter()
+        .cloned()
+        .map(|condition| storage_engine::LiveCheck {
+            condition,
+            status: status.clone(),
+        })
+        .collect()
+}
+
+/// Resource attestation cannot cross runs, bypass unknown evidence, or release the live OS lock.
+#[test]
+fn leased_admission_binds_run_and_preserves_existing_evidence_rules() -> Result<(), Box<dyn Error>>
+{
+    use storage_engine::{ActionRunState, LiveCheckStatus};
+    let root = Scratch::new()?;
+    let (frozen, mut run) = fixture()?;
+    let mut other = ExecutionRun::new(frozen.document())?;
+    let action = ActionId::new(0);
+    other.begin_check(action)?;
+    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let instance = Uuid::now_v7();
+    let fresh = observation(&other, instance, 1);
+    let claims = checks(&other, LiveCheckStatus::Satisfied);
+    assert!(matches!(
+        lease.record_admission(&mut other, fresh, LiveCheckStatus::Satisfied, claims),
+        Err(LeaseError::RunMismatch)
+    ));
+    assert!(other.latest_observation().is_none());
+    let fresh = observation(&run, instance, 1);
+    let unknown = LiveCheckStatus::Unknown {
+        required_evidence: "provider capability".into(),
+    };
+    let claims = checks(&run, LiveCheckStatus::Satisfied);
+    assert!(!lease.record_admission(&mut run, fresh, unknown, claims)?);
+    assert_eq!(run.state(action)?, ActionRunState::Checking);
+    assert_eq!(
+        run.admission(action)?
+            .ok_or("admission missing")?
+            .held_resources,
+        lease.held_resources()
+    );
+    assert!(matches!(
+        ExecutionLease::try_acquire(&root.0, &other, action),
+        Err(LeaseError::Busy)
+    ));
+    let fresh = observation(&run, instance, 2);
+    assert!(
+        lease
+            .record_admission(&mut run, fresh, LiveCheckStatus::Satisfied, Vec::new())
+            .is_err()
+    );
+    assert_eq!(
+        run.latest_observation()
+            .ok_or("observation")?
+            .reference
+            .epoch
+            .get(),
+        1
+    );
+    let fresh = observation(&run, instance, 2);
+    let claims = checks(&run, LiveCheckStatus::Satisfied);
+    assert!(lease.record_admission(&mut run, fresh, LiveCheckStatus::Satisfied, claims)?);
+    assert_eq!(run.state(action)?, ActionRunState::Running);
+    assert!(matches!(
+        ExecutionLease::try_acquire(&root.0, &other, action),
+        Err(LeaseError::Busy)
+    ));
+    drop(lease);
+    let next = ExecutionLease::try_acquire(&root.0, &other, action)?;
+    drop(next);
+    Ok(())
+}

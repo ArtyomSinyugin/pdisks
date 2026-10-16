@@ -8,11 +8,14 @@ use rustix::{
     io::Errno,
     process::geteuid,
 };
-use storage_provider::ResourceAccess;
+use storage_provider::{ActionPrerequisite, ResourceAccess};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{ActionId, ActionRunState, ExecutionRun, ExecutionRunError};
+use crate::{
+    ActionId, ActionRunState, AdmissionReport, ExecutionRun, ExecutionRunError, LiveCheck,
+    LiveCheckStatus, LiveObservation,
+};
 
 /// Permanent name shared by every cooperating host, regardless of transient plan/node IDs.
 const LOCK_FILE: &str = "execution.lock";
@@ -35,6 +38,9 @@ pub enum LeaseError {
     /// Acquisition is permitted only for the active Checking action.
     #[error("action must be Checking before acquiring its execution lease")]
     NotChecking,
+    /// A guard acquired for one attempt cannot attest another attempt over the same plan.
+    #[error("execution lease belongs to another run")]
+    RunMismatch,
     /// The requested action or run lifecycle is invalid.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
@@ -132,5 +138,34 @@ impl ExecutionLease {
     /// Describes logical resources covered by the stronger global cooperative exclusion.
     pub fn held_resources(&self) -> &[ResourceAccess] {
         &self.resources
+    }
+
+    /// Records host-supplied evidence with resources covered by this still-held OS guard.
+    /// The host must probe after acquisition and retain the guard through result verification.
+    /// This supplies exclusion only; the host remains responsible for evidence and applicability.
+    pub fn record_admission(
+        &self,
+        run: &mut ExecutionRun,
+        observation: LiveObservation,
+        applicability: LiveCheckStatus,
+        checks: Vec<LiveCheck<ActionPrerequisite>>,
+    ) -> Result<bool, LeaseError> {
+        self.check_run(run)?;
+        Ok(run.record_admission(AdmissionReport {
+            run_id: self.run_id,
+            action: self.action,
+            observation,
+            applicability,
+            held_resources: self.resources.clone(),
+            checks,
+        })?)
+    }
+
+    /// Rejects accidental reuse of a lease with another attempt before changing any run state.
+    fn check_run(&self, run: &ExecutionRun) -> Result<(), LeaseError> {
+        if run.run_id() != self.run_id {
+            return Err(LeaseError::RunMismatch);
+        }
+        Ok(())
     }
 }
