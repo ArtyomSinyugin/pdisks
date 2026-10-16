@@ -435,6 +435,7 @@ mod tests {
                 Node {
                     kind: NodeSpec { kind, size: None },
                     size: NodeFacts {
+                        lvm_active: None,
                         observed_in: None,
                         presence: Presence::Present,
                         identities: Vec::new(),

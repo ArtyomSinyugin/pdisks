@@ -2227,6 +2227,7 @@ mod tests {
                         size: Some(Bytes::new(1_000_000)),
                     },
                     size: NodeFacts {
+                        lvm_active: None,
                         observed_in: None,
                         presence: Presence::Present,
                         identities: Vec::new(),

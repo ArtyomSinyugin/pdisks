@@ -211,6 +211,19 @@ mod tests {
             }],
         };
         assert_eq!(request.created_uuid(&before, &after)?, "new-uuid");
+        let mut observed = after.lvs[0].clone();
+        for (attributes, expected) in [
+            (Some("-wi-a-----"), Some(true)),
+            (Some("-wi-------"), Some(false)),
+            (Some("-wi-s-----"), None),
+            (Some("-wi-I-----"), None),
+            (Some("a"), None),
+            (Some("-wi-a----?"), None),
+            (None, None),
+        ] {
+            observed.attributes = attributes.map(str::to_owned);
+            assert_eq!(observed.activation(), expected, "{attributes:?}");
+        }
         assert!(request.created_uuid(&after, &after).is_err());
         for case in 0..8 {
             let mut changed = after.clone();

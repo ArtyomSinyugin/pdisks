@@ -855,6 +855,25 @@ pub struct LvmLvEntry {
     pub segments: Vec<LvmSegmentEntry>,
 }
 
+impl LvmLvEntry {
+    /// Reads the native lv_attr state column; suspended, malformed and unsupported states stay unknown.
+    pub fn activation(&self) -> Option<bool> {
+        let attributes = self.attributes.as_deref()?.as_bytes();
+        if attributes.len() != 10
+            || !attributes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return None;
+        }
+        match attributes[4] {
+            b'a' => Some(true),
+            b'-' => Some(false),
+            _ => None,
+        }
+    }
+}
+
 /// One physical allocation segment of an LVM logical volume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LvmSegmentEntry {

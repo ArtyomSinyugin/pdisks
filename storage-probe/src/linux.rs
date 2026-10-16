@@ -1130,6 +1130,7 @@ fn enrich_lvm(
                 ..NodeFacts::default()
             });
         let identity = ExternalId::LvmLvUuid(lv.uuid.clone());
+        facts.lvm_active = lv.activation();
         if !facts.identities.contains(&identity) {
             facts.identities.push(identity);
         }
@@ -2869,6 +2870,10 @@ mod tests {
 
         let vg_id = stable_node_id("lvm-vg", "aaaaaaaa");
         let lv_id = block_node_id(Path::new("/dev/dm-0"));
+        assert_eq!(
+            graph.node(&lv_id).and_then(|node| node.size.lvm_active),
+            Some(true)
+        );
         assert!(matches!(
             graph.node(&vg_id).map(|node| &node.kind.kind),
             Some(NodeKind::LvmVg { .. })

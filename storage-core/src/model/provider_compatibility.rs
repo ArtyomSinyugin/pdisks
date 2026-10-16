@@ -56,6 +56,7 @@ fn lsblk_blkid_libfdisk_and_udev_fit_existing_block_types() {
                 NodeKind::Disk,
                 Some(1_000_000_000),
                 NodeFacts {
+                    lvm_active: None,
                     observed_in: Some(ProbeEpoch::new(3)),
                     presence: Presence::Present,
                     identities: vec![

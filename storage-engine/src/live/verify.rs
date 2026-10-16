@@ -128,7 +128,9 @@ fn check_result(
     }
     let source = match condition {
         Postcondition::NodeMatches { id, .. } => *id,
-        Postcondition::NodeSize { node, .. } | Postcondition::NodeReprobed(node) => *node,
+        Postcondition::NodeSize { node, .. }
+        | Postcondition::NodeReprobed(node)
+        | Postcondition::Activation { node, .. } => *node,
         Postcondition::FilesystemLabel { filesystem, .. } => *filesystem,
         Postcondition::NodeAbsent(node) => *node,
         _ => {
@@ -142,6 +144,15 @@ fn check_result(
         Err(status) => return status,
     };
     match condition {
+        Postcondition::Activation { active, .. }
+            if matches!(observed.kind.kind, NodeKind::LvmLv(_)) =>
+        {
+            match observed.size.lvm_active {
+                Some(actual) if actual == *active => LiveCheckStatus::Satisfied,
+                Some(_) => violated("observed LV activation differs from the requested result"),
+                None => unknown("fresh unambiguous native LV activation state is required"),
+            }
+        }
         Postcondition::NodeAbsent(_) => {
             violated("correlated object is still present in the observation")
         }
@@ -323,6 +334,36 @@ mod tests {
                 ),
                 "case {case}"
             );
+        }
+        for (active, expected) in [
+            (Some(true), "satisfied"),
+            (Some(false), "violated"),
+            (None, "unknown"),
+        ] {
+            let mut observed = observation.clone();
+            let mut node = lv.clone();
+            node.size.lvm_active = active;
+            observed.snapshot.graph.replace_existing(actual, node)?;
+            let report = check_observed_postconditions_with_bindings(
+                &baseline,
+                &observed,
+                &[Postcondition::Activation {
+                    node: planned,
+                    active: true,
+                }],
+                std::slice::from_ref(&binding),
+            )?;
+            match expected {
+                "satisfied" => assert_eq!(report.checks[0].status, LiveCheckStatus::Satisfied),
+                "violated" => assert!(matches!(
+                    report.checks[0].status,
+                    LiveCheckStatus::Violated { .. }
+                )),
+                _ => assert!(matches!(
+                    report.checks[0].status,
+                    LiveCheckStatus::Unknown { .. }
+                )),
+            }
         }
         let mut replaced = original.clone();
         replaced.size.identities = vec![ExternalId::LvmVgUuid("replacement-vg".into())];

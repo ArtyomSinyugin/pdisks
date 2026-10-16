@@ -563,6 +563,12 @@ adapter; обычный manifest по-прежнему разрешает тол
 
 ## Наблюдения для нового baseline
 
+`NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
+Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся
+Unknown. Отсутствие endpoint не доказывает inactive. Pure postconditions
+проверяют `Activation` по этому факту и UUID correlation, включая provisional
+bindings созданных LV; это ещё не подтверждение writable block interface.
+
 `ProviderState.lvm_vgs` и `ProbeSnapshot.lvm_vgs` сохраняют исходные LVM VG
 records с соответствующими `NodeId` из того же прохода. `LinuxProbe` вызывает
 каждый адаптер один раз и публикует граф вместе с этими записями; конфликтующие

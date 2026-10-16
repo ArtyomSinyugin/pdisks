@@ -78,6 +78,9 @@ impl ProbeEpoch {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeFacts {
+    /// Fresh provider-reported LV activation; absent or suspended state remains unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lvm_active: Option<bool>,
     pub observed_in: Option<ProbeEpoch>,
     pub presence: Presence,
     pub identities: Vec<ExternalId>,
