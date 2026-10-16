@@ -1,4 +1,4 @@
-//! Typed read-only libblockdev LVM-plugin FFI adapter.
+//! Typed libblockdev LVM-plugin FFI: read-only discovery and the guarded linear-create recipe.
 
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},

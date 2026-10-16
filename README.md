@@ -440,7 +440,7 @@ prerequisites. `BackendCapabilityCheck` отдельно устанавлива�
 и получает run/action, digest плана, backend и live UUID targets. JSON-флага
 разрешения, автоматического допуска по root и production allow-all policy нет.
 Положительный admission пока проверяется только с синтетическими test policies;
-реальные capability/authorization adapters остаются частью следующего native этапа.
+production scope/authorization policies остаются частью следующего native этапа.
 
 `ExecutionCoordinator::execute_action()` выполняет одно действие: lease →
 fresh admission → durable checkpoint → Running → typed synchronous dispatcher →
@@ -482,6 +482,11 @@ linear CreateLv; resolver проверяет точные native-парамет�
 и другие операции получают Unavailable. Полноту scope adapter по умолчанию
 оценивает как Unknown: host обязан отдельно доказать coverage, отсутствие
 внешних writers и авторизацию. Само создание adapter не разрешает запись.
+Disk-free интеграционный тест проходит через настоящий FFI adapter и отдельные
+native queries в fresh probe: проверяет наличие checkpoint и удержание lock до
+вызова, Verified/binding/clear при успехе и сохранение checkpoint с запретом
+retry при ошибке вызова, чтения или результата. Это проверка ABI и runtime
+порядка на mock-библиотеке, а не готовности host-политик или реального LVM.
 
 ## Аварийный checkpoint вместо истории выполнения
 

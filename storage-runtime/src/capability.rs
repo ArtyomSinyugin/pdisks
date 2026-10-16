@@ -16,7 +16,7 @@ pub enum OperationAvailability {
 }
 
 /// Trust boundary for native capability and complete scope/namespace coverage checks.
-/// No production write implementation is supplied until its native recipe is validated.
+/// Native operation support does not establish full scope coverage or authorization.
 pub trait BackendCapabilityCheck {
     /// Checks the exact typed operation, not merely a backend's coarse Probe capability.
     fn availability(

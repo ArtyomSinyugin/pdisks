@@ -24,7 +24,7 @@ pub enum TargetError {
     /// The requested action does not belong to this run.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
-    /// Native endpoint resolution currently supports only CreateLv in an existing VG.
+    /// Native endpoint resolution currently supports only linear CreateLv in an existing VG.
     #[error("target resolution does not support this action")]
     UnsupportedAction,
     /// The resolved native endpoint or parameters fail the narrow recipe's validation.

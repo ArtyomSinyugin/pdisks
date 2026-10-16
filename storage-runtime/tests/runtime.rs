@@ -1446,3 +1446,274 @@ mod native_lvm {
         Ok(())
     }
 }
+
+#[cfg(target_os = "linux")]
+mod native_execution {
+    use super::*;
+    use std::{cell::Cell, fs, path::PathBuf};
+    use storage_core::model::{
+        Dependency, DependencyKind, LvmLv, LvmLvKind, Node, NodeFacts, NodeSpec, Presence,
+    };
+    use storage_engine::{ActionRunState, ExecutionRunError, LiveCheckStatus, LiveObservation};
+    use storage_provider::{ProviderAction, RegisteredBackend};
+    use storage_runtime::{
+        authorization::{ApprovalRequest, AuthorizationContext},
+        capability::{BackendCapabilityCheck, OperationAvailability},
+        checkpoint::{ActiveAttempt, plan_digest},
+        coordinator::{CoordinatorError, ExecutionCoordinator},
+        dispatcher::{BackendDispatcher, DispatchError, ExecutionReceipt},
+        host::LinuxLiveHost,
+        lease::ExecutionRoot,
+        native_lvm::NativeLvmAdapter,
+        targets::ResolvedAction,
+    };
+
+    /// Native LVM reads over the mock library, combined with explicitly synthetic physical backing.
+    struct NativeProvider<'backend> {
+        /// In-memory mock registration, never the installed system plugin.
+        backend: &'backend RegisteredBackend,
+        /// Fixed physical facts and VG node identity, independent of the plan's predicted outputs.
+        template: ProbeSnapshot,
+    }
+
+    impl NativeProvider<'_> {
+        /// Converts fresh native records to graph facts without consulting the execution plan.
+        fn snapshot(&self) -> Result<ProbeSnapshot, Box<dyn Error>> {
+            let native = self.backend.probe_lvm()?;
+            let vg = native.vgs.first().ok_or("mock VG missing")?;
+            let mut state = self.template.clone();
+            let vg_id = state.lvm_vgs[0].node;
+            let mut node = state
+                .current
+                .graph
+                .node(&vg_id)
+                .ok_or("template VG")?
+                .clone();
+            node.kind = NodeSpec {
+                kind: NodeKind::LvmVg {
+                    name: vg.name.clone(),
+                    extent_size: Some(Bytes::new(vg.extent_size)),
+                },
+                size: Some(Bytes::new(vg.size)),
+            };
+            node.size.identities = vec![ExternalId::LvmVgUuid(vg.uuid.clone())];
+            state.current.graph.replace_existing(vg_id, node)?;
+            state.lvm_vgs[0].vg = vg.clone();
+            let (pv_id, mut pv) = state
+                .current
+                .graph
+                .nodes()
+                .find(|(_, node)| matches!(node.kind.kind, NodeKind::LvmPv))
+                .map(|(id, node)| (*id, node.clone()))
+                .ok_or("template PV")?;
+            let record = native.pvs.first().ok_or("native PV")?;
+            pv.kind.size = Some(Bytes::new(record.size));
+            pv.size.identities = vec![ExternalId::LvmPvUuid(record.uuid.clone())];
+            state.current.graph.replace_existing(pv_id, pv)?;
+            for lv in native.lvs {
+                if lv.vg_name != vg.name || lv.segment_type.as_deref() != Some("linear") {
+                    return Err("unsupported fixture LV".into());
+                }
+                let id = NodeId::new();
+                state.current.graph.insert_new(
+                    id,
+                    Node {
+                        kind: NodeSpec {
+                            kind: NodeKind::LvmLv(LvmLv {
+                                name: lv.name,
+                                kind: LvmLvKind::Linear,
+                            }),
+                            size: Some(Bytes::new(lv.size)),
+                        },
+                        size: NodeFacts {
+                            presence: Presence::Present,
+                            identities: vec![ExternalId::LvmLvUuid(lv.uuid)],
+                            ..NodeFacts::default()
+                        },
+                    },
+                )?;
+                state.current.graph.insert_dependency(Dependency {
+                    from: vg_id,
+                    to: id,
+                    kind: DependencyKind::Provides,
+                });
+            }
+            Ok(state)
+        }
+    }
+
+    impl StateProvider for NativeProvider<'_> {
+        /// Distinguishes this mock contribution from installed native providers.
+        fn id(&self) -> &str {
+            "native-lvm-abi-fixture"
+        }
+        /// The mock owns its entire isolated topology for this test.
+        fn responsibility(&self) -> &str {
+            "fixture.native_topology"
+        }
+        /// This test adapter calls a loaded mock library.
+        fn connection_kind(&self) -> ProviderConnectionKind {
+            ProviderConnectionKind::BuiltIn
+        }
+        /// Reads the C fixture anew on every host probe, including after native errors.
+        fn probe(&self) -> Result<ProviderState, ProviderProbeError> {
+            let snapshot = self.snapshot().map_err(|error| {
+                ProviderProbeError::new("fixture.native_probe", error.to_string())
+            })?;
+            Ok(ProviderState {
+                graph: snapshot.current.graph,
+                mounts: snapshot.current.mounts.entries,
+                lvm_vgs: snapshot.lvm_vgs,
+                environment: Some(snapshot.current.environment),
+                diagnostics: vec![],
+            })
+        }
+    }
+
+    /// Synthetic scope policy is confined to this disk-free fixture and never exported as production evidence.
+    struct MockScope<'backend>(NativeLvmAdapter<'backend>);
+    impl BackendCapabilityCheck for MockScope<'_> {
+        /// Operation support still comes from the actual typed adapter and mock C technology query.
+        fn availability(
+            &self,
+            operation: &ProviderAction,
+            observed: &LiveObservation,
+        ) -> OperationAvailability {
+            self.0.availability(operation, observed)
+        }
+        /// The fixture consists only of private memory; it has no external writers or namespaces.
+        fn check_scope(
+            &self,
+            _context: &storage_engine::ExecutionContext<'_>,
+            _action: &ResolvedAction,
+            _observed: &LiveObservation,
+        ) -> LiveCheckStatus {
+            LiveCheckStatus::Satisfied
+        }
+    }
+
+    /// Explicit fixture approval for one immutable document, run and UUID-qualified target.
+    struct MockApproval {
+        /// Exact test execution attempt.
+        run_id: uuid::Uuid,
+        /// Trusted canonical document digest computed before dispatch.
+        digest: String,
+    }
+    impl AuthorizationContext for MockApproval {
+        /// No blanket root/yes grant: the mock request must still match this fixture's intent.
+        fn check(&mut self, request: &ApprovalRequest) -> LiveCheckStatus {
+            if request.run_id == self.run_id
+                && request.plan_digest == self.digest
+                && request.backend.as_str() == "mock-lvm"
+                && request.action_id == ActionId::new(0)
+                && request.targets.len() == 1
+                && request.targets[0].external_ids == vec![ExternalId::LvmVgUuid("vg-uuid".into())]
+            {
+                LiveCheckStatus::Satisfied
+            } else {
+                LiveCheckStatus::Violated {
+                    reason: "fixture approval mismatch".into(),
+                }
+            }
+        }
+    }
+
+    /// Observes the durable checkpoint and held lock immediately before delegating to the native adapter.
+    struct CheckedDispatcher<'backend> {
+        /// Exact native adapter selected during admission.
+        native: NativeLvmAdapter<'backend>,
+        /// Isolated execution root whose marker must already exist.
+        root: PathBuf,
+        /// Counts native adapter entries to prove absence of retries.
+        calls: Rc<Cell<usize>>,
+    }
+    impl BackendDispatcher for CheckedDispatcher<'_> {
+        /// Uses the same registered backend throughout the attempt.
+        fn backend_id(&self) -> &BackendId {
+            self.native.backend_id()
+        }
+        /// Asserts checkpoint ordering before crossing the real Rust-to-C call boundary.
+        fn execute(
+            &mut self,
+            action: &ResolvedAction,
+            progress: &mut dyn FnMut(String) -> Result<(), ExecutionRunError>,
+        ) -> Result<ExecutionReceipt, DispatchError> {
+            let attempt = ActiveAttempt::from_bytes(
+                &fs::read(self.root.join("active-attempt.json"))
+                    .unwrap_or_else(|error| panic!("checkpoint before native call: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("checkpoint parse: {error}"));
+            assert_eq!(attempt.run_id, action.run_id());
+            assert_eq!(attempt.action_id, action.action_id());
+            assert_eq!(&attempt.backend_id, action.backend());
+            assert_eq!(&attempt.action, action.operation());
+            assert_eq!(attempt.targets, action.fingerprints());
+            let root = ExecutionRoot::open(&self.root)
+                .unwrap_or_else(|error| panic!("fixture root: {error}"));
+            assert!(root.try_lock_host().is_err());
+            self.calls.set(self.calls.get() + 1);
+            self.native.execute(action, progress)
+        }
+    }
+
+    /// The full path verifies a native success and retains incidents for native/query/result failures.
+    #[test]
+    fn native_execution_observes_checkpoint_and_never_retries_uncertain_effects()
+    -> Result<(), Box<dyn Error>> {
+        for scenario in [0, 7, 8, 9, 14] {
+            let library = mock_lvm::Fixture::new(scenario)?;
+            let backend = library.registry.backends().next().ok_or("mock backend")?;
+            let (template, _) = fixture()?;
+            let provider = NativeProvider { backend, template };
+            let initial = provider.snapshot()?;
+            let baseline =
+                HistoricalBaseline::from_lvm_observations(initial.current, &initial.lvm_vgs)?;
+            let mut session = PlanSession::new(baseline)?;
+            session.add_lv(
+                session.revision(),
+                initial.lvm_vgs[0].node,
+                "data",
+                Bytes::new(4096),
+            )?;
+            let frozen = session.freeze(session.revision())?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let adapter = NativeLvmAdapter::new(backend)?;
+            let scratch = admission::Scratch::new()?;
+            let calls = Rc::new(Cell::new(0));
+            let dispatcher = CheckedDispatcher {
+                native: adapter,
+                root: scratch.0.clone(),
+                calls: calls.clone(),
+            };
+            let host = LinuxLiveHost::new(
+                LinuxProbe::from_providers(vec![Box::new(provider)]),
+                MockScope(adapter),
+                MockApproval {
+                    run_id: run.run_id(),
+                    digest: plan_digest(run.document())?,
+                },
+            );
+            let mut coordinator =
+                ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+            let result = coordinator.execute_action(&mut run, ActionId::new(0), None);
+            assert_eq!(calls.get(), 1, "scenario {scenario}: {result:?}");
+            if scenario == 0 {
+                assert_eq!(result?, ActionRunState::Verified);
+                assert_eq!(coordinator.bindings().len(), 1);
+                assert!(!scratch.0.join("active-attempt.json").exists());
+                assert!(!run.is_verified());
+            } else {
+                assert!(result.is_err() || result? != ActionRunState::Verified);
+                assert_eq!(run.state(ActionId::new(0))?, ActionRunState::OutcomeUnknown);
+                assert!(coordinator.bindings().is_empty());
+                assert!(scratch.0.join("active-attempt.json").exists());
+                assert!(matches!(
+                    coordinator.execute_action(&mut run, ActionId::new(0), None),
+                    Err(CoordinatorError::Stopped)
+                ));
+                assert_eq!(calls.get(), 1);
+            }
+        }
+        Ok(())
+    }
+}
