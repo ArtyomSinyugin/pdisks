@@ -10,7 +10,8 @@ use crate::{HistoricalBaseline, ProtectedScope};
 
 use super::{
     DraftBuildError, DraftDocument, DraftDocumentError, DraftRevision, MAX_DRAFT_OPERATIONS,
-    OperationId, PlanDraft, PlanOperation, PlanRequest, PreviewState, build_preview,
+    OperationId, PlanDraft, PlanOperation, PlanRequest, PreviewState, RebaseError, RebasePreview,
+    build_preview,
 };
 
 /// Default number of draft snapshots retained on each side of undo/redo history.
@@ -350,6 +351,42 @@ impl PlanSession {
     /// Shared resources and scheduling edges do not imply cancellation dependencies.
     pub fn removal_impact(&self, operation: OperationId) -> Result<Vec<OperationId>, EditError> {
         removal_impact(&self.draft, &[operation])
+    }
+
+    /// Publishes an explicitly reviewed rebase atomically, retaining operation/output IDs.
+    /// Undo/redo restart at this baseline boundary; old frozen documents retain their own context.
+    /// An invalid/blocked reviewed forecast remains editable and never grants write permission.
+    pub fn accept_rebase(
+        &mut self,
+        expected_revision: DraftRevision,
+        review: RebasePreview,
+    ) -> Result<DraftRevision, RebaseError> {
+        if expected_revision != self.revision {
+            return Err(RebaseError::RevisionConflict {
+                expected: expected_revision,
+                actual: self.revision,
+            });
+        }
+        if review.source.revision != self.revision {
+            return Err(RebaseError::RevisionConflict {
+                expected: review.source.revision,
+                actual: self.revision,
+            });
+        }
+        if review.source.session_id != self.id
+            || review.source.baseline != *self.baseline
+            || review.source.draft != self.draft
+        {
+            return Err(RebaseError::SourceContextChanged);
+        }
+        let revision = self.revision.next().ok_or(RebaseError::RevisionExhausted)?;
+        self.baseline = Arc::new(review.baseline);
+        self.draft = review.draft;
+        self.preview = review.preview;
+        self.revision = revision;
+        self.undo.clear();
+        self.redo.clear();
+        Ok(revision)
     }
 
     /// Restores the previous draft and its identities; the publication revision still increases.
@@ -915,6 +952,159 @@ mod tests {
         assert_eq!(session.draft(), &draft);
         assert_eq!(session.preview(), &preview);
         assert_eq!(session.revision(), revision);
+    }
+
+    /// Accepted reviews atomically replace the baseline and establish a fresh undo boundary.
+    #[test]
+    fn accepted_rebase_keeps_ids_and_frozen_context_but_resets_history() {
+        let (mut session, next, _, target) = crate::editing::rebase::tests::session_and_baseline();
+        session.set_history_limit(2);
+        let original = session.draft_document();
+        let frozen = session
+            .freeze(session.revision())
+            .unwrap_or_else(|error| panic!("freeze: {error}"));
+        let json = frozen
+            .document()
+            .canonical_json()
+            .unwrap_or_else(|error| panic!("export: {error}"));
+        let review = session
+            .prepare_rebase(session.revision(), next.clone())
+            .unwrap_or_else(|error| panic!("prepare: {error}"));
+        let expected_draft = review.draft().clone();
+        let expected_preview = review.preview().clone();
+        let revision = session
+            .accept_rebase(session.revision(), review)
+            .unwrap_or_else(|error| panic!("accept: {error}"));
+        assert_eq!(revision.get(), original.revision.get() + 1);
+        assert_eq!(session.id(), original.session_id);
+        assert_eq!(session.baseline(), &next);
+        assert_eq!(session.draft(), &expected_draft);
+        assert_eq!(session.preview(), &expected_preview);
+        assert_eq!(session.history_limit(), 2);
+        assert!(
+            matches!(session.draft().operations[0].request, PlanRequest::CreateLv { vg, .. } if vg == target)
+        );
+        for (before, after) in original
+            .draft
+            .operations
+            .iter()
+            .zip(&session.draft().operations)
+        {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.created_node, after.created_node);
+        }
+        assert_eq!(session.undo(revision), Err(EditError::NoUndo));
+        assert_eq!(session.redo(revision), Err(EditError::NoRedo));
+        assert_eq!(frozen.document().baseline, original.baseline);
+        assert_eq!(
+            frozen
+                .document()
+                .canonical_json()
+                .unwrap_or_else(|error| panic!("old export: {error}")),
+            json
+        );
+        session
+            .set_created_lv_size(
+                session.revision(),
+                session.draft().operations[0].id,
+                Bytes::new(25 * 4 * 1024 * 1024),
+            )
+            .unwrap_or_else(|error| panic!("new edit: {error}"));
+        session
+            .undo(session.revision())
+            .unwrap_or_else(|error| panic!("undo new edit: {error}"));
+        assert_eq!(session.draft(), &expected_draft);
+        assert_eq!(session.baseline(), &next);
+    }
+
+    /// Stale, cross-session, and altered restored contexts cannot publish a reviewed candidate.
+    #[test]
+    fn rejected_rebase_acceptance_preserves_the_entire_session() {
+        let (mut session, next, _, _) = crate::editing::rebase::tests::session_and_baseline();
+        let review = session
+            .prepare_rebase(session.revision(), next)
+            .unwrap_or_else(|error| panic!("prepare: {error}"));
+        let mut other = PlanSession::from_document(session.draft_document())
+            .unwrap_or_else(|error| panic!("restore: {error}"));
+        other.draft.operations[0].request = if let PlanRequest::CreateLv {
+            vg,
+            name,
+            size,
+            layout,
+            activate: _,
+        } = &other.draft.operations[0].request
+        {
+            PlanRequest::CreateLv {
+                vg: *vg,
+                name: name.clone(),
+                size: *size,
+                layout: layout.clone(),
+                activate: false,
+            }
+        } else {
+            panic!("LV request")
+        };
+        let altered = other.draft_document();
+        assert_eq!(
+            other.accept_rebase(other.revision(), review.clone()),
+            Err(RebaseError::SourceContextChanged)
+        );
+        assert_eq!(other.draft_document(), altered);
+        other.id = uuid::Uuid::now_v7();
+        assert_eq!(
+            other.accept_rebase(other.revision(), review.clone()),
+            Err(RebaseError::SourceContextChanged)
+        );
+        apply(
+            &mut session,
+            PlanEdit::SetProtection(ProtectedScope::default()),
+        );
+        let saved = session.draft_document();
+        let preview = session.preview.clone();
+        let undo = session.undo.clone();
+        let redo = session.redo.clone();
+        assert!(matches!(
+            session.accept_rebase(session.revision(), review),
+            Err(RebaseError::RevisionConflict { .. })
+        ));
+        assert_eq!(session.draft_document(), saved);
+        assert_eq!(session.preview, preview);
+        assert_eq!(session.undo, undo);
+        assert_eq!(session.redo, redo);
+    }
+
+    /// Accepting an invalid forecast preserves editability; overflow rejects before publication.
+    #[test]
+    fn accepting_invalid_rebase_and_revision_exhaustion_are_explicit() {
+        let (mut session, mut next, _, _) = crate::editing::rebase::tests::session_and_baseline();
+        next.capacity_evidence[0].available = storage_provider::AllocationQuantity::new(1);
+        let review = session
+            .prepare_rebase(session.revision(), next)
+            .unwrap_or_else(|error| panic!("prepare: {error}"));
+        session
+            .accept_rebase(session.revision(), review)
+            .unwrap_or_else(|error| panic!("accept invalid: {error}"));
+        assert_eq!(session.preview().status(), PreviewStatus::Invalid);
+        assert!(session.preview().calculated().is_none());
+        assert!(session.freeze(session.revision()).is_err());
+        let operation = session.draft().operations[0].id;
+        session
+            .set_created_lv_size(session.revision(), operation, Bytes::new(4 * 1024 * 1024))
+            .unwrap_or_else(|error| panic!("repair request: {error}"));
+        assert!(session.preview().calculated().is_some());
+        session.revision = serde_json::from_value(serde_json::json!(u64::MAX))
+            .unwrap_or_else(|error| panic!("max: {error}"));
+        let mut next = session.baseline().clone();
+        next.id = uuid::Uuid::now_v7();
+        let review = session
+            .prepare_rebase(session.revision(), next)
+            .unwrap_or_else(|error| panic!("prepare at max: {error}"));
+        let saved = session.draft_document();
+        assert_eq!(
+            session.accept_rebase(session.revision(), review),
+            Err(RebaseError::RevisionExhausted)
+        );
+        assert_eq!(session.draft_document(), saved);
     }
 
     /// Malformed baseline evidence prevents opening a session instead of creating a broken editor.

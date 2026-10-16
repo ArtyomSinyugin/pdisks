@@ -24,6 +24,12 @@ pub enum RebaseError {
         /// Current editing revision.
         actual: DraftRevision,
     },
+    /// A review belongs to another session, baseline, or restored draft content.
+    #[error("rebase review no longer matches the source editing context")]
+    SourceContextChanged,
+    /// Publishing the accepted review must not wrap the revision counter.
+    #[error("draft revision exhausted")]
+    RevisionExhausted,
     /// A new context must not reuse the immutable historical baseline identity.
     #[error("rebase requires a new baseline identity")]
     SameBaselineIdentity,
