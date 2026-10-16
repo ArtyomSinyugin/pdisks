@@ -314,6 +314,22 @@ impl RegisteredBackend {
         }
     }
 
+    /// Checks the exact linear-create ABI and native CREATE/QUERY technology availability.
+    /// A successful result does not attest scope, authorization, or stable target identity.
+    pub fn check_linear_lv_support(&self) -> Result<(), LvmWriteError> {
+        if !self
+            .manifest
+            .capabilities
+            .contains(&BackendCapability::Execute)
+        {
+            return Err(LvmWriteError::ExecutionNotDeclared);
+        }
+        match &self.access {
+            LoadedBackendAccess::Library { library } => Ok(library.check_linear_lv_support()?),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
+        }
+    }
+
     /// Reads Btrfs subvolumes below mounted filesystem roots.
     pub fn probe_btrfs(
         &self,
@@ -1401,6 +1417,28 @@ mod tests {
             manifest_version: BACKEND_MANIFEST_VERSION,
             backends,
         }
+    }
+
+    /// Execute opt-in and a native library are both mandatory for the linear-create adapter.
+    #[test]
+    fn native_lvm_support_requires_execution_manifest_and_library() {
+        let mut backend = RegisteredBackend {
+            manifest: manifest("fake-lvm", "/bin/true"),
+            manifest_path: PathBuf::from("/fixture/providers.json"),
+            access: LoadedBackendAccess::Executable,
+        };
+        assert!(matches!(
+            backend.check_linear_lv_support(),
+            Err(LvmWriteError::ExecutionNotDeclared)
+        ));
+        backend
+            .manifest
+            .capabilities
+            .insert(BackendCapability::Execute);
+        assert!(matches!(
+            backend.check_linear_lv_support(),
+            Err(LvmWriteError::Native(NativeProbeError::LibraryRequired))
+        ));
     }
 
     #[test]

@@ -344,6 +344,10 @@ protects plugin lifecycle only and does not authorize storage writes.
 an existing UUID-qualified VG. Its pure preflight requires a unique VG, an
 unused LV name, sufficient free space and an exact extent-aligned size.
 Constructing or checking a request does not authorize writes.
+`RegisteredBackend::check_linear_lv_support()` additionally requires explicit
+manifest `execute` capability, all read/create symbols, successful plugin init,
+and libblockdev BASIC CREATE/QUERY support. It never supplies scope or approval
+evidence; ordinary probe-only manifests remain unable to execute.
 
 One operation has one owning backend. A second library may enrich discovery,
 but it must not become an alternative executor for the same action.

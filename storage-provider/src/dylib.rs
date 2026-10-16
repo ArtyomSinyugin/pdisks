@@ -148,6 +148,11 @@ impl LoadedLibrary {
         lvm::probe(&self.handle)
     }
 
+    /// Resolves the narrow create recipe and queries host technology support without writing.
+    pub(super) fn check_linear_lv_support(&self) -> Result<(), NativeProbeError> {
+        lvm::check_linear_lv_support(&self.handle)
+    }
+
     /// Reads Btrfs subvolumes below mounted filesystem roots.
     pub(super) fn probe_btrfs(
         &self,

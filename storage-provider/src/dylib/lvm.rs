@@ -108,6 +108,58 @@ type GErrorFree = unsafe extern "C" fn(*mut GErrorRaw);
 /// Releases one record owned by a terminated native array.
 type ItemFree<T> = unsafe extern "C" fn(*mut T);
 
+/// Exact libblockdev linear-create ABI; no PV list or extra arguments are supplied by this recipe.
+type Create = unsafe extern "C" fn(
+    *const c_char,
+    *const c_char,
+    u64,
+    *const c_char,
+    *const *const c_char,
+    *const *const c_void,
+    *mut *mut GErrorRaw,
+) -> c_int;
+/// BDLVMTech is a C enum; BDLVMTechMode is a 64-bit bitmask in the public API.
+type TechAvailable = unsafe extern "C" fn(c_int, u64, *mut *mut GErrorRaw) -> c_int;
+
+/// Resolves the exact write symbol before admission; missing symbols cannot surface after arm.
+fn load_create(library: &Library) -> Result<Symbol<'_, Create>, NativeProbeError> {
+    // SAFETY: Create matches bd_lvm_lvcreate in the installed libblockdev lvm.h ABI.
+    unsafe { load_symbol(library, b"bd_lvm_lvcreate\0") }
+}
+
+/// Checks required symbols, plugin initialization, and BASIC CREATE/QUERY without mutating storage.
+pub(super) fn check_linear_lv_support(library: &Library) -> Result<(), NativeProbeError> {
+    let _exclusive = LVM_SESSION
+        .lock()
+        .map_err(|_| call_failed("LVM plugin session lock"))?;
+    let api = Api::load(library)?;
+    let _create = load_create(library)?;
+    // SAFETY: TechAvailable matches bd_lvm_is_tech_avail in lvm.h; the library remains loaded.
+    let available: Symbol<'_, TechAvailable> =
+        unsafe { load_symbol(library, b"bd_lvm_is_tech_avail\0") }?;
+    // SAFETY: standalone init has no arguments and the process-local session lock is held.
+    if unsafe { (api.init)() } == 0 {
+        return Err(call_failed("bd_lvm_init"));
+    }
+    let _session = Session { api: &api };
+    check_create_technology(&available, &api.g_error_free)
+}
+
+/// Rejects either a false result or GError, including inconsistent native success-with-error.
+fn check_create_technology(
+    available: &TechAvailable,
+    free: &GErrorFree,
+) -> Result<(), NativeProbeError> {
+    let mut error = ErrorGuard::new(free);
+    // SAFETY: BASIC=0 and CREATE|QUERY=(1<<0)|(1<<4) are lvm.h constants; GError starts null.
+    let result = unsafe { available(0, (1 << 0) | (1 << 4), &mut error.pointer) };
+    error.check("bd_lvm_is_tech_avail")?;
+    if result == 0 {
+        return Err(call_failed("bd_lvm_is_tech_avail"));
+    }
+    Ok(())
+}
+
 /// Symbols used by the libblockdev LVM adapter.
 struct Api<'library> {
     init: Symbol<'library, Init>,
@@ -459,6 +511,30 @@ fn invalid(operation: &'static str) -> NativeProbeError {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Mock confirms that the adapter asks for BASIC CREATE and QUERY together.
+    extern "C" fn basic_create_query(tech: c_int, mode: u64, _error: *mut *mut GErrorRaw) -> c_int {
+        i32::from(tech == 0 && mode == 17)
+    }
+
+    /// Mock models a missing native dependency without allocating a GError.
+    extern "C" fn unavailable_technology(
+        _tech: c_int,
+        _mode: u64,
+        _error: *mut *mut GErrorRaw,
+    ) -> c_int {
+        0
+    }
+
+    /// Native false cannot be converted into write availability, even without a GError.
+    #[test]
+    fn technology_requires_basic_create_and_query() {
+        let free: GErrorFree = free_error;
+        let supported: TechAvailable = basic_create_query;
+        let missing: TechAvailable = unavailable_technology;
+        assert!(check_create_technology(&supported, &free).is_ok());
+        assert!(check_create_technology(&missing, &free).is_err());
+    }
 
     /// Number of simulated GError releases; only the error-guard test uses this counter.
     static ERRORS_FREED: AtomicUsize = AtomicUsize::new(0);

@@ -6,6 +6,9 @@ use thiserror::Error;
 /// A rejected request or observation must never reach the native mutator.
 #[derive(Debug, Error)]
 pub enum LvmWriteError {
+    /// The trusted manifest did not opt this backend into execution.
+    #[error("backend manifest does not declare execution capability")]
+    ExecutionNotDeclared,
     /// Names, identity, or size cannot be represented by this conservative recipe.
     #[error("invalid native linear LV request")]
     InvalidRequest,
@@ -78,7 +81,7 @@ impl LinearLvRequest {
             || vg.uuid != self.vg_uuid
             || vg.exported
             || vg.extent_size == 0
-            || self.size % vg.extent_size != 0
+            || !self.size.is_multiple_of(vg.extent_size)
             || vg.free < self.size
             || vg.free > vg.size
             || state
