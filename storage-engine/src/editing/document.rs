@@ -11,8 +11,8 @@ use crate::{
 };
 
 use super::{
-    DraftBuildError, DraftRevision, OperationActions, OperationDiagnostic, PlanOperation,
-    PlanSession, PreviewState, PreviewStatus, RequestCoverage,
+    DraftBuildError, DraftRevision, OperationActions, OperationDiagnostic, OperationId,
+    PlanOperation, PlanSession, PreviewState, PreviewStatus, RequestCoverage,
 };
 
 /// Output preview schema, independent of editable drafts and frozen plan documents.
@@ -206,7 +206,8 @@ mod tests {
     }
 }
 
-/// Version of persisted editable requests, separate from display and execution schemas.
+/// Version of persisted editable requests; version 2 adds exact partition creation.
+/// Legacy version 1 remains readable with its original request catalogue.
 pub const DRAFT_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum UTF-8 size accepted by the draft JSON boundary, including its historical snapshot.
@@ -240,6 +241,14 @@ pub enum DraftDocumentError {
     /// The request/document schema is unsupported.
     #[error("unsupported draft schema version {0}")]
     SchemaVersion(u64),
+    /// A request is newer than the catalogue declared by the document.
+    #[error("operation {operation:?} is unavailable in draft schema {version}")]
+    RequestVersion {
+        /// Declared request catalogue.
+        version: u32,
+        /// Request requiring a newer catalogue.
+        operation: OperationId,
+    },
     /// A saved session must retain a non-nil identity.
     #[error("draft session identity must not be nil")]
     InvalidSessionIdentity,
@@ -265,6 +274,7 @@ impl DraftDocument {
         if let Some(version) = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
+            && version != 1
             && version != u64::from(DRAFT_SCHEMA_VERSION)
         {
             return Err(DraftDocumentError::SchemaVersion(version));
@@ -289,10 +299,23 @@ impl DraftDocument {
 
     /// Checks public/deserialized data again before it can become a live editing session.
     pub(super) fn validate(&self) -> Result<(), DraftDocumentError> {
-        if self.schema_version != DRAFT_SCHEMA_VERSION {
+        if self.schema_version != 1 && self.schema_version != DRAFT_SCHEMA_VERSION {
             return Err(DraftDocumentError::SchemaVersion(u64::from(
                 self.schema_version,
             )));
+        }
+        if self.schema_version == 1
+            && let Some(operation) = self.draft.operations.iter().find(|operation| {
+                matches!(
+                    operation.request,
+                    super::PlanRequest::CreatePartition { .. }
+                )
+            })
+        {
+            return Err(DraftDocumentError::RequestVersion {
+                version: 1,
+                operation: operation.id,
+            });
         }
         if self.session_id.is_nil() {
             return Err(DraftDocumentError::InvalidSessionIdentity);
@@ -333,6 +356,53 @@ mod draft_tests {
         build::tests::{baseline, lv_request, workflow},
     };
     use storage_core::model::{Bytes, FilesystemKind, NodeId};
+
+    /// Legacy drafts resume without changing identities and export with the current catalogue.
+    #[test]
+    fn legacy_request_catalogue_remains_readable_but_cannot_claim_partition_support() {
+        let mut document = PlanSession::new(baseline()).unwrap().draft_document();
+        document.schema_version = 1;
+        document.draft = workflow();
+        let json = document.to_json().unwrap();
+        let decoded = DraftDocument::from_json(&json).unwrap();
+        assert_eq!(decoded, document);
+        let session = PlanSession::from_document(decoded).unwrap();
+        assert_eq!(session.draft(), &document.draft);
+        assert_eq!(session.id(), document.session_id);
+        assert_eq!(session.revision(), document.revision);
+        assert_eq!(
+            session.draft_document().schema_version,
+            DRAFT_SCHEMA_VERSION
+        );
+
+        let table = document.draft.operations[0].request.referenced_nodes()[0];
+        let operation = super::super::PlanOperation::new(PlanRequest::CreatePartition {
+            table,
+            number: std::num::NonZeroU32::new(1).unwrap(),
+            offset: Bytes::new(1024),
+            size: Bytes::new(2048),
+            role: None,
+            attributes: storage_core::model::PartitionAttributes::default(),
+        });
+        document.draft.operations = vec![operation];
+        let untrusted = serde_json::to_string(&document).unwrap();
+        assert!(matches!(
+            DraftDocument::from_json(&untrusted),
+            Err(DraftDocumentError::RequestVersion { version: 1, .. })
+        ));
+        assert!(document.to_json().is_err());
+        assert!(PlanSession::from_document(document.clone()).is_err());
+        document.schema_version = DRAFT_SCHEMA_VERSION;
+        let json = document.to_json().unwrap();
+        assert_eq!(DraftDocument::from_json(&json).unwrap(), document);
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["draft"]["operations"][0]["request"]["create_partition"]["number"] =
+            serde_json::json!(0);
+        assert!(matches!(
+            DraftDocument::from_json(&value.to_string()),
+            Err(DraftDocumentError::Json(_))
+        ));
+    }
 
     /// Resuming recalculates forecasts, retains all IDs/revisions, and starts with empty history.
     #[test]
