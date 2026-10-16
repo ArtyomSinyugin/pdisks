@@ -6,6 +6,7 @@ use std::{
     fs,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
+    sync::Mutex,
 };
 use storage_core::model::Bytes;
 use storage_engine::{
@@ -14,6 +15,9 @@ use storage_engine::{
 };
 use storage_runtime::lease::{ExecutionLease, ExecutionRoot, LeaseError};
 use uuid::Uuid;
+
+/// Fork temporarily inherits other threads' CLOEXEC fds before exec; isolate release assertions.
+static PROCESS_TESTS: Mutex<()> = Mutex::new(());
 
 /// Owns a fresh private directory, removed only after all test guards have been dropped.
 struct Scratch(PathBuf);
@@ -50,6 +54,9 @@ fn fixture() -> Result<(FrozenPlan, ExecutionRun), Box<dyn Error>> {
 /// Independently opened handles and different plans contend on the same OS lock.
 #[test]
 fn host_lease_serializes_runs_and_releases_on_drop() -> Result<(), Box<dyn Error>> {
+    let _process = PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let root = Scratch::new()?;
     let (_, run) = fixture()?;
     let (_, other) = fixture()?;
@@ -84,6 +91,9 @@ fn host_lease_serializes_runs_and_releases_on_drop() -> Result<(), Box<dyn Error
 /// Public roots, symlinks, and linked lock files cannot silently select another lock domain.
 #[test]
 fn lease_rejects_untrusted_paths_and_nonchecking_actions() -> Result<(), Box<dyn Error>> {
+    let _process = PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     use std::os::unix::fs::symlink;
     let root = Scratch::new()?;
     let (frozen, run) = fixture()?;
@@ -164,6 +174,9 @@ fn checks(
 /// The OS guard remains held through in-memory admission, completion, and verification.
 #[test]
 fn lease_remains_held_through_result_verification() -> Result<(), Box<dyn Error>> {
+    let _process = PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     use storage_engine::{
         AdmissionReport, BackendCompletion, BackendOutcome, LiveCheck, LiveCheckStatus,
         VerificationReport,
@@ -255,6 +268,9 @@ fn lease_subprocess_child() -> Result<(), Box<dyn Error>> {
 /// Actual child processes see contention and release the kernel lock even without Rust cleanup.
 #[test]
 fn lease_excludes_other_processes_and_survives_process_exit() -> Result<(), Box<dyn Error>> {
+    let _process = PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let root = Scratch::new()?;
     let (_, run) = fixture()?;
     let action = ActionId::new(0);
@@ -289,6 +305,9 @@ fn lease_excludes_other_processes_and_survives_process_exit() -> Result<(), Box<
 /// Incident inspection and action execution share exclusion without needing a historical run.
 #[test]
 fn host_lock_and_action_lease_share_one_lock() -> Result<(), Box<dyn Error>> {
+    let _process = PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let scratch = Scratch::new()?;
     let root = ExecutionRoot::open(&scratch.0)?;
     let (_, run) = fixture()?;
@@ -315,6 +334,9 @@ fn host_lock_and_action_lease_share_one_lock() -> Result<(), Box<dyn Error>> {
 /// Later path replacement cannot redirect operations through the previously checked directory fd.
 #[test]
 fn root_retains_the_opened_directory() -> Result<(), Box<dyn Error>> {
+    let _process = PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let scratch = Scratch::new()?;
     let path = scratch.0.join("root");
     fs::DirBuilder::new().mode(0o700).create(&path)?;

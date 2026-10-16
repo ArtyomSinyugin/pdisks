@@ -44,7 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ActionId, ActionRunState, AdmissionReport, ExecutionRun, HistoricalBaseline,
         LiveCheckStatus, editing::PlanSession, live::ProbedObservation,
     };
-    use storage_runtime::lease::{ExecutionLease, ExecutionRoot, LeaseError};
+    use storage_runtime::{
+        checkpoint::CheckpointStore,
+        lease::{ExecutionLease, ExecutionRoot, LeaseError},
+    };
     use uuid::Uuid;
 
     let mut arguments = std::env::args_os().skip(1);
@@ -78,6 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let action = ActionId::new(0);
     run.begin_check(action)?;
     let guard = ExecutionLease::try_acquire(&root, &run, action)?;
+    let checkpoint = CheckpointStore::new(guard.host_lock());
+    if checkpoint.inspect()?.is_some() {
+        return Err("unresolved active attempt; inspect the incident before execution".into());
+    }
     let mut contender = ExecutionRun::new(frozen.document())?;
     contender.begin_check(action)?;
     assert!(matches!(
@@ -108,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         held_resources: guard.held_resources().to_vec(),
         checks,
     })?);
-    assert!(!directory.join("active-attempt.json").exists());
+    assert!(checkpoint.inspect()?.is_none());
     assert_eq!(run.state(action)?, ActionRunState::Failed);
     assert_eq!(
         run.latest_observation()

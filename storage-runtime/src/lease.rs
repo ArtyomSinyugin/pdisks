@@ -67,6 +67,10 @@ impl ExecutionRoot {
 
     /// Acquires the shared nonblocking lock without reconstructing any execution run.
     pub fn try_lock_host(&self) -> Result<HostExecutionLock, LeaseError> {
+        let info = fstat(&self.directory).map_err(io::Error::from)?;
+        if info.st_uid != geteuid().as_raw() || info.st_mode & 0o077 != 0 {
+            return Err(LeaseError::InsecureDirectory);
+        }
         let lock = openat(
             &self.directory,
             LOCK_FILE,

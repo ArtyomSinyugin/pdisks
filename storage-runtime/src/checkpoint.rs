@@ -11,6 +11,11 @@ use storage_provider::{BackendId, LvmAction, ProviderAction};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+mod store;
+#[cfg(target_os = "linux")]
+pub use store::CheckpointStore;
+
 /// Initial checkpoint schema, independent of plan and provider-action versions.
 pub const CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 /// Maximum encoded checkpoint size, enforced before parsing or publication.
@@ -46,6 +51,18 @@ pub enum CheckpointError {
     /// Capture must occur after full admission and before the invocation boundary.
     #[error("checkpoint capture requires an Admitted action")]
     NotAdmitted,
+    /// An unresolved attempt already occupies the only active checkpoint name.
+    #[error("an active checkpoint already exists")]
+    AlreadyActive,
+    /// Clear requires an existing checkpoint with the exact requested run/action identity.
+    #[error("checkpoint does not belong to this run and action")]
+    AttemptMismatch,
+    /// Files must be private, owned, singly linked regular files.
+    #[error("invalid checkpoint file")]
+    InvalidFile,
+    /// A failed mutation may have changed durable state; the host must stop this run.
+    #[error("checkpoint store cannot mutate after an I/O failure")]
+    Poisoned,
     /// Run identity or state could not be read.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
