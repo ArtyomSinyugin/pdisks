@@ -16,6 +16,7 @@ use crate::{
     ActionId, ActionRunState, AdmissionReport, ExecutionRun, ExecutionRunError, LiveCheck,
     LiveCheckStatus, LiveObservation,
     journal::{DurableJournal, JournalError},
+    live::{ProbeObservationError, ProbedObservation},
 };
 
 /// Permanent name shared by every cooperating host, regardless of transient plan/node IDs.
@@ -48,6 +49,9 @@ pub enum LeaseError {
     /// Intent was not durably acknowledged; the host must not dispatch.
     #[error(transparent)]
     Journal(#[from] JournalError),
+    /// Collection or interpretation of the actual provider pass failed before admission.
+    #[error(transparent)]
+    Probe(#[from] ProbeObservationError),
 }
 
 /// Exclusive cooperative lease bound to one run/action; dropping it releases the OS lock.
@@ -163,6 +167,39 @@ impl ExecutionLease {
             held_resources: self.resources.clone(),
             checks,
         })?)
+    }
+
+    /// Collects a new provider pass under this guard and records conservative preflight evidence.
+    /// This never admits dispatch: native capabilities and authorization remain unimplemented.
+    /// Known prerequisite violations still stop the run; incomplete checks retain Checking.
+    pub fn record_probe_preflight(
+        &self,
+        run: &mut ExecutionRun,
+        probe: &storage_probe::LinuxProbe<'_>,
+    ) -> Result<(), LeaseError> {
+        self.check_run(run)?;
+        if run.state(self.action)? != ActionRunState::Checking {
+            return Err(LeaseError::NotChecking);
+        }
+        if run
+            .latest_observation()
+            .is_some_and(|latest| latest.reference.probe_instance != probe.instance_id())
+        {
+            return Err(ExecutionRunError::StaleObservation.into());
+        }
+        let publication = ProbedObservation::collect(probe)?;
+        let context = run.context();
+        let prerequisites = &context.plan.actions()[self.action.get() as usize]
+            .informational_contract
+            .prerequisites;
+        let report = publication
+            .check_prerequisites(context.historical_baseline, prerequisites)
+            .map_err(ProbeObservationError::from)?;
+        // shortcut: keep applicability unknown until native capability and authorization checks exist.
+        self.record_admission(run, publication.into_observation(), LiveCheckStatus::Unknown {
+            required_evidence: "native capability, scope applicability, and authorization checks are not configured".into(),
+        }, report.checks)?;
+        Ok(())
     }
 
     /// Syncs this admitted action's invocation intent while the OS lease remains held.

@@ -189,3 +189,138 @@ fn missing_ambiguous_and_changed_geometry_measurements_remain_unknown() -> Resul
     }
     Ok(())
 }
+
+/// A leased preflight really probes, rejects probe substitution, and never manufactures admission.
+#[cfg(target_os = "linux")]
+#[test]
+fn leased_preflight_publishes_fresh_checks_without_enabling_dispatch() -> Result<(), Box<dyn Error>>
+{
+    use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
+    use storage_engine::{
+        ActionId, ActionRunState, ExecutionRun, ExecutionRunError,
+        editing::PlanSession,
+        journal::{DurableJournal, JournalLog, RecoveryStatus},
+        leases::{ExecutionLease, LeaseError},
+    };
+    /// Cleans only this test's private scratch root after its guards and journals have dropped.
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        /// Production code retains the persistent lock inode; test cleanup follows guard teardown.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Scratch(
+        std::env::temp_dir().join(format!("pdisks-preflight-test-{}", uuid::Uuid::now_v7())),
+    );
+    fs::DirBuilder::new().mode(0o700).create(&root.0)?;
+    let source = fixture()?;
+    let vg = source.lvm_vgs[0].node;
+    let baseline =
+        HistoricalBaseline::from_lvm_observations(source.current.clone(), &source.lvm_vgs)?;
+    let mut session = PlanSession::new(baseline)?;
+    session.add_lv(session.revision(), vg, "data", Bytes::new(16 * 1024 * 1024))?;
+    let frozen = session.freeze(session.revision())?;
+    let mut run = ExecutionRun::new(frozen.document())?;
+    let mut other = ExecutionRun::new(frozen.document())?;
+    let path = root.0.join("run.jsonl");
+    let mut journal = DurableJournal::create(&path, &frozen, &run)?;
+    let action = ActionId::new(0);
+    run.begin_check(action)?;
+    other.begin_check(action)?;
+    let guard = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let state = RefCell::new(source.clone());
+    let calls = Cell::new(0);
+    let probe = LinuxProbe::from_providers(vec![Box::new(Recorded {
+        state: &state,
+        calls: &calls,
+    })]);
+    assert!(matches!(
+        guard.record_probe_preflight(&mut other, &probe),
+        Err(LeaseError::RunMismatch)
+    ));
+    assert_eq!(calls.get(), 0);
+    guard.record_probe_preflight(&mut run, &probe)?;
+    assert_eq!(calls.get(), 1);
+    assert_eq!(run.state(action)?, ActionRunState::Checking);
+    let admission = run.admission(action)?.ok_or("preflight")?;
+    assert!(matches!(
+        admission.applicability,
+        LiveCheckStatus::Unknown { .. }
+    ));
+    assert!(
+        admission
+            .checks
+            .iter()
+            .all(|check| check.status == LiveCheckStatus::Satisfied)
+    );
+    assert_eq!(admission.held_resources, guard.held_resources());
+    assert_eq!(
+        run.latest_observation()
+            .ok_or("actual snapshot")?
+            .snapshot
+            .graph
+            .nodes()
+            .len(),
+        1
+    );
+    let retained = run.latest_observation().cloned();
+    let events = run.events_since(0).count();
+    let other_probe = LinuxProbe::from_providers(vec![Box::new(Recorded {
+        state: &state,
+        calls: &calls,
+    })]);
+    assert!(matches!(
+        guard.record_probe_preflight(&mut run, &other_probe),
+        Err(LeaseError::Run(ExecutionRunError::StaleObservation))
+    ));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(run.latest_observation(), retained.as_ref());
+    assert_eq!(run.events_since(0).count(), events);
+    state
+        .borrow_mut()
+        .current
+        .graph
+        .insert_dependency(storage_core::model::Dependency {
+            from: NodeId::new(),
+            to: NodeId::new(),
+            kind: storage_core::model::DependencyKind::Backs,
+        });
+    assert!(guard.record_probe_preflight(&mut run, &probe).is_err());
+    assert_eq!(run.latest_observation(), retained.as_ref());
+    assert_eq!(run.events_since(0).count(), events);
+    *state.borrow_mut() = source;
+    state.borrow_mut().lvm_vgs[0].vg.free = 0;
+    guard.record_probe_preflight(&mut run, &probe)?;
+    assert_eq!(calls.get(), 3);
+    assert_eq!(run.state(action)?, ActionRunState::Failed);
+    assert_eq!(
+        run.latest_observation()
+            .ok_or("fresh snapshot")?
+            .reference
+            .epoch
+            .get(),
+        3
+    );
+    assert!(
+        run.admission(action)?
+            .ok_or("failed preflight")?
+            .checks
+            .iter()
+            .any(|check| matches!(check.status, LiveCheckStatus::Violated { .. }))
+    );
+    assert!(guard.record_dispatch_intent(&mut journal, &run).is_err());
+    journal.flush_events(&run)?;
+    assert_eq!(
+        JournalLog::read(&path)?.review()?.actions[0].status,
+        RecoveryStatus::NoInvocationRecorded
+    );
+    assert!(matches!(
+        ExecutionLease::try_acquire(&root.0, &other, action),
+        Err(LeaseError::Busy)
+    ));
+    assert!(guard.record_probe_preflight(&mut run, &probe).is_err());
+    assert_eq!(calls.get(), 3);
+    drop(guard);
+    Ok(())
+}
