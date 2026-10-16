@@ -262,7 +262,7 @@ Native-режим выполняет read-only probe и выводит preview �
 | Проверка фактического результата | [ExecutionRun](storage-engine/src/execution.rs): фактический снимок сохраняется и при ошибке, прогноз на него не накладывается; успешный backend и проверенные действия ещё требуют отдельной проверки конечной цели |
 
 В указанных модулях находятся регрессионные тесты этих сценариев. Формат плана
-имеет `PLAN_SCHEMA_VERSION = 3`, каталог контрактов — `ACTION_SEMANTICS_VERSION = 5`.
+имеет `PLAN_SCHEMA_VERSION = 3`, каталог контрактов — `ACTION_SEMANTICS_VERSION = 6`.
 `requested_goal.mounts` содержит отдельные массивы `runtime` и `persistent`;
 `MountEntry` не содержит прежнего флага `persistent`. `PlanDocument::from_json`
 явно отвергает версии 1 и 2 до разбора старой формы монтирований. Устаревшие поля

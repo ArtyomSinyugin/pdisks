@@ -68,12 +68,88 @@ pub fn validate_provider_action(action: &ProviderAction, graph: &NodeGraph) -> V
                 }]
             }
         }
-        ProviderAction::Partition(
-            PartitionAction::CreateTable { .. } | PartitionAction::Create { .. },
-        )
+        ProviderAction::Partition(action @ PartitionAction::Create { .. }) => {
+            validate_partition_create(action, graph)
+        }
+        ProviderAction::Partition(PartitionAction::CreateTable { .. })
         | ProviderAction::Filesystem(_)
         | ProviderAction::Btrfs(_) => Vec::new(),
     }
+}
+
+/// Rejects provably invalid extents; backend allocation/alignment evidence remains required.
+fn validate_partition_create(action: &PartitionAction, graph: &NodeGraph) -> Vec<Diagnostic> {
+    let PartitionAction::Create {
+        table,
+        number,
+        offset,
+        size,
+        ..
+    } = action
+    else {
+        return Vec::new();
+    };
+    let reject = |code: &str, message: &str| {
+        vec![Diagnostic {
+            code: code.to_owned(),
+            severity: DiagnosticSeverity::Error,
+            subjects: vec![DiagnosticSubject::Node(*table)],
+            message: message.to_owned(),
+            evidence: None,
+            suggested_remedy: None,
+        }]
+    };
+    let Some(end) = offset.as_u64().checked_add(size.as_u64()) else {
+        return reject(
+            "partition.create.invalid_extent",
+            "partition byte range overflows",
+        );
+    };
+    if size.as_u64() == 0
+        || graph
+            .node(table)
+            .and_then(|node| node.kind.size)
+            .is_some_and(|capacity| end > capacity.as_u64())
+    {
+        return reject(
+            "partition.create.invalid_extent",
+            "partition must have nonzero size and fit within known table capacity",
+        );
+    }
+    for edge in graph
+        .dependencies()
+        .filter(|edge| edge.from == *table && matches!(edge.kind, DependencyKind::Contains { .. }))
+    {
+        let Some(node) = graph.node(&edge.to) else {
+            continue;
+        };
+        let NodeKind::Partition {
+            number: occupied_number,
+            offset: occupied_offset,
+            ..
+        } = node.kind.kind
+        else {
+            continue;
+        };
+        if number == &occupied_number {
+            return reject(
+                "partition.create.duplicate_number",
+                "partition number is already used in this table",
+            );
+        }
+        if let Some(occupied_size) = node.kind.size {
+            let occupied_end = occupied_offset.as_u64().checked_add(occupied_size.as_u64());
+            if occupied_end.is_none_or(|occupied_end| {
+                offset.as_u64() < occupied_end && occupied_offset.as_u64() < end
+            }) {
+                return reject(
+                    "partition.create.overlap",
+                    "partition overlaps a known occupied or overflowing byte range",
+                );
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Rejects ambiguous lexical paths without resolving filesystem state or symbolic links.
@@ -564,6 +640,75 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Invalid ranges and occupied numbers are rejected, while adjacent ranges remain possible.
+    #[test]
+    fn partition_creation_checks_known_ranges_and_numbers() {
+        let table = NodeId::new();
+        let occupied = NodeId::new();
+        let mut graph = NodeGraph::new();
+        for (id, kind, size) in [
+            (
+                table,
+                NodeKind::PartitionTable(PartitionTable::Gpt),
+                Some(Bytes::new(1000)),
+            ),
+            (
+                occupied,
+                NodeKind::Partition {
+                    number: std::num::NonZeroU32::new(1).unwrap(),
+                    offset: Bytes::new(100),
+                    role: None,
+                    attributes: PartitionAttributes::default(),
+                },
+                Some(Bytes::new(100)),
+            ),
+        ] {
+            graph
+                .insert_new(
+                    id,
+                    Node {
+                        kind: NodeSpec { kind, size },
+                        size: NodeFacts::default(),
+                    },
+                )
+                .unwrap();
+        }
+        graph.insert_dependency(Dependency {
+            from: table,
+            to: occupied,
+            kind: DependencyKind::Contains {
+                offset: Bytes::new(100),
+            },
+        });
+        for (number, offset, size, expected) in [
+            (2, 0, 0, Some("partition.create.invalid_extent")),
+            (2, u64::MAX, 2, Some("partition.create.invalid_extent")),
+            (2, 900, 101, Some("partition.create.invalid_extent")),
+            (1, 200, 100, Some("partition.create.duplicate_number")),
+            (2, 99, 2, Some("partition.create.overlap")),
+            (2, 150, 10, Some("partition.create.overlap")),
+            (2, 199, 2, Some("partition.create.overlap")),
+            (2, 0, 100, None),
+            (2, 200, 800, None),
+        ] {
+            let action = ProviderAction::Partition(PartitionAction::Create {
+                table,
+                planned_node_id: NodeId::new(),
+                number: std::num::NonZeroU32::new(number).unwrap(),
+                offset: Bytes::new(offset),
+                size: Bytes::new(size),
+                role: None,
+                attributes: PartitionAttributes::default(),
+            });
+            let diagnostics = validate_provider_action(&action, &graph);
+            assert_eq!(
+                diagnostics.first().map(|d| d.code.as_str()),
+                expected,
+                "{action:?}"
+            );
         }
     }
 
