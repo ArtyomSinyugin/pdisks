@@ -69,7 +69,8 @@ pub struct ObservationReference {
 
 /// Actual published observation supplied by the trusted runtime host.
 /// Constructing this value is not itself evidence that a probe took place.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LiveObservation {
     /// Service and generation binding this snapshot to one actual observation.
     pub reference: ObservationReference,
@@ -115,7 +116,8 @@ pub enum BackendOutcome {
 }
 
 /// Actual backend completion plus a newly published observation, including on failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendCompletion {
     /// Run that invoked the backend.
     pub run_id: Uuid,
@@ -362,6 +364,11 @@ impl ExecutionRun {
     /// Returns this attempt's identity.
     pub const fn run_id(&self) -> Uuid {
         self.run_id
+    }
+
+    /// Returns the frozen description for durable recording, never a mutable editing draft.
+    pub const fn document(&self) -> &PlanDocument {
+        &self.document
     }
 
     /// Returns the immutable reviewed context for the trusted runtime checker.
