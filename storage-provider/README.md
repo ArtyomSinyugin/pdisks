@@ -362,6 +362,17 @@ or fallback is provided, and normal probe manifests do not opt into writes.
 The disk-free ABI regression test builds a mock shared library with `cc` and
 checks pre-call rejection and post-call ambiguity without loading system LVM.
 
+`LvActivationRequest` and `RegisteredBackend::activate_lv()` implement only
+activation of an unchanged UUID-qualified linear LV. The adapter rechecks full
+VG/PV membership and LV name/UUID/size, requires known native state, and calls
+`bd_lvm_lvactivate` with ignore-skip/shared disabled and no extra arguments.
+Its separate support check requires BASIC MODIFY/QUERY and the exact symbol.
+Native false or GError, missing/ambiguous identity, suspended/unknown state,
+or a failed/mismatched post-query all fail closed. Native active state still
+does not prove the runtime's promised writable block interface. Deactivation,
+forced activation, external writer exclusion and host authorization are outside
+this narrow provider adapter.
+
 One operation has one owning backend. A second library may enrich discovery,
 but it must not become an alternative executor for the same action.
 

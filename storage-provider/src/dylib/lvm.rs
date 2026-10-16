@@ -1,4 +1,4 @@
-//! Typed libblockdev LVM-plugin FFI: read-only discovery and the guarded linear-create recipe.
+//! Typed libblockdev LVM FFI: discovery and guarded linear-create/activation recipes.
 
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
@@ -10,8 +10,8 @@ use libloading::{Library, Symbol};
 
 use super::load_symbol;
 use crate::{
-    LinearLvRequest, LvmEntry, LvmLvEntry, LvmPvEntry, LvmSegmentEntry, LvmVgEntry, LvmWriteError,
-    NativeProbeError,
+    LinearLvRequest, LvActivationRequest, LvmEntry, LvmLvEntry, LvmPvEntry, LvmSegmentEntry,
+    LvmVgEntry, LvmWriteError, NativeProbeError,
 };
 
 const MAX_NATIVE_ENTRIES: usize = 65_536;
@@ -124,6 +124,91 @@ type Create = unsafe extern "C" fn(
 /// BDLVMTech is a C enum; BDLVMTechMode is a 64-bit bitmask in the public API.
 type TechAvailable = unsafe extern "C" fn(c_int, u64, *mut *mut GErrorRaw) -> c_int;
 
+/// Exact activation ABI from lvm.h, with explicit ignore-skip/shared boolean arguments.
+type Activate = unsafe extern "C" fn(
+    *const c_char,
+    *const c_char,
+    c_int,
+    c_int,
+    *const *const c_void,
+    *mut *mut GErrorRaw,
+) -> c_int;
+
+/// Resolves only the implemented activation operation, preserving its library lifetime.
+fn load_activate(library: &Library) -> Result<Symbol<'_, Activate>, NativeProbeError> {
+    // SAFETY: Activate matches bd_lvm_lvactivate in libblockdev lvm.h.
+    unsafe { load_symbol(library, b"bd_lvm_lvactivate\0") }
+}
+
+/// Requires the activation symbol, initialized plugin and BASIC MODIFY/QUERY technology.
+pub(super) fn check_lv_activation_support(library: &Library) -> Result<(), NativeProbeError> {
+    let _exclusive = LVM_SESSION
+        .lock()
+        .map_err(|_| call_failed("LVM plugin session lock"))?;
+    let api = Api::load(library)?;
+    let _activate = load_activate(library)?;
+    // SAFETY: TechAvailable matches the public lvm.h ABI and retains the live library borrow.
+    let available: Symbol<'_, TechAvailable> =
+        unsafe { load_symbol(library, b"bd_lvm_is_tech_avail\0") }?;
+    // SAFETY: standalone init takes no arguments; all plugin sessions are serialized here.
+    if unsafe { (api.init)() } == 0 {
+        return Err(call_failed("bd_lvm_init"));
+    }
+    let _session = Session { api: &api };
+    check_technology(&available, &api.g_error_free, (1 << 3) | (1 << 4))
+}
+
+/// Activates once under a serialized native session after rechecking VG/LV identity and current state.
+pub(super) fn activate_lv(
+    library: &Library,
+    request: &LvActivationRequest,
+) -> Result<(), LvmWriteError> {
+    let _exclusive = LVM_SESSION
+        .lock()
+        .map_err(|_| call_failed("LVM plugin session lock"))?;
+    let api = Api::load(library)?;
+    let activate = load_activate(library)?;
+    // SAFETY: exact lvm.h technology query signature; the loaded library remains retained.
+    let available: Symbol<'_, TechAvailable> =
+        unsafe { load_symbol(library, b"bd_lvm_is_tech_avail\0") }?;
+    // SAFETY: standalone init takes no arguments and the shared plugin session lock is held.
+    if unsafe { (api.init)() } == 0 {
+        return Err(call_failed("bd_lvm_init").into());
+    }
+    let _session = Session { api: &api };
+    check_technology(&available, &api.g_error_free, (1 << 3) | (1 << 4))?;
+    if request
+        .observed_lv(&read_state(&api)?)?
+        .activation()
+        .is_none()
+    {
+        return Err(LvmWriteError::TargetChanged);
+    }
+    let vg = CString::new(request.vg_name.as_str()).map_err(|_| invalid("bd_lvm_lvactivate"))?;
+    let lv = CString::new(request.lv_name.as_str()).map_err(|_| invalid("bd_lvm_lvactivate"))?;
+    let mut error = ErrorGuard::new(&api.g_error_free);
+    // SAFETY: names are validated and terminated, force-like options are false, extra is null,
+    // and GError storage starts null. The synchronous call borrows the names only until return.
+    let result = unsafe {
+        activate(
+            vg.as_ptr(),
+            lv.as_ptr(),
+            0,
+            0,
+            std::ptr::null(),
+            &mut error.pointer,
+        )
+    };
+    error.check("bd_lvm_lvactivate")?;
+    if result == 0 {
+        return Err(call_failed("bd_lvm_lvactivate").into());
+    }
+    if request.observed_lv(&read_state(&api)?)?.activation() != Some(true) {
+        return Err(LvmWriteError::TargetChanged);
+    }
+    Ok(())
+}
+
 /// Resolves the exact write symbol before admission; missing symbols cannot surface after arm.
 fn load_create(library: &Library) -> Result<Symbol<'_, Create>, NativeProbeError> {
     // SAFETY: Create matches bd_lvm_lvcreate in the installed libblockdev lvm.h ABI.
@@ -145,17 +230,18 @@ pub(super) fn check_linear_lv_support(library: &Library) -> Result<(), NativePro
         return Err(call_failed("bd_lvm_init"));
     }
     let _session = Session { api: &api };
-    check_create_technology(&available, &api.g_error_free)
+    check_technology(&available, &api.g_error_free, (1 << 0) | (1 << 4))
 }
 
 /// Rejects either a false result or GError, including inconsistent native success-with-error.
-fn check_create_technology(
+fn check_technology(
     available: &TechAvailable,
     free: &GErrorFree,
+    mode: u64,
 ) -> Result<(), NativeProbeError> {
     let mut error = ErrorGuard::new(free);
-    // SAFETY: BASIC=0 and CREATE|QUERY=(1<<0)|(1<<4) are lvm.h constants; GError starts null.
-    let result = unsafe { available(0, (1 << 0) | (1 << 4), &mut error.pointer) };
+    // SAFETY: BASIC=0 and the caller's mode bitmask are lvm.h constants; GError starts null.
+    let result = unsafe { available(0, mode, &mut error.pointer) };
     error.check("bd_lvm_is_tech_avail")?;
     if result == 0 {
         return Err(call_failed("bd_lvm_is_tech_avail"));
@@ -243,7 +329,7 @@ pub(super) fn create_linear_lv(
         return Err(call_failed("bd_lvm_init").into());
     }
     let _session = Session { api: &api };
-    check_create_technology(&available, &api.g_error_free)?;
+    check_technology(&available, &api.g_error_free, (1 << 0) | (1 << 4))?;
     let before = read_state(&api)?;
     request.check_target(&before)?;
     invoke_create(&create, &api.g_error_free, request)?;
@@ -593,8 +679,8 @@ mod tests {
         let free: GErrorFree = free_error;
         let supported: TechAvailable = basic_create_query;
         let missing: TechAvailable = unavailable_technology;
-        assert!(check_create_technology(&supported, &free).is_ok());
-        assert!(check_create_technology(&missing, &free).is_err());
+        assert!(check_technology(&supported, &free, 17).is_ok());
+        assert!(check_technology(&missing, &free, 17).is_err());
     }
 
     /// Records native call arguments without accessing any disks; bad flags return failure.

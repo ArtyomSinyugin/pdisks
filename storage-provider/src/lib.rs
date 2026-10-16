@@ -40,7 +40,7 @@ pub use luks::{
     CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProbeFailure,
     LuksProbeReport, LuksProvider, LuksValidationError,
 };
-pub use lvm_write::{LinearLvRequest, LvmWriteError};
+pub use lvm_write::{LinearLvRequest, LvActivationRequest, LvmWriteError};
 pub use planning::{
     DependencyReason, ExternalRequirement, FragmentAction, FragmentDependency, FragmentOrigin,
     LocalActionId, PlanFragment,
@@ -345,6 +345,39 @@ impl RegisteredBackend {
         }
         match &self.access {
             LoadedBackendAccess::Library { library } => library.create_linear_lv(request),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
+        }
+    }
+
+    /// Checks the exact activation-only ABI and BASIC MODIFY/QUERY technology without storage writes.
+    pub fn check_lv_activation_support(&self) -> Result<(), LvmWriteError> {
+        if !self
+            .manifest
+            .capabilities
+            .contains(&BackendCapability::Execute)
+        {
+            return Err(LvmWriteError::ExecutionNotDeclared);
+        }
+        match &self.access {
+            LoadedBackendAccess::Library { library } => Ok(library.check_lv_activation_support()?),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
+        }
+    }
+
+    /// Activates a UUID-qualified linear LV once, with fresh native checks before and after the call.
+    /// Caller must hold admission, scope/authorization, lease and durable checkpoint. External LVM
+    /// writers must be excluded: the native name-based mutation is not atomic with UUID validation.
+    /// Success does not replace runtime probe/verification of the promised writable block interface.
+    pub fn activate_lv(&self, request: &LvActivationRequest) -> Result<(), LvmWriteError> {
+        if !self
+            .manifest
+            .capabilities
+            .contains(&BackendCapability::Execute)
+        {
+            return Err(LvmWriteError::ExecutionNotDeclared);
+        }
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.activate_lv(request),
             LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
         }
     }
@@ -1469,12 +1502,20 @@ mod tests {
             backend.check_linear_lv_support(),
             Err(LvmWriteError::ExecutionNotDeclared)
         ));
+        assert!(matches!(
+            backend.check_lv_activation_support(),
+            Err(LvmWriteError::ExecutionNotDeclared)
+        ));
         backend
             .manifest
             .capabilities
             .insert(BackendCapability::Execute);
         assert!(matches!(
             backend.check_linear_lv_support(),
+            Err(LvmWriteError::Native(NativeProbeError::LibraryRequired))
+        ));
+        assert!(matches!(
+            backend.check_lv_activation_support(),
             Err(LvmWriteError::Native(NativeProbeError::LibraryRequired))
         ));
     }

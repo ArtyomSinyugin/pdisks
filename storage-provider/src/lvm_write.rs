@@ -1,6 +1,6 @@
 //! Narrow native LVM write recipe; construction validates intent but grants no authorization.
 
-use crate::LvmEntry;
+use crate::{LvmEntry, LvmLvEntry, LvmVgEntry};
 use thiserror::Error;
 
 /// A rejected request or observation must never reach the native mutator.
@@ -10,7 +10,7 @@ pub enum LvmWriteError {
     #[error("backend manifest does not declare execution capability")]
     ExecutionNotDeclared,
     /// Names, identity, or size cannot be represented by this conservative recipe.
-    #[error("invalid native linear LV request")]
+    #[error("invalid native LVM write request")]
     InvalidRequest,
     /// The fresh native VG identity, capacity, or LV namespace differs from admission.
     #[error("native LVM target no longer matches the admitted request")]
@@ -42,22 +42,7 @@ impl LinearLvRequest {
         lv_name: &str,
         size: u64,
     ) -> Result<Self, LvmWriteError> {
-        if !valid_name(vg_name)
-            || !valid_name(lv_name)
-            || lv_name.starts_with("snapshot")
-            || lv_name.starts_with("pvmove")
-            || [
-                "_cdata", "_cmeta", "_corig", "_mimage", "_mlog", "_pmspare", "_rimage", "_rmeta",
-                "_tdata", "_tmeta", "_vdata", "_vorigin",
-            ]
-            .iter()
-            .any(|reserved| lv_name.contains(reserved))
-            || vg_uuid.is_empty()
-            || !vg_uuid
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || size == 0
-        {
+        if !valid_name(vg_name) || !valid_lv_name(lv_name) || !valid_uuid(vg_uuid) || size == 0 {
             return Err(LvmWriteError::InvalidRequest);
         }
         Ok(Self {
@@ -71,46 +56,13 @@ impl LinearLvRequest {
     /// Requires a unique UUID/name pair, nonexported VG, exact extent sizing, and a free LV name.
     /// This pure check alone grants no authorization or protection against concurrent LVM tools.
     pub fn check_target(&self, state: &LvmEntry) -> Result<(), LvmWriteError> {
-        let mut matches = state
-            .vgs
-            .iter()
-            .filter(|vg| vg.name == self.vg_name || vg.uuid == self.vg_uuid);
-        let vg = matches.next().ok_or(LvmWriteError::TargetChanged)?;
-        if matches.next().is_some()
-            || vg.name != self.vg_name
-            || vg.uuid != self.vg_uuid
-            || vg.exported
-            || vg.extent_size == 0
-            || !self.size.is_multiple_of(vg.extent_size)
+        let vg = checked_vg(state, &self.vg_name, &self.vg_uuid)?;
+        if !self.size.is_multiple_of(vg.extent_size)
             || vg.free < self.size
-            || vg.free > vg.size
             || state
                 .lvs
                 .iter()
                 .any(|lv| lv.vg_name == self.vg_name && lv.name == self.lv_name)
-        {
-            return Err(LvmWriteError::TargetChanged);
-        }
-        let members: Vec<_> = state
-            .pvs
-            .iter()
-            .filter(|pv| {
-                pv.vg_name.as_deref() == Some(self.vg_name.as_str())
-                    || pv.vg_uuid.as_deref() == Some(self.vg_uuid.as_str())
-            })
-            .collect();
-        let mut uuids = std::collections::HashSet::new();
-        if vg.pv_count == 0
-            || members.len() as u64 != vg.pv_count
-            || members.iter().any(|pv| {
-                pv.vg_name.as_deref() != Some(self.vg_name.as_str())
-                    || pv.vg_uuid.as_deref() != Some(self.vg_uuid.as_str())
-                    || pv.missing
-                    || pv.uuid.is_empty()
-                    || !uuids.insert(&pv.uuid)
-                    || pv.size == 0
-                    || pv.free > pv.size
-            })
         {
             return Err(LvmWriteError::TargetChanged);
         }
@@ -157,6 +109,139 @@ impl LinearLvRequest {
         }
         Ok(lv.uuid.clone())
     }
+}
+
+/// Validated activation-only request bound to the native VG/LV UUIDs and reviewed LV size.
+/// Deactivation and force/skip/shared options are deliberately absent from the first recipe.
+#[derive(Debug)]
+pub struct LvActivationRequest {
+    /// Admitted native VG name.
+    pub(crate) vg_name: String,
+    /// Admitted persistent VG identity.
+    pub(crate) vg_uuid: String,
+    /// Admitted native LV name.
+    pub(crate) lv_name: String,
+    /// Independently verified LV output identity.
+    pub(crate) lv_uuid: String,
+    /// Reviewed exact LV capacity.
+    size: u64,
+}
+
+impl LvActivationRequest {
+    /// Validates the exact native endpoint without performing any host operation.
+    pub fn new(
+        vg_name: &str,
+        vg_uuid: &str,
+        lv_name: &str,
+        lv_uuid: &str,
+        size: u64,
+    ) -> Result<Self, LvmWriteError> {
+        if !valid_name(vg_name)
+            || !valid_lv_name(lv_name)
+            || !valid_uuid(vg_uuid)
+            || !valid_uuid(lv_uuid)
+            || size == 0
+        {
+            return Err(LvmWriteError::InvalidRequest);
+        }
+        Ok(Self {
+            vg_name: vg_name.into(),
+            vg_uuid: vg_uuid.into(),
+            lv_name: lv_name.into(),
+            lv_uuid: lv_uuid.into(),
+            size,
+        })
+    }
+
+    /// Rejects renamed/replaced/ambiguous LV identities and incomplete owning VG membership.
+    pub(crate) fn observed_lv<'a>(
+        &self,
+        state: &'a LvmEntry,
+    ) -> Result<&'a LvmLvEntry, LvmWriteError> {
+        checked_vg(state, &self.vg_name, &self.vg_uuid)?;
+        let mut matches = state.lvs.iter().filter(|lv| {
+            (lv.vg_name == self.vg_name && lv.name == self.lv_name) || lv.uuid == self.lv_uuid
+        });
+        let lv = matches.next().ok_or(LvmWriteError::TargetChanged)?;
+        if matches.next().is_some()
+            || lv.vg_name != self.vg_name
+            || lv.name != self.lv_name
+            || lv.uuid != self.lv_uuid
+            || lv.size != self.size
+            || lv.segment_type.as_deref() != Some("linear")
+        {
+            return Err(LvmWriteError::TargetChanged);
+        }
+        Ok(lv)
+    }
+}
+
+/// Rechecks one native VG and its complete present PV membership for both write recipes.
+fn checked_vg<'a>(
+    state: &'a LvmEntry,
+    name: &str,
+    uuid: &str,
+) -> Result<&'a LvmVgEntry, LvmWriteError> {
+    let mut matches = state
+        .vgs
+        .iter()
+        .filter(|vg| vg.name == name || vg.uuid == uuid);
+    let vg = matches.next().ok_or(LvmWriteError::TargetChanged)?;
+    if matches.next().is_some()
+        || vg.name != name
+        || vg.uuid != uuid
+        || vg.exported
+        || vg.extent_size == 0
+        || vg.free > vg.size
+    {
+        return Err(LvmWriteError::TargetChanged);
+    }
+    let members: Vec<_> = state
+        .pvs
+        .iter()
+        .filter(|pv| pv.vg_name.as_deref() == Some(name) || pv.vg_uuid.as_deref() == Some(uuid))
+        .collect();
+    if vg.pv_count == 0
+        || members.len() as u64 != vg.pv_count
+        || members.iter().any(|pv| {
+            pv.vg_name.as_deref() != Some(name)
+                || pv.vg_uuid.as_deref() != Some(uuid)
+                || pv.missing
+                || !valid_uuid(&pv.uuid)
+                || pv.size == 0
+                || pv.free > pv.size
+                || state
+                    .pvs
+                    .iter()
+                    .filter(|other| other.uuid == pv.uuid)
+                    .count()
+                    != 1
+        })
+    {
+        return Err(LvmWriteError::TargetChanged);
+    }
+    Ok(vg)
+}
+
+/// Names reserved for LVM's internal devices are excluded from public LV requests.
+fn valid_lv_name(name: &str) -> bool {
+    valid_name(name)
+        && !name.starts_with("snapshot")
+        && !name.starts_with("pvmove")
+        && ![
+            "_cdata", "_cmeta", "_corig", "_mimage", "_mlog", "_pmspare", "_rimage", "_rmeta",
+            "_tdata", "_tmeta", "_vdata", "_vorigin",
+        ]
+        .iter()
+        .any(|reserved| name.contains(reserved))
+}
+
+/// LVM UUIDs are nonempty ASCII identity strings and may contain formatting hyphens.
+fn valid_uuid(uuid: &str) -> bool {
+    !uuid.is_empty()
+        && uuid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 /// Accepts a conservative subset of LVM names, excluding paths and option-like names.

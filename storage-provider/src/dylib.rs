@@ -161,6 +161,19 @@ impl LoadedLibrary {
         lvm::create_linear_lv(&self.handle, request)
     }
 
+    /// Checks the exact activation-only native recipe without calling its mutator.
+    pub(super) fn check_lv_activation_support(&self) -> Result<(), NativeProbeError> {
+        lvm::check_lv_activation_support(&self.handle)
+    }
+
+    /// Calls activation with immutable UUID-qualified intent after fresh native preflight.
+    pub(super) fn activate_lv(
+        &self,
+        request: &crate::LvActivationRequest,
+    ) -> Result<(), crate::LvmWriteError> {
+        lvm::activate_lv(&self.handle, request)
+    }
+
     /// Reads Btrfs subvolumes below mounted filesystem roots.
     pub(super) fn probe_btrfs(
         &self,

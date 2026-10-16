@@ -1,6 +1,7 @@
 /* Disk-free libblockdev ABI fixture. Each loaded copy owns isolated in-memory state. */
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifndef SCENARIO
 #define SCENARIO 0
@@ -26,6 +27,8 @@ typedef struct {
 
 /* Count mutator invocations separately from whether the requested effect became visible. */
 static unsigned calls;
+/* Activation attempts are visible in mock LV copy_percent, independently of the active flag. */
+static unsigned activation_calls;
 
 /* Return an owned numeric error without retaining caller-owned storage. */
 static void fail(Error **error) {
@@ -40,7 +43,7 @@ void bd_lvm_close(void) {}
 /* Require the BASIC CREATE|QUERY ABI constants. */
 int bd_lvm_is_tech_avail(int tech, uint64_t mode, Error **error) {
     (void)error;
-    return SCENARIO != 12 && tech == 0 && mode == 17;
+    return SCENARIO != 12 && tech == 0 && (mode == 17 || (mode == 24 && SCENARIO != 28));
 }
 /* All fixture record strings are static; native record ownership is heap-only. */
 void g_free(void *pointer) { free(pointer); }
@@ -55,7 +58,7 @@ void bd_lvm_lvdata_free(Lv *lv) { free(lv); }
 
 /* Publish a complete member or an explicit query failure/missing member. */
 Pv **bd_lvm_pvs(Error **error) {
-    if (SCENARIO == 11 || (SCENARIO == 14 && calls)) { fail(error); return NULL; }
+    if (SCENARIO == 11 || (SCENARIO == 14 && calls) || (SCENARIO == 23 && activation_calls)) { fail(error); return NULL; }
     Pv **items = calloc(2, sizeof(Pv *));
     items[0] = calloc(1, sizeof(Pv));
     *items[0] = (Pv){ .name = "/dev/mock", .uuid = "pv-uuid", .size = 16384,
@@ -82,7 +85,12 @@ Lv **bd_lvm_lvs(const char *vg, Error **error) {
         items[0] = calloc(1, sizeof(Lv));
         *items[0] = (Lv){ .name = SCENARIO == 10 && !calls ? "old" : "data",
             .vg_name = SCENARIO == 15 ? "foreign" : "vg", .uuid = "new-uuid",
-            .size = SCENARIO == 9 ? 8192 : 4096, .segtype = "linear" };
+            .size = SCENARIO == 9 ? 8192 : 4096, .segtype = "linear",
+            .attr = SCENARIO == 22 ? NULL : SCENARIO == 21 ? "-wi-s-----" :
+                activation_calls && SCENARIO != 20 ? "-wi-a-----" : "-wi-------",
+            .copy_percent = activation_calls };
+        if (SCENARIO == 24 && activation_calls) items[0]->uuid = "replacement";
+        if (SCENARIO == 27 && activation_calls) items[0]->size = 8192;
         if (SCENARIO == 16 && calls) {
             items[1] = calloc(1, sizeof(Lv)); *items[1] = *items[0];
         }
@@ -97,3 +105,16 @@ int bd_lvm_lvcreate(const char *vg, const char *lv, uint64_t size, const char *t
     if (SCENARIO == 7 || SCENARIO == 13) fail(error);
     return SCENARIO != 7;
 }
+
+#if SCENARIO != 29
+/* A missing symbol scenario omits this entry point entirely; no system activation is possible. */
+int bd_lvm_lvactivate(const char *vg, const char *lv, int ignore_skip, int shared,
+    const void **extra, Error **error) {
+    activation_calls++;
+    if (strcmp(vg, "vg") || strcmp(lv, "data") || ignore_skip || shared || extra) {
+        fail(error); return 0;
+    }
+    if (SCENARIO == 19 || SCENARIO == 26) fail(error);
+    return SCENARIO != 19 && SCENARIO != 25;
+}
+#endif
