@@ -36,4 +36,4 @@ pub use document::{
 
 pub use correlate::{CorrelationError, NodeCorrelation, correlate_nodes};
 
-pub use rebase::{RebaseError, remap_draft};
+pub use rebase::{RebaseError, RebasePreview, remap_draft};

@@ -8,13 +8,22 @@ use thiserror::Error;
 use crate::HistoricalBaseline;
 
 use super::{
-    CorrelationError, DraftBuildError, NodeCorrelation, OperationId, PlanDraft, PlanRequest,
-    build::validate_draft, build_preview, correlate_nodes,
+    CorrelationError, DraftBuildError, DraftDocument, DraftRevision, NodeCorrelation, OperationId,
+    PlanDraft, PlanRequest, PlanSession, PreviewState, build::validate_draft, build_preview,
+    correlate_nodes,
 };
 
 /// Rejected baseline translation; original requests and observations are left untouched.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RebaseError {
+    /// A caller prepared or accepted a review for an older source revision.
+    #[error("expected revision {expected:?}, actual revision {actual:?}")]
+    RevisionConflict {
+        /// Revision supplied by the caller or captured by the review.
+        expected: DraftRevision,
+        /// Current editing revision.
+        actual: DraftRevision,
+    },
     /// A new context must not reuse the immutable historical baseline identity.
     #[error("rebase requires a new baseline identity")]
     SameBaselineIdentity,
@@ -33,6 +42,86 @@ pub enum RebaseError {
     /// Non-host namespaces/target roots have no durable identity in the initial rebase API.
     #[error("mount context {0:?} cannot be correlated across baselines")]
     UnsupportedMountContext(MountContext),
+}
+
+/// Immutable proposed rebase; inspecting it does not publish a new baseline or editing revision.
+/// There is no deserialization path that could forge a reviewed candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebasePreview {
+    /// Full source context also detects stale restored sessions sharing an ID/revision.
+    pub(super) source: DraftDocument,
+    /// Replacement observations, never overwritten by later probe publications.
+    pub(super) baseline: HistoricalBaseline,
+    /// Request identities retained with correlated existing inputs.
+    pub(super) draft: PlanDraft,
+    /// Result recalculated entirely against the replacement observations.
+    pub(super) preview: PreviewState,
+    /// Selected observed object bindings for explicit review.
+    pub(super) correlations: Vec<NodeCorrelation>,
+}
+
+impl RebasePreview {
+    /// Source session for which this candidate was prepared.
+    pub fn source_session_id(&self) -> uuid::Uuid {
+        self.source.session_id
+    }
+
+    /// Source editing revision that must still be current when accepting this candidate.
+    pub fn source_revision(&self) -> DraftRevision {
+        self.source.revision
+    }
+
+    /// New immutable observation context proposed by the caller.
+    pub fn target_baseline(&self) -> &HistoricalBaseline {
+        &self.baseline
+    }
+
+    /// Translated requests, retaining every operation and planned output identity.
+    pub fn draft(&self) -> &PlanDraft {
+        &self.draft
+    }
+
+    /// New forecast and conditions, including an invalid plan that remains editable.
+    pub fn preview(&self) -> &PreviewState {
+        &self.preview
+    }
+
+    /// Unique identity bindings, without paths or display-name inference.
+    pub fn correlations(&self) -> &[NodeCorrelation] {
+        &self.correlations
+    }
+}
+
+impl PlanSession {
+    /// Prepares a separately reviewable forecast without mutating baseline, revision, or history.
+    /// Every existing input is correlated before the candidate is simulated through the shared engine.
+    pub fn prepare_rebase(
+        &self,
+        expected_revision: DraftRevision,
+        baseline: HistoricalBaseline,
+    ) -> Result<RebasePreview, RebaseError> {
+        if expected_revision != self.revision() {
+            return Err(RebaseError::RevisionConflict {
+                expected: expected_revision,
+                actual: self.revision(),
+            });
+        }
+        let source = self.draft_document();
+        let (draft, correlations) = remap_draft(&source.baseline, &source.draft, &baseline)?;
+        let result = build_preview(&baseline, &draft);
+        if let Err(error) = &result
+            && error.is_internal()
+        {
+            return Err(RebaseError::Inputs(Box::new(error.clone())));
+        }
+        Ok(RebasePreview {
+            source,
+            baseline,
+            draft,
+            preview: result.into(),
+            correlations,
+        })
+    }
 }
 
 /// Copies a draft, correlating existing inputs and retaining operation/planned-output identities.
@@ -206,6 +295,72 @@ pub(super) mod tests {
             assert_eq!(before.created_node, after.created_node);
         }
         assert_eq!(draft, original);
+    }
+
+    /// Preparing a new view leaves the active revision and its forecast unchanged.
+    #[test]
+    fn rebase_review_is_separate_from_the_active_forecast() {
+        let (session, next, source, target) = session_and_baseline();
+        let saved = session.draft_document();
+        let active = session.preview().clone();
+        let frozen = session
+            .freeze(session.revision())
+            .unwrap_or_else(|error| panic!("freeze: {error}"));
+        let json = frozen
+            .document()
+            .canonical_json()
+            .unwrap_or_else(|error| panic!("export: {error}"));
+        let review = session
+            .prepare_rebase(session.revision(), next.clone())
+            .unwrap_or_else(|error| panic!("prepare: {error}"));
+        assert_eq!(review.source_session_id(), session.id());
+        assert_eq!(review.source_revision(), session.revision());
+        assert_eq!(review.target_baseline(), &next);
+        assert!(review.preview().calculated().is_some());
+        assert_eq!(
+            (
+                review.correlations()[0].source,
+                review.correlations()[0].target
+            ),
+            (source, target)
+        );
+        assert_eq!(
+            review.draft().operations[1..],
+            session.draft().operations[1..]
+        );
+        assert_eq!(session.draft_document(), saved);
+        assert_eq!(session.preview(), &active);
+        assert_eq!(
+            frozen
+                .document()
+                .canonical_json()
+                .unwrap_or_else(|error| panic!("export: {error}")),
+            json
+        );
+        assert!(matches!(
+            session.prepare_rebase(DraftRevision::default(), next),
+            Err(RebaseError::RevisionConflict { .. })
+        ));
+    }
+
+    /// A newly insufficient capacity is an inspectable failed forecast, retaining request IDs.
+    #[test]
+    fn rebase_review_keeps_invalid_requests_without_a_stale_desired_state() {
+        let (session, mut next, _, _) = session_and_baseline();
+        next.capacity_evidence[0].available = AllocationQuantity::new(1);
+        let review = session
+            .prepare_rebase(session.revision(), next)
+            .unwrap_or_else(|error| panic!("prepare invalid plan: {error}"));
+        assert_eq!(
+            review.preview().status(),
+            super::super::PreviewStatus::Invalid
+        );
+        assert!(review.preview().calculated().is_none());
+        assert_eq!(
+            review.preview().diagnostics()[0].operation,
+            Some(session.draft().operations[0].id)
+        );
+        assert!(session.preview().calculated().is_some());
     }
 
     /// Output collisions, reused contexts, and path-only requests cannot silently change meaning.
