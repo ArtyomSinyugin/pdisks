@@ -206,9 +206,9 @@ mod tests {
     }
 }
 
-/// Version of persisted editable requests; version 4 adds LV and filesystem resize.
-/// Versions 1 through 3 remain readable with their original request catalogues.
-pub const DRAFT_SCHEMA_VERSION: u32 = 4;
+/// Version of persisted editable requests; version 5 adds explicit partition/LV removal and LUKS close.
+/// Versions 1 through 4 remain readable with their original request catalogues.
+pub const DRAFT_SCHEMA_VERSION: u32 = 5;
 
 /// Maximum UTF-8 size accepted by the draft JSON boundary, including its historical snapshot.
 pub const MAX_DRAFT_JSON_BYTES: usize = 1024 * 1024;
@@ -305,6 +305,9 @@ impl DraftDocument {
         }
         if let Some(operation) = self.draft.operations.iter().find(|operation| {
             let required_version = match operation.request {
+                super::PlanRequest::DeletePartition { .. }
+                | super::PlanRequest::RemoveLv { .. }
+                | super::PlanRequest::CloseLuks { .. } => 5,
                 super::PlanRequest::ResizeLv { .. }
                 | super::PlanRequest::ResizeFilesystem { .. } => 4,
                 super::PlanRequest::FormatLuks { .. } | super::PlanRequest::OpenLuks { .. } => 3,
@@ -486,7 +489,38 @@ mod draft_tests {
             },
         ] {
             document.draft.operations = vec![PlanOperation::new(request)];
-            for version in 1..DRAFT_SCHEMA_VERSION {
+            for version in 1..4 {
+                document.schema_version = version;
+                assert!(
+                    matches!(DraftDocument::from_json(&serde_json::to_string(&document)?), Err(DraftDocumentError::RequestVersion { version: actual, .. }) if actual == version)
+                );
+                assert!(PlanSession::from_document(document.clone()).is_err());
+            }
+            document.schema_version = 4;
+            assert_eq!(DraftDocument::from_json(&document.to_json()?)?, document);
+            let mut invalid = document.clone();
+            invalid.draft.operations[0].created_node = Some(NodeId::new());
+            assert!(invalid.to_json().is_err());
+        }
+        Ok(())
+    }
+
+    /// Older catalogues and implicit cascade fields cannot broaden a saved removal scope.
+    #[test]
+    fn removal_requests_require_schema_five_and_explicit_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut document = PlanSession::new(baseline())?.draft_document();
+        let node = lv_request().referenced_nodes()[0];
+        for (variant, request) in [
+            (
+                "delete_partition",
+                PlanRequest::DeletePartition { partition: node },
+            ),
+            ("remove_lv", PlanRequest::RemoveLv { lv: node }),
+            ("close_luks", PlanRequest::CloseLuks { mapping: node }),
+        ] {
+            document.draft.operations = vec![PlanOperation::new(request)];
+            for version in 1..5 {
                 document.schema_version = version;
                 assert!(
                     matches!(DraftDocument::from_json(&serde_json::to_string(&document)?), Err(DraftDocumentError::RequestVersion { version: actual, .. }) if actual == version)
@@ -495,9 +529,15 @@ mod draft_tests {
             }
             document.schema_version = DRAFT_SCHEMA_VERSION;
             assert_eq!(DraftDocument::from_json(&document.to_json()?)?, document);
-            let mut invalid = document.clone();
-            invalid.draft.operations[0].created_node = Some(NodeId::new());
-            assert!(invalid.to_json().is_err());
+            let mut value = serde_json::to_value(&document)?;
+            value["draft"]["operations"][0]["request"][variant]["recursive"] =
+                serde_json::json!(true);
+            assert!(matches!(
+                DraftDocument::from_json(&value.to_string()),
+                Err(DraftDocumentError::Json(_))
+            ));
+            document.draft.operations[0].created_node = Some(NodeId::new());
+            assert!(document.to_json().is_err());
         }
         Ok(())
     }

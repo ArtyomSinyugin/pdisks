@@ -165,6 +165,31 @@ pub fn lower_operation(
                 description: "resize ext filesystem".to_owned(),
             }
         }
+        PlanRequest::DeletePartition { partition } => {
+            operations.push(ProviderAction::Partition(PartitionAction::Delete {
+                partition: *partition,
+            }));
+            FragmentOrigin::Change {
+                subject: *partition,
+                description: "delete selected partition".to_owned(),
+            }
+        }
+        PlanRequest::RemoveLv { lv } => {
+            operations.push(ProviderAction::Lvm(LvmAction::RemoveLv { lv: *lv }));
+            FragmentOrigin::Change {
+                subject: *lv,
+                description: "remove selected logical volume".to_owned(),
+            }
+        }
+        PlanRequest::CloseLuks { mapping } => {
+            operations.push(ProviderAction::Luks(LuksAction::Close {
+                mapping: *mapping,
+            }));
+            FragmentOrigin::Change {
+                subject: *mapping,
+                description: "close selected LUKS mapping".to_owned(),
+            }
+        }
         PlanRequest::CreateFilesystem {
             backing,
             filesystem,

@@ -79,6 +79,21 @@ pub enum PlanRequest {
         /// Exact requested resulting capacity in bytes.
         new_size: Bytes,
     },
+    /// Deletes exactly one partition entry; remaining consumers or relations block the recipe.
+    DeletePartition {
+        /// Sole partition selected for deletion; its table and siblings are retained.
+        partition: NodeId,
+    },
+    /// Removes exactly one logical volume, without selecting its consumers or siblings.
+    RemoveLv {
+        /// Sole LV selected for removal; live destructive-scope approval remains required.
+        lv: NodeId,
+    },
+    /// Closes one unused dm-crypt mapping without erasing its LUKS container or backing.
+    CloseLuks {
+        /// Sole runtime mapping selected for closure.
+        mapping: NodeId,
+    },
     /// Creates one filesystem on a referenced block node.
     CreateFilesystem {
         /// Existing or planned block-providing node.
@@ -135,7 +150,9 @@ impl PlanRequest {
         match self {
             Self::CreatePartition { table, .. } => vec![*table],
             Self::CreateLv { vg, .. } => vec![*vg],
-            Self::ResizeLv { lv, .. } => vec![*lv],
+            Self::ResizeLv { lv, .. } | Self::RemoveLv { lv } => vec![*lv],
+            Self::DeletePartition { partition } => vec![*partition],
+            Self::CloseLuks { mapping } => vec![*mapping],
             Self::CreateFilesystem { backing, .. } | Self::FormatLuks { backing, .. } => {
                 vec![*backing]
             }
@@ -175,7 +192,9 @@ impl PlanRequest {
         match self {
             Self::CreatePartition { table, .. } => remap(table),
             Self::CreateLv { vg, .. } => remap(vg),
-            Self::ResizeLv { lv, .. } => remap(lv),
+            Self::ResizeLv { lv, .. } | Self::RemoveLv { lv } => remap(lv),
+            Self::DeletePartition { partition } => remap(partition),
+            Self::CloseLuks { mapping } => remap(mapping),
             Self::CreateFilesystem { backing, .. } | Self::FormatLuks { backing, .. } => {
                 remap(backing)
             }
@@ -244,6 +263,9 @@ mod remap_tests {
                 filesystem: source,
                 new_size: Bytes::new(1024),
             },
+            PlanRequest::DeletePartition { partition: source },
+            PlanRequest::RemoveLv { lv: source },
+            PlanRequest::CloseLuks { mapping: source },
             PlanRequest::Mount(entry.clone()),
             PlanRequest::PersistMount(entry.clone()),
             PlanRequest::SetFilesystemLabel {

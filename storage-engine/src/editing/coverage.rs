@@ -151,6 +151,18 @@ pub(super) fn request_coverage(
             ],
         ) => filesystem == actual && new_size == actual_size,
         (
+            PlanRequest::DeletePartition { partition },
+            [ProviderAction::Partition(PartitionAction::Delete { partition: actual })],
+        ) => partition == actual,
+        (
+            PlanRequest::RemoveLv { lv },
+            [ProviderAction::Lvm(LvmAction::RemoveLv { lv: actual })],
+        ) => lv == actual,
+        (
+            PlanRequest::CloseLuks { mapping },
+            [ProviderAction::Luks(LuksAction::Close { mapping: actual })],
+        ) => mapping == actual,
+        (
             PlanRequest::CreateFilesystem {
                 backing,
                 filesystem,
@@ -245,6 +257,42 @@ mod tests {
     use storage_core::model::{
         Bytes, FilesystemKind, LvmLvKind, MountContext, MountEntry, MountSource, NodeId,
     };
+
+    /// Removal coverage permits exactly the selected target and rejects added cascade actions.
+    #[test]
+    fn removal_recipes_cover_only_one_explicit_target() -> Result<(), Box<dyn std::error::Error>> {
+        let node = NodeId::new();
+        for request in [
+            PlanRequest::DeletePartition { partition: node },
+            PlanRequest::RemoveLv { lv: node },
+            PlanRequest::CloseLuks { mapping: node },
+        ] {
+            let operation = PlanOperation::new(request);
+            assert_eq!(operation.created_node, None);
+            let fragment = lower_operation(&operation, None)
+                .unwrap_or_else(|error| panic!("lower removal: {error:?}"));
+            assert_eq!(fragment.actions.len(), 1);
+            let action = &fragment.actions[0].operation;
+            assert!(request_coverage(&operation, &[action]).covered);
+            assert!(!request_coverage(&operation, &[]).covered);
+            assert!(!request_coverage(&operation, &[action, action]).covered);
+            let mut changed = action.clone();
+            let target = match &mut changed {
+                ProviderAction::Partition(PartitionAction::Delete { partition }) => partition,
+                ProviderAction::Lvm(LvmAction::RemoveLv { lv }) => lv,
+                ProviderAction::Luks(LuksAction::Close { mapping }) => mapping,
+                _ => return Err("unexpected removal recipe".into()),
+            };
+            *target = NodeId::new();
+            assert!(!request_coverage(&operation, &[&changed]).covered);
+            assert!(!request_coverage(&operation, &[action, &changed]).covered);
+            assert_eq!(
+                serde_json::from_str::<ProviderAction>(&serde_json::to_string(action)?)?,
+                *action
+            );
+        }
+        Ok(())
+    }
 
     /// Resize recipes preserve target identity and reject changed sizes, targets, and hidden actions.
     #[test]
