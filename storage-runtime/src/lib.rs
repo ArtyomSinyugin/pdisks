@@ -15,3 +15,7 @@ pub mod authorization;
 pub mod capability;
 #[cfg(target_os = "linux")]
 pub mod host;
+
+#[cfg(target_os = "linux")]
+pub mod coordinator;
+pub mod dispatcher;

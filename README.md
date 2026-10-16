@@ -426,6 +426,16 @@ prerequisites. `BackendCapabilityCheck` отдельно устанавлива�
 Положительный admission пока проверяется только с синтетическими test policies;
 реальные capability/authorization adapters остаются частью следующего native этапа.
 
+`ExecutionCoordinator::execute_action()` выполняет одно действие: lease →
+fresh admission → durable checkpoint → Running → typed synchronous dispatcher →
+новый probe → completion → проверка сохранённых postconditions → clear только
+после Verified. Backend ID, run/action, operation и publication сверяются перед
+допуском; при ошибке подготовки действие остаётся до invocation boundary.
+Ошибка adapter не считается доказательством отсутствия побочных эффектов.
+Неудача, неизвестный результат или ошибка clear блокируют дальнейшие вызовы
+через coordinator. Финальная проверка всей цели остаётся отдельным этапом;
+`execute_action()` не объявляет run успешным.
+
 ## Аварийный checkpoint вместо истории выполнения
 
 Старый JSONL-журнал удалён. Импорт исторических `.jsonl`, восстановление run и

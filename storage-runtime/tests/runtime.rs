@@ -357,3 +357,321 @@ mod admission {
         Ok(())
     }
 }
+
+#[cfg(target_os = "linux")]
+mod coordination {
+    use super::admission::{Authorization, Capabilities, Scratch, authorization};
+    use super::*;
+    use std::{cell::Cell, fs, path::PathBuf};
+    use storage_engine::{
+        ActionRunState, BackendOutcome, ExecutionRunError, LiveCheckStatus, RunEventKind,
+    };
+    use storage_runtime::{
+        authorization::{ApprovalRequest, AuthorizationContext},
+        capability::OperationAvailability,
+        checkpoint::ActiveAttempt,
+        coordinator::{CoordinatorError, ExecutionCoordinator},
+        dispatcher::{BackendDispatcher, DispatchError},
+        host::LinuxLiveHost,
+        lease::ExecutionRoot,
+        targets::ResolvedAction,
+    };
+
+    /// Explicitly synthetic backend that checks checkpoint ordering before changing fixture data.
+    pub(super) struct FakeDispatcher {
+        /// Exact adapter identity checked by the coordinator.
+        pub(super) backend: BackendId,
+        /// Parent-owned test root; used only to assert the active file was already published.
+        pub(super) root: PathBuf,
+        /// Current recorded publication, used to simulate a failed post-backend probe.
+        pub(super) state: Rc<RefCell<ProbeSnapshot>>,
+        /// Number of actual synthetic invocation attempts.
+        pub(super) calls: Rc<Cell<usize>>,
+        /// Completed classification supplied by the fixture, never by simulation.
+        pub(super) outcome: BackendOutcome,
+        /// Simulates the loss of a valid observation after invocation.
+        pub(super) break_probe: bool,
+        /// Simulates an adapter error whose partial effects cannot be ruled out.
+        pub(super) fail: bool,
+    }
+    impl BackendDispatcher for FakeDispatcher {
+        /// Identifies this test adapter without asserting native backend availability.
+        fn backend_id(&self) -> &BackendId {
+            &self.backend
+        }
+        /// Verifies durable-publication ordering, emits progress, and returns synthetic completion.
+        fn execute(
+            &mut self,
+            action: &ResolvedAction,
+            progress: &mut dyn FnMut(String) -> Result<(), ExecutionRunError>,
+        ) -> Result<BackendOutcome, DispatchError> {
+            let attempt = ActiveAttempt::from_bytes(
+                &fs::read(self.root.join("active-attempt.json"))
+                    .unwrap_or_else(|error| panic!("checkpoint before dispatch: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("valid checkpoint: {error}"));
+            assert_eq!(attempt.run_id, action.run_id());
+            assert_eq!(attempt.action_id, action.action_id());
+            assert_eq!(&attempt.action, action.operation());
+            assert_eq!(&attempt.backend_id, action.backend());
+            assert_eq!(attempt.targets, action.fingerprints());
+            self.calls.set(self.calls.get() + 1);
+            progress("synthetic adapter completed".into())?;
+            if self.break_probe {
+                self.state.borrow_mut().current.graph.insert_dependency(
+                    storage_core::model::Dependency {
+                        from: NodeId::new(),
+                        to: NodeId::new(),
+                        kind: storage_core::model::DependencyKind::Backs,
+                    },
+                );
+            }
+            if self.fail {
+                Err(DispatchError::Adapter("completion transport lost".into()))
+            } else {
+                Ok(self.outcome.clone())
+            }
+        }
+    }
+
+    /// Builds a fake backend with an inspectable invocation counter.
+    pub(super) fn dispatcher(root: &Scratch, state: Rc<RefCell<ProbeSnapshot>>) -> FakeDispatcher {
+        FakeDispatcher {
+            backend: backend(),
+            root: root.0.clone(),
+            state,
+            calls: Rc::new(Cell::new(0)),
+            outcome: BackendOutcome::Succeeded,
+            break_probe: false,
+            fail: false,
+        }
+    }
+
+    /// Explicitly synthetic complete policies; production policies are never inferred from fixtures.
+    pub(super) fn host(
+        state: Rc<RefCell<ProbeSnapshot>>,
+        run: &ExecutionRun,
+    ) -> Result<LinuxLiveHost<'static, Capabilities, Authorization>, Box<dyn Error>> {
+        Ok(LinuxLiveHost::new(
+            probe(state),
+            Capabilities {
+                availability: OperationAvailability::Available(backend()),
+                scope: LiveCheckStatus::Satisfied,
+            },
+            authorization(run)?,
+        ))
+    }
+
+    /// Even a successful backend reply cannot verify an unobserved planned output or clear its marker.
+    #[test]
+    fn checkpoint_precedes_dispatch_and_missing_result_stops_continuation()
+    -> Result<(), Box<dyn Error>> {
+        let (state, frozen) = fixture()?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = Scratch::new()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let fake = dispatcher(&scratch, state.clone());
+        let calls = fake.calls.clone();
+        let mut coordinator =
+            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host(state, &run)?, fake);
+        let operation = frozen.source_map()[0].operation;
+        assert_eq!(
+            coordinator.execute_action(&mut run, ActionId::new(0), Some(operation))?,
+            ActionRunState::OutcomeUnknown
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            run.latest_observation()
+                .ok_or("post probe")?
+                .reference
+                .epoch
+                .get(),
+            2
+        );
+        assert!(!run.is_verified());
+        assert!(
+            run.events_since(0)
+                .any(|event| matches!(event.kind, RunEventKind::Progress { .. }))
+        );
+        let attempt = ActiveAttempt::from_bytes(&fs::read(scratch.0.join("active-attempt.json"))?)?;
+        assert_eq!(attempt.operation_id, Some(operation));
+        assert!(matches!(
+            coordinator.execute_action(&mut run, ActionId::new(1), None),
+            Err(CoordinatorError::Stopped)
+        ));
+        assert_eq!(calls.get(), 1);
+        Ok(())
+    }
+
+    /// Every incomplete or contradicted live gate prevents the synthetic call and any checkpoint.
+    #[test]
+    fn every_admission_veto_prevents_dispatch() -> Result<(), Box<dyn Error>> {
+        for case in 0..6 {
+            let (state, frozen) = fixture()?;
+            let state = Rc::new(RefCell::new(state));
+            let scratch = Scratch::new()?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let mut capabilities = Capabilities {
+                availability: OperationAvailability::Available(backend()),
+                scope: LiveCheckStatus::Satisfied,
+            };
+            let mut authorization = authorization(&run)?;
+            match case {
+                0 => {
+                    capabilities.availability =
+                        OperationAvailability::Unknown("write unavailable".into())
+                }
+                1 => {
+                    capabilities.scope = LiveCheckStatus::Unknown {
+                        required_evidence: "namespace coverage".into(),
+                    }
+                }
+                2 => {
+                    authorization.status = LiveCheckStatus::Violated {
+                        reason: "no approval".into(),
+                    }
+                }
+                3 => {
+                    let id = state.borrow().lvm_vgs[0].node;
+                    let mut node = state.borrow().current.graph.node(&id).ok_or("VG")?.clone();
+                    node.size.identities = vec![ExternalId::LvmVgUuid("other-vg".into())];
+                    state
+                        .borrow_mut()
+                        .current
+                        .graph
+                        .replace_existing(id, node)?;
+                }
+                4 => state.borrow_mut().current.mounts.entries.push(
+                    storage_core::model::ObservedMount {
+                        source: storage_core::model::MountSource::Tmpfs,
+                        target: "/foreign".into(),
+                        options: vec![],
+                        context: storage_core::model::MountContext::Host,
+                    },
+                ),
+                _ => state.borrow_mut().lvm_vgs[0].vg.free = 0,
+            }
+            let fake = dispatcher(&scratch, state.clone());
+            let calls = fake.calls.clone();
+            let mut coordinator = ExecutionCoordinator::new(
+                ExecutionRoot::open(&scratch.0)?,
+                LinuxLiveHost::new(probe(state), capabilities, authorization),
+                fake,
+            );
+            coordinator.execute_action(&mut run, ActionId::new(0), None)?;
+            assert_eq!(calls.get(), 0, "case {case}");
+            assert!(!scratch.0.join("active-attempt.json").exists());
+        }
+        Ok(())
+    }
+
+    /// Known failure, uncertain adapter error, and post-probe failure retain the marker and stop.
+    #[test]
+    fn backend_failure_and_probe_loss_retain_checkpoint() -> Result<(), Box<dyn Error>> {
+        for case in 0..3 {
+            let (state, frozen) = fixture()?;
+            let state = Rc::new(RefCell::new(state));
+            let scratch = Scratch::new()?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let mut fake = dispatcher(&scratch, state.clone());
+            match case {
+                0 => {
+                    fake.outcome = BackendOutcome::Failed {
+                        reason: "partial failure".into(),
+                    }
+                }
+                1 => fake.fail = true,
+                _ => fake.break_probe = true,
+            }
+            let calls = fake.calls.clone();
+            let mut coordinator = ExecutionCoordinator::new(
+                ExecutionRoot::open(&scratch.0)?,
+                host(state, &run)?,
+                fake,
+            );
+            let result = coordinator.execute_action(&mut run, ActionId::new(0), None);
+            assert_eq!(result.is_err(), case == 2);
+            assert_eq!(
+                run.state(ActionId::new(0))?,
+                if case == 0 {
+                    ActionRunState::Failed
+                } else {
+                    ActionRunState::OutcomeUnknown
+                }
+            );
+            assert_eq!(calls.get(), 1);
+            assert!(scratch.0.join("active-attempt.json").exists());
+            assert_eq!(
+                run.latest_observation()
+                    .ok_or("actual")?
+                    .reference
+                    .epoch
+                    .get(),
+                if case == 2 { 1 } else { 2 }
+            );
+            assert!(matches!(
+                coordinator.execute_action(&mut run, ActionId::new(0), None),
+                Err(CoordinatorError::Stopped)
+            ));
+        }
+        Ok(())
+    }
+
+    /// A test policy creates a competing marker after inspection to force preparation failure.
+    struct CheckpointCollision {
+        /// Ordinary exact-request fixture authorization.
+        inner: Authorization,
+        /// Newly owned test directory where the competing marker is injected.
+        root: PathBuf,
+    }
+    impl AuthorizationContext for CheckpointCollision {
+        /// Injects only a temporary regular-file collision; no storage backend runs.
+        fn check(&mut self, request: &ApprovalRequest) -> LiveCheckStatus {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.root.join("active-attempt.json");
+            fs::write(&path, b"competing incident")
+                .unwrap_or_else(|error| panic!("collision: {error}"));
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .unwrap_or_else(|error| panic!("collision permissions: {error}"));
+            self.inner.check(request)
+        }
+    }
+
+    /// An arm failure stays before invocation, retains the competing data, and records its reason.
+    #[test]
+    fn checkpoint_failure_stops_before_dispatch() -> Result<(), Box<dyn Error>> {
+        let (state, frozen) = fixture()?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = Scratch::new()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let fake = dispatcher(&scratch, state.clone());
+        let calls = fake.calls.clone();
+        let authorization = CheckpointCollision {
+            inner: authorization(&run)?,
+            root: scratch.0.clone(),
+        };
+        let host = LinuxLiveHost::new(
+            probe(state),
+            Capabilities {
+                availability: OperationAvailability::Available(backend()),
+                scope: LiveCheckStatus::Satisfied,
+            },
+            authorization,
+        );
+        let mut coordinator =
+            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, fake);
+        assert!(matches!(
+            coordinator.execute_action(&mut run, ActionId::new(0), None),
+            Err(CoordinatorError::Checkpoint(_))
+        ));
+        assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Failed);
+        assert!(run.pre_dispatch_failure(ActionId::new(0))?.is_some());
+        assert!(run.completion(ActionId::new(0))?.is_none());
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            fs::read(scratch.0.join("active-attempt.json"))?,
+            b"competing incident"
+        );
+        Ok(())
+    }
+}
