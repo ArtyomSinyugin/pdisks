@@ -5,8 +5,8 @@ use storage_core::model::{
 };
 use storage_provider::{
     ActionPrerequisite, DependencyReason, ExternalRequirement, FilesystemAction, FragmentAction,
-    FragmentDependency, FragmentOrigin, LocalActionId, LvmAction, MountAction, PlanFragment,
-    ProviderAction,
+    FragmentDependency, FragmentOrigin, LocalActionId, LvmAction, MountAction, PartitionAction,
+    PlanFragment, ProviderAction,
 };
 
 use super::{PlanOperation, PlanRequest};
@@ -39,6 +39,31 @@ pub fn lower_operation(
     let mut operations = Vec::new();
     let mut requirements = Vec::new();
     let origin = match &operation.request {
+        PlanRequest::CreatePartition {
+            table,
+            number,
+            offset,
+            size,
+            role,
+            attributes,
+        } => {
+            let node = operation
+                .created_node
+                .ok_or_else(|| fail("draft.created_node", "missing partition output ID"))?;
+            operations.push(ProviderAction::Partition(PartitionAction::Create {
+                table: *table,
+                planned_node_id: node,
+                number: *number,
+                offset: *offset,
+                size: *size,
+                role: *role,
+                attributes: *attributes,
+            }));
+            FragmentOrigin::Change {
+                subject: node,
+                description: "create partition at exact byte extent".to_owned(),
+            }
+        }
         PlanRequest::CreateLv {
             vg,
             name,

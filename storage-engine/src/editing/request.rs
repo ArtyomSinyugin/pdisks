@@ -1,11 +1,11 @@
 //! Typed user requests for the initial plan editing workflow.
 
-use std::path::PathBuf;
+use std::{num::NonZeroU32, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use storage_core::model::{
     Bytes, FilesystemKind, LvmLvKind, MountContext, MountEntry, MountSource, NodeId,
-    OperationIntent,
+    OperationIntent, PartitionAttributes, UsageRole,
 };
 
 /// User-level parameters retained for editing instead of mutating a frozen action DAG.
@@ -13,6 +13,21 @@ use storage_core::model::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlanRequest {
+    /// Creates one partition with exact byte geometry on an existing or planned table.
+    CreatePartition {
+        /// Partition table receiving the new entry.
+        table: NodeId,
+        /// Explicit nonzero partition number; no automatic placement is performed.
+        number: NonZeroU32,
+        /// Exact byte offset from the beginning of the disk.
+        offset: Bytes,
+        /// Exact requested size in bytes.
+        size: Bytes,
+        /// Optional intended system role.
+        role: Option<UsageRole>,
+        /// Native attributes preserved without implicit defaults or reinterpretation.
+        attributes: PartitionAttributes,
+    },
     /// Creates one logical volume, optionally followed by activation.
     CreateLv {
         /// Existing or planned volume group.
@@ -67,12 +82,16 @@ pub enum PlanRequest {
 impl PlanRequest {
     /// Whether this request reserves exactly one new storage node.
     pub(crate) fn creates_node(&self) -> bool {
-        matches!(self, Self::CreateLv { .. } | Self::CreateFilesystem { .. })
+        matches!(
+            self,
+            Self::CreatePartition { .. } | Self::CreateLv { .. } | Self::CreateFilesystem { .. }
+        )
     }
 
     /// Storage identities used as inputs; ordering and shared resources are not ownership.
     pub fn referenced_nodes(&self) -> Vec<NodeId> {
         match self {
+            Self::CreatePartition { table, .. } => vec![*table],
             Self::CreateLv { vg, .. } => vec![*vg],
             Self::CreateFilesystem { backing, .. } => vec![*backing],
             Self::SetFilesystemLabel { filesystem, .. } => vec![*filesystem],
@@ -107,6 +126,7 @@ impl PlanRequest {
             }
         };
         match self {
+            Self::CreatePartition { table, .. } => remap(table),
             Self::CreateLv { vg, .. } => remap(vg),
             Self::CreateFilesystem { backing, .. } => remap(backing),
             Self::SetFilesystemLabel { filesystem, .. } => remap(filesystem),

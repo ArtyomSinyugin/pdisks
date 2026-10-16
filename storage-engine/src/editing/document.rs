@@ -207,7 +207,7 @@ mod tests {
 }
 
 /// Version of persisted editable requests, separate from display and execution schemas.
-pub const DRAFT_SCHEMA_VERSION: u32 = 1;
+pub const DRAFT_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum UTF-8 size accepted by the draft JSON boundary, including its historical snapshot.
 pub const MAX_DRAFT_JSON_BYTES: usize = 1024 * 1024;
