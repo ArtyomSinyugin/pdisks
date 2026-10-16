@@ -1,12 +1,15 @@
 //! Conservative result checks over one retained actual post-backend observation.
 
 use serde::Serialize;
-use storage_core::model::{MountContext, MountSource, NodeKind};
+use storage_core::model::{
+    ExternalId, MountContext, MountSource, Node, NodeId, NodeKind, Presence,
+};
 use storage_provider::Postcondition;
 
 use super::{ObservationError, correlated_node, qualify_observed_status, unknown};
 use crate::{
     HistoricalBaseline, LiveCheck, LiveCheckStatus, LiveObservation, ObservationReference,
+    editing::NodeCorrelation,
 };
 
 /// Observed postconditions retain frozen identities and the exact publication they inspect.
@@ -26,6 +29,18 @@ pub fn check_observed_postconditions(
     observation: &LiveObservation,
     postconditions: &[Postcondition],
 ) -> Result<ObservedPostconditions, ObservationError> {
+    check_observed_postconditions_with_bindings(baseline, observation, postconditions, &[])
+}
+
+/// Checks actual result properties with provisional LV identities supplied by the trusted runtime.
+/// Bindings establish correlation only: size, spec, dependency and diagnostics are still checked.
+/// The runtime must prove a new UUID came from this invocation before publishing a verified binding.
+pub fn check_observed_postconditions_with_bindings(
+    baseline: &HistoricalBaseline,
+    observation: &LiveObservation,
+    postconditions: &[Postcondition],
+    bindings: &[NodeCorrelation],
+) -> Result<ObservedPostconditions, ObservationError> {
     observation.validate()?;
     baseline.snapshot.graph.validate_structure()?;
     Ok(ObservedPostconditions {
@@ -36,7 +51,7 @@ pub fn check_observed_postconditions(
                 condition: condition.clone(),
                 status: qualify_observed_status(
                     observation,
-                    check_result(baseline, observation, condition),
+                    check_result(baseline, observation, condition, bindings),
                 ),
             })
             .collect(),
@@ -48,14 +63,15 @@ fn check_result(
     baseline: &HistoricalBaseline,
     observation: &LiveObservation,
     condition: &Postcondition,
+    bindings: &[NodeCorrelation],
 ) -> LiveCheckStatus {
     match condition {
         Postcondition::DependencyPresent(edge) | Postcondition::DependencyAbsent(edge) => {
-            let (from, _) = match correlated_node(baseline, observation, edge.from) {
+            let (from, _) = match result_node(baseline, observation, edge.from, bindings) {
                 Ok(value) => value,
                 Err(status) => return status,
             };
-            let (to, _) = match correlated_node(baseline, observation, edge.to) {
+            let (to, _) = match result_node(baseline, observation, edge.to, bindings) {
                 Ok(value) => value,
                 Err(status) => return status,
             };
@@ -76,7 +92,7 @@ fn check_result(
             target,
             context: MountContext::Host,
         } => {
-            let (filesystem, node) = match correlated_node(baseline, observation, *source) {
+            let (filesystem, node) = match result_node(baseline, observation, *source, bindings) {
                 Ok(value) => value,
                 Err(status) => return status,
             };
@@ -121,7 +137,7 @@ fn check_result(
             );
         }
     };
-    let (_, observed) = match correlated_node(baseline, observation, source) {
+    let (_, observed) = match result_node(baseline, observation, source, bindings) {
         Ok(value) => value,
         Err(status) => return status,
     };
@@ -161,9 +177,172 @@ fn check_result(
     }
 }
 
+/// Existing-node bindings never override baseline correlation; only unique present LV UUIDs qualify.
+fn result_node<'a>(
+    baseline: &HistoricalBaseline,
+    observation: &'a LiveObservation,
+    source: NodeId,
+    bindings: &[NodeCorrelation],
+) -> Result<(NodeId, &'a Node), LiveCheckStatus> {
+    if baseline.snapshot.graph.node(&source).is_some() {
+        return correlated_node(baseline, observation, source);
+    }
+    let mut candidates = bindings.iter().filter(|item| item.source == source);
+    let binding = candidates
+        .next()
+        .ok_or_else(|| unknown("created output requires runtime UUID evidence"))?;
+    if candidates.next().is_some()
+        || bindings
+            .iter()
+            .filter(|item| item.target == binding.target)
+            .count()
+            != 1
+    {
+        return Err(unknown("created output binding is ambiguous"));
+    }
+    let node = observation
+        .snapshot
+        .graph
+        .node(&binding.target)
+        .ok_or_else(|| unknown("bound output is absent"))?;
+    if source.as_uuid().is_nil()
+        || node.size.presence != Presence::Present
+        || !matches!((&node.kind.kind, &binding.identity), (NodeKind::LvmLv(_), ExternalId::LvmLvUuid(uuid)) if !uuid.trim().is_empty() && uuid.trim() == uuid)
+        || !node.size.identities.contains(&binding.identity)
+        || node
+            .size
+            .identities
+            .iter()
+            .filter(|id| matches!(id, ExternalId::LvmLvUuid(_)))
+            .count()
+            != 1
+        || observation
+            .snapshot
+            .graph
+            .nodes()
+            .filter(|(_, node)| node.size.identities.contains(&binding.identity))
+            .count()
+            != 1
+    {
+        return Err(unknown(
+            "created output needs one unambiguous observed LV UUID",
+        ));
+    }
+    Ok((binding.target, node))
+}
+
 /// Reports a concrete mismatch separately from an evidence gap.
 fn violated(reason: &str) -> LiveCheckStatus {
     LiveCheckStatus::Violated {
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage_core::model::{LvmLv, LvmLvKind, ProbeEpoch};
+    use uuid::Uuid;
+
+    /// Provisional correlation cannot override existing identities or bypass UUID uniqueness.
+    #[test]
+    fn output_correlations_require_unique_uuid_and_never_override_baseline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../examples/fixtures/probe_snapshot.json"))?;
+        let snapshot = serde_json::from_value(raw["current"].clone())?;
+        let baseline = HistoricalBaseline {
+            id: Uuid::now_v7(),
+            snapshot,
+            capacity_evidence: Vec::new(),
+        };
+        let (&vg, original) = baseline.snapshot.graph.nodes().next().ok_or("VG")?;
+        let planned = NodeId::new();
+        let actual = NodeId::new();
+        let mut lv = original.clone();
+        lv.kind.kind = NodeKind::LvmLv(LvmLv {
+            name: "data".into(),
+            kind: LvmLvKind::Linear,
+        });
+        lv.size.identities = vec![ExternalId::LvmLvUuid("created-lv".into())];
+        let mut observation = LiveObservation {
+            reference: ObservationReference {
+                probe_instance: Uuid::now_v7(),
+                epoch: ProbeEpoch::new(1),
+            },
+            snapshot: baseline.snapshot.clone(),
+        };
+        observation.snapshot.graph.insert_new(actual, lv.clone())?;
+        let binding = NodeCorrelation {
+            source: planned,
+            target: actual,
+            identity: lv.size.identities[0].clone(),
+        };
+        let condition = Postcondition::NodeReprobed(planned);
+        assert_eq!(
+            check_observed_postconditions_with_bindings(
+                &baseline,
+                &observation,
+                std::slice::from_ref(&condition),
+                std::slice::from_ref(&binding)
+            )?
+            .checks[0]
+                .status,
+            LiveCheckStatus::Satisfied
+        );
+        for case in 0..4 {
+            let mut observed = observation.clone();
+            let mut bindings = vec![binding.clone()];
+            match case {
+                0 => bindings.push(binding.clone()),
+                1 => {
+                    bindings[0].identity = ExternalId::Serial {
+                        vendor: None,
+                        value: "not an LV UUID".into(),
+                    }
+                }
+                2 => {
+                    observed
+                        .snapshot
+                        .graph
+                        .insert_new(NodeId::new(), lv.clone())?;
+                }
+                _ => bindings.clear(),
+            }
+            assert!(
+                matches!(
+                    check_observed_postconditions_with_bindings(
+                        &baseline,
+                        &observed,
+                        std::slice::from_ref(&condition),
+                        &bindings
+                    )?
+                    .checks[0]
+                        .status,
+                    LiveCheckStatus::Unknown { .. }
+                ),
+                "case {case}"
+            );
+        }
+        let mut replaced = original.clone();
+        replaced.size.identities = vec![ExternalId::LvmVgUuid("replacement-vg".into())];
+        observation.snapshot.graph.replace_existing(vg, replaced)?;
+        let forged = NodeCorrelation {
+            source: vg,
+            target: actual,
+            identity: binding.identity,
+        };
+        assert!(matches!(
+            check_observed_postconditions_with_bindings(
+                &baseline,
+                &observation,
+                &[Postcondition::NodeReprobed(vg)],
+                &[forged]
+            )?
+            .checks[0]
+                .status,
+            LiveCheckStatus::Unknown { .. }
+        ));
+        Ok(())
     }
 }

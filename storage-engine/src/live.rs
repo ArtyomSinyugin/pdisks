@@ -13,7 +13,10 @@ use crate::{
 mod capacity;
 pub use capacity::check_observed_prerequisites_with_capacity;
 mod verify;
-pub use verify::{ObservedPostconditions, check_observed_postconditions};
+pub use verify::{
+    ObservedPostconditions, check_observed_postconditions,
+    check_observed_postconditions_with_bindings,
+};
 
 /// Partial prerequisite evidence bound to one publication, without applicability or lease claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

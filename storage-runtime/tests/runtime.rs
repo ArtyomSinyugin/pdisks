@@ -371,7 +371,7 @@ mod coordination {
         capability::OperationAvailability,
         checkpoint::ActiveAttempt,
         coordinator::{CoordinatorError, ExecutionCoordinator},
-        dispatcher::{BackendDispatcher, DispatchError},
+        dispatcher::{BackendDispatcher, DispatchError, ExecutionReceipt},
         host::LinuxLiveHost,
         lease::ExecutionRoot,
         targets::ResolvedAction,
@@ -393,6 +393,10 @@ mod coordination {
         pub(super) break_probe: bool,
         /// Simulates an adapter error whose partial effects cannot be ruled out.
         pub(super) fail: bool,
+        /// UUID returned for a fixture-created LV, absent in generic success-only tests.
+        pub(super) created_uuid: Option<String>,
+        /// Selects deliberately incorrect result data for negative verification tests.
+        pub(super) result_case: u8,
     }
     impl BackendDispatcher for FakeDispatcher {
         /// Identifies this test adapter without asserting native backend availability.
@@ -404,7 +408,7 @@ mod coordination {
             &mut self,
             action: &ResolvedAction,
             progress: &mut dyn FnMut(String) -> Result<(), ExecutionRunError>,
-        ) -> Result<BackendOutcome, DispatchError> {
+        ) -> Result<ExecutionReceipt, DispatchError> {
             let attempt = ActiveAttempt::from_bytes(
                 &fs::read(self.root.join("active-attempt.json"))
                     .unwrap_or_else(|error| panic!("checkpoint before dispatch: {error}")),
@@ -426,10 +430,104 @@ mod coordination {
                     },
                 );
             }
+            if let Some(uuid) = &self.created_uuid {
+                use storage_core::model::{Dependency, DependencyKind, LvmLv};
+                let storage_provider::ProviderAction::Lvm(storage_provider::LvmAction::CreateLv {
+                    name,
+                    size,
+                    layout,
+                    ..
+                }) = action.operation()
+                else {
+                    panic!("fixture expects CreateLv");
+                };
+                // Only this fake adapter fabricates a test observation; production consumes native facts.
+                let mut state = self.state.borrow_mut();
+                let vg = action.target().observed_id;
+                let mut lv = state
+                    .current
+                    .graph
+                    .node(&vg)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("fixture VG"));
+                lv.kind.kind = NodeKind::LvmLv(LvmLv {
+                    name: name.clone(),
+                    kind: layout.clone(),
+                });
+                lv.kind.size = Some(if self.result_case == 1 {
+                    Bytes::new(size.as_u64() / 2)
+                } else {
+                    *size
+                });
+                lv.size.identities = vec![ExternalId::LvmLvUuid(if self.result_case == 4 {
+                    "unrelated-uuid".into()
+                } else {
+                    uuid.clone()
+                })];
+                let id = NodeId::new();
+                state
+                    .current
+                    .graph
+                    .insert_new(id, lv.clone())
+                    .unwrap_or_else(|error| panic!("fixture LV: {error}"));
+                let parent = if self.result_case == 2 {
+                    let id = NodeId::new();
+                    let mut other = state
+                        .current
+                        .graph
+                        .node(&vg)
+                        .cloned()
+                        .unwrap_or_else(|| panic!("VG"));
+                    other.size.identities = vec![ExternalId::LvmVgUuid("wrong-owner".into())];
+                    state
+                        .current
+                        .graph
+                        .insert_new(id, other)
+                        .unwrap_or_else(|error| panic!("other VG: {error}"));
+                    id
+                } else {
+                    vg
+                };
+                state.current.graph.insert_dependency(Dependency {
+                    from: parent,
+                    to: id,
+                    kind: DependencyKind::Provides,
+                });
+                if self.result_case == 3 {
+                    state
+                        .current
+                        .graph
+                        .insert_new(NodeId::new(), lv)
+                        .unwrap_or_else(|error| panic!("duplicate UUID: {error}"));
+                }
+                if self.result_case == 6 {
+                    state
+                        .current
+                        .diagnostics
+                        .push(storage_core::model::Diagnostic {
+                            code: "fixture.incomplete".into(),
+                            severity: storage_core::model::DiagnosticSeverity::Error,
+                            subjects: vec![],
+                            message: "incomplete result probe".into(),
+                            evidence: None,
+                            suggested_remedy: None,
+                        });
+                }
+            }
+            if self.result_case == 7 {
+                fs::write(
+                    self.root.join("active-attempt.json"),
+                    b"unreadable incident",
+                )
+                .unwrap_or_else(|error| panic!("clear fault: {error}"));
+            }
             if self.fail {
                 Err(DispatchError::Adapter("completion transport lost".into()))
             } else {
-                Ok(self.outcome.clone())
+                Ok(ExecutionReceipt {
+                    outcome: self.outcome.clone(),
+                    created_lv_uuid: self.created_uuid.clone(),
+                })
             }
         }
     }
@@ -444,6 +542,8 @@ mod coordination {
             outcome: BackendOutcome::Succeeded,
             break_probe: false,
             fail: false,
+            created_uuid: None,
+            result_case: 0,
         }
     }
 
@@ -472,8 +572,12 @@ mod coordination {
         let mut run = ExecutionRun::new(frozen.document())?;
         let fake = dispatcher(&scratch, state.clone());
         let calls = fake.calls.clone();
-        let mut coordinator =
-            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host(state, &run)?, fake);
+        let mut coordinator = ExecutionCoordinator::new(
+            ExecutionRoot::open(&scratch.0)?,
+            host(state, &run)?,
+            fake,
+            &run,
+        );
         let operation = frozen.source_map()[0].operation;
         assert_eq!(
             coordinator.execute_action(&mut run, ActionId::new(0), Some(operation))?,
@@ -557,6 +661,7 @@ mod coordination {
                 ExecutionRoot::open(&scratch.0)?,
                 LinuxLiveHost::new(probe(state), capabilities, authorization),
                 fake,
+                &run,
             );
             coordinator.execute_action(&mut run, ActionId::new(0), None)?;
             assert_eq!(calls.get(), 0, "case {case}");
@@ -588,6 +693,7 @@ mod coordination {
                 ExecutionRoot::open(&scratch.0)?,
                 host(state, &run)?,
                 fake,
+                &run,
             );
             let result = coordinator.execute_action(&mut run, ActionId::new(0), None);
             assert_eq!(result.is_err(), case == 2);
@@ -659,7 +765,7 @@ mod coordination {
             authorization,
         );
         let mut coordinator =
-            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, fake);
+            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, fake, &run);
         assert!(matches!(
             coordinator.execute_action(&mut run, ActionId::new(0), None),
             Err(CoordinatorError::Checkpoint(_))
@@ -671,6 +777,180 @@ mod coordination {
         assert_eq!(
             fs::read(scratch.0.join("active-attempt.json"))?,
             b"competing incident"
+        );
+        Ok(())
+    }
+    /// Receipt UUID plus independent LV properties/ownership is required before clear or binding.
+    #[test]
+    fn created_lv_binding_requires_verified_result_and_exact_owner() -> Result<(), Box<dyn Error>> {
+        use storage_provider::{LvmAction, ProviderAction};
+        for case in 0..7 {
+            let (state, frozen) = fixture()?;
+            let state = Rc::new(RefCell::new(state));
+            if case == 5 {
+                let vg = state.borrow().lvm_vgs[0].node;
+                let mut node = state.borrow().current.graph.node(&vg).ok_or("VG")?.clone();
+                node.kind.kind = NodeKind::LvmLv(storage_core::model::LvmLv {
+                    name: "preexisting".into(),
+                    kind: storage_core::model::LvmLvKind::Linear,
+                });
+                node.size.identities = vec![ExternalId::LvmLvUuid("created-lv-uuid".into())];
+                state
+                    .borrow_mut()
+                    .current
+                    .graph
+                    .insert_new(NodeId::new(), node)?;
+            }
+            let scratch = Scratch::new()?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let ProviderAction::Lvm(LvmAction::CreateLv {
+                planned_node_id, ..
+            }) = &run.context().plan.actions()[0].operation
+            else {
+                return Err("CreateLv".into());
+            };
+            let planned = *planned_node_id;
+            let mut fake = dispatcher(&scratch, state.clone());
+            fake.created_uuid = Some("created-lv-uuid".into());
+            fake.result_case = case;
+            let calls = fake.calls.clone();
+            let mut coordinator = ExecutionCoordinator::new(
+                ExecutionRoot::open(&scratch.0)?,
+                host(state, &run)?,
+                fake,
+                &run,
+            );
+            assert!(coordinator.bindings().is_empty());
+            let result = coordinator.execute_action(&mut run, ActionId::new(0), None);
+            assert_eq!(result.is_err(), (2..=5).contains(&case), "case {case}");
+            assert_eq!(calls.get(), 1);
+            assert_eq!(
+                run.state(ActionId::new(0))?,
+                match case {
+                    0 => ActionRunState::Verified,
+                    1 => ActionRunState::Failed,
+                    _ => ActionRunState::OutcomeUnknown,
+                }
+            );
+            assert_eq!(coordinator.bindings().len(), usize::from(case == 0));
+            assert_eq!(scratch.0.join("active-attempt.json").exists(), case != 0);
+            assert!(!run.is_verified());
+            if case == 0 {
+                assert_eq!(fs::read_dir(&scratch.0)?.count(), 1);
+                let actual = run.latest_observation().ok_or("actual result")?;
+                let id = coordinator.bindings().resolve(&run, planned, actual)?;
+                assert_ne!(id, planned);
+                assert!(
+                    actual
+                        .snapshot
+                        .graph
+                        .node(&id)
+                        .ok_or("LV")?
+                        .size
+                        .identities
+                        .contains(&ExternalId::LvmLvUuid("created-lv-uuid".into()))
+                );
+                let mut replacement = actual.clone();
+                let mut node = replacement.snapshot.graph.node(&id).ok_or("LV")?.clone();
+                node.size.identities = vec![ExternalId::LvmLvUuid("replacement".into())];
+                replacement.snapshot.graph.replace_existing(id, node)?;
+                assert!(
+                    coordinator
+                        .bindings()
+                        .resolve(&run, planned, &replacement)
+                        .is_err()
+                );
+                let mut other = ExecutionRun::new(frozen.document())?;
+                assert!(
+                    coordinator
+                        .bindings()
+                        .resolve(&other, planned, actual)
+                        .is_err()
+                );
+                assert!(matches!(
+                    coordinator.execute_action(&mut other, ActionId::new(0), None),
+                    Err(CoordinatorError::RunMismatch)
+                ));
+                assert_eq!(other.state(ActionId::new(0))?, ActionRunState::Waiting);
+            }
+        }
+        Ok(())
+    }
+    /// Neither a different adapter nor an old unresolved incident may reach the dispatcher.
+    #[test]
+    fn backend_mismatch_and_existing_incident_prevent_dispatch() -> Result<(), Box<dyn Error>> {
+        for existing in [false, true] {
+            let (state, frozen) = fixture()?;
+            let state = Rc::new(RefCell::new(state));
+            let scratch = Scratch::new()?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let mut fake = dispatcher(&scratch, state.clone());
+            if existing {
+                fs::write(
+                    scratch.0.join("active-attempt.json"),
+                    b"unresolved incident",
+                )?;
+            } else {
+                fake.backend = BackendId::new("different-adapter").ok_or("backend")?;
+            }
+            let calls = fake.calls.clone();
+            let mut coordinator = ExecutionCoordinator::new(
+                ExecutionRoot::open(&scratch.0)?,
+                host(state, &run)?,
+                fake,
+                &run,
+            );
+            assert!(
+                coordinator
+                    .execute_action(&mut run, ActionId::new(0), None)
+                    .is_err()
+            );
+            assert_eq!(calls.get(), 0);
+            assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Checking);
+            assert!(coordinator.bindings().is_empty());
+            if existing {
+                assert_eq!(
+                    fs::read(scratch.0.join("active-attempt.json"))?,
+                    b"unresolved incident"
+                );
+            } else {
+                assert!(!scratch.0.join("active-attempt.json").exists());
+            }
+        }
+        Ok(())
+    }
+    /// Verified output cannot authorize a successor when checkpoint clear fails afterwards.
+    #[test]
+    fn clear_failure_keeps_coordinator_stopped_after_verified_result() -> Result<(), Box<dyn Error>>
+    {
+        let (state, frozen) = fixture()?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = Scratch::new()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let mut fake = dispatcher(&scratch, state.clone());
+        fake.created_uuid = Some("created-lv-uuid".into());
+        fake.result_case = 7;
+        let calls = fake.calls.clone();
+        let mut coordinator = ExecutionCoordinator::new(
+            ExecutionRoot::open(&scratch.0)?,
+            host(state, &run)?,
+            fake,
+            &run,
+        );
+        assert!(matches!(
+            coordinator.execute_action(&mut run, ActionId::new(0), None),
+            Err(CoordinatorError::Checkpoint(_))
+        ));
+        assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Verified);
+        assert_eq!(coordinator.bindings().len(), 1);
+        assert!(matches!(
+            coordinator.execute_action(&mut run, ActionId::new(1), None),
+            Err(CoordinatorError::Stopped)
+        ));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            fs::read(scratch.0.join("active-attempt.json"))?,
+            b"unreadable incident"
         );
         Ok(())
     }

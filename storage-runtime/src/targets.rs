@@ -167,11 +167,12 @@ pub fn resolve_action(
 
 /// Conservatively compares the whole connected component, including existing LV consumers.
 /// Unsupported identities prevent admission rather than silently reducing the checked scope.
-fn check_scope(
+pub(crate) fn check_scope(
     baseline: &CurrentState,
     current: &CurrentState,
     source: NodeId,
 ) -> Result<(), TargetError> {
+    // shortcut: require supported LVM/filesystem identities, extend correlation before native PV-backed writes.
     let mut selected = vec![source];
     loop {
         let before = selected.len();

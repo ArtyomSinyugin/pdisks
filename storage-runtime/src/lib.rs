@@ -19,3 +19,5 @@ pub mod host;
 #[cfg(target_os = "linux")]
 pub mod coordinator;
 pub mod dispatcher;
+
+pub mod bindings;

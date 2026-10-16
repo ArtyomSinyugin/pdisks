@@ -1,16 +1,15 @@
 //! Single synchronous admission/checkpoint/dispatch/completion path for the first LVM action.
 
 use crate::{
+    bindings::{BindingError, OutputBindings, verify_created_lv},
     checkpoint::{ActiveAttempt, CheckpointError, CheckpointStore},
-    dispatcher::BackendDispatcher,
+    dispatcher::{BackendDispatcher, ExecutionReceipt},
     host::{HostError, RuntimeHost},
     lease::{ExecutionLease, ExecutionRoot, LeaseError},
 };
 use storage_engine::{
     ActionId, ActionRunState, BackendCompletion, BackendOutcome, ExecutionRun, ExecutionRunError,
-    VerificationReport,
     editing::OperationId,
-    live::{ObservationError, check_observed_postconditions},
 };
 use thiserror::Error;
 
@@ -23,6 +22,12 @@ pub enum CoordinatorError {
     /// A trusted host returned an endpoint inconsistent with the frozen action or dispatcher.
     #[error("admission endpoint does not match the run, publication, operation, or backend")]
     InvalidDecision,
+    /// The coordinator and output bindings belong to a different execution attempt.
+    #[error("coordinator belongs to another run")]
+    RunMismatch,
+    /// Created output identity or actual result could not be established.
+    #[error(transparent)]
+    Binding(#[from] BindingError),
     /// OS exclusion could not be established.
     #[error(transparent)]
     Lease(#[from] LeaseError),
@@ -35,9 +40,6 @@ pub enum CoordinatorError {
     /// The engine rejected a report or lifecycle transition.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
-    /// Actual postconditions could not be interpreted.
-    #[error(transparent)]
-    Observation(#[from] ObservationError),
 }
 
 /// Owns the only host-side sequence around a synchronous backend call.
@@ -51,17 +53,28 @@ pub struct ExecutionCoordinator<H, D> {
     dispatcher: D,
     /// Latched before invocation and cleared only after verified result plus durable checkpoint clear.
     halted: bool,
+    /// Attempt that owns this coordinator and its verified output identities.
+    run_id: uuid::Uuid,
+    /// Created nodes remain unavailable until complete postcondition verification.
+    bindings: OutputBindings,
 }
 
 impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
     /// Requires explicit host policies and dispatcher; no default write configuration exists.
-    pub fn new(root: ExecutionRoot, host: H, dispatcher: D) -> Self {
+    pub fn new(root: ExecutionRoot, host: H, dispatcher: D, run: &ExecutionRun) -> Self {
         Self {
             root,
             host,
             dispatcher,
             halted: false,
+            run_id: run.run_id(),
+            bindings: OutputBindings::new(run),
         }
+    }
+
+    /// Returns only outputs whose retained completion passed full postcondition verification.
+    pub fn bindings(&self) -> &OutputBindings {
+        &self.bindings
     }
 
     /// Executes one waiting/checking action, respecting the engine's verified-predecessor rules.
@@ -73,6 +86,9 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         action: ActionId,
         operation: Option<OperationId>,
     ) -> Result<ActionRunState, CoordinatorError> {
+        if self.run_id != run.run_id() {
+            return Err(CoordinatorError::RunMismatch);
+        }
         if self.halted {
             return Err(CoordinatorError::Stopped);
         }
@@ -124,11 +140,14 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         // Every exit after this boundary retains the stop latch unless clear is acknowledged.
         self.halted = true;
         run.mark_dispatch_started(action)?;
-        let outcome = self
+        let receipt = self
             .dispatcher
             .execute(&resolved, &mut |detail| run.record_progress(action, detail))
-            .unwrap_or_else(|error| BackendOutcome::OutcomeUnknown {
-                reason: error.to_string(),
+            .unwrap_or_else(|error| ExecutionReceipt {
+                outcome: BackendOutcome::OutcomeUnknown {
+                    reason: error.to_string(),
+                },
+                created_lv_uuid: None,
             });
         let post = match self.host.probe() {
             Ok(post) => post,
@@ -140,39 +159,35 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         if let Err(error) = run.record_completion(BackendCompletion {
             run_id: run.run_id(),
             action,
-            outcome,
+            outcome: receipt.outcome,
             observation: post.into_observation(),
         }) {
             run.mark_outcome_unknown(action, error.to_string())?;
             return Err(error.into());
         }
+        let mut pending = None;
         if run.state(action)? == ActionRunState::Verifying {
-            let context = run.context();
-            let completion = run
-                .completion(action)?
-                .ok_or(ExecutionRunError::ReportMismatch)?;
-            let report = match check_observed_postconditions(
-                context.historical_baseline,
-                &completion.observation,
-                &context.plan.actions()[action.get() as usize]
-                    .informational_contract
-                    .postconditions,
+            let (report, candidate) = match verify_created_lv(
+                run,
+                action,
+                &resolved,
+                observed.observation(),
+                receipt.created_lv_uuid.as_deref(),
             ) {
-                Ok(report) => report,
+                Ok(result) => result,
                 Err(error) => {
                     run.mark_outcome_unknown(action, error.to_string())?;
                     return Err(error.into());
                 }
             };
-            run.record_verification(VerificationReport {
-                run_id: run.run_id(),
-                action,
-                observation: report.observation,
-                checks: report.checks,
-            })?;
+            run.record_verification(report)?;
+            pending = candidate;
         }
         let state = run.state(action)?;
         if state == ActionRunState::Verified {
+            if let Some(binding) = pending {
+                self.bindings.record_verified(run, binding)?;
+            }
             store.clear(run.run_id(), action)?;
             self.halted = false;
         }

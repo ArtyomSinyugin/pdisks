@@ -436,6 +436,22 @@ fresh admission → durable checkpoint → Running → typed synchronous dispatc
 через coordinator. Финальная проверка всей цели остаётся отдельным этапом;
 `execute_action()` не объявляет run успешным.
 
+`ExecutionReceipt` может содержать UUID созданного LV. Runtime проверяет, что UUID
+не существовал до вызова, уникально наблюдается после него и принадлежит именно
+допущенной VG. Остальной затронутый компонент должен совпадать с reviewed scope.
+Provisional correlation передаётся в чистую engine-проверку: она независимо
+сверяет размер, свойства и Provides edge; UUID не подменяет эти postconditions.
+Только после `Verified` появляется запись в `OutputBindings`, затем очищается
+checkpoint. Последующие обращения к binding повторно проверяют UUID, VG owner,
+свойства и публикацию; другой run использовать его не может.
+
+Coordinator привязан к одному `ExecutionRun`. Успешный синтетический `CreateLv`
+проверен до `Verified` и удаления checkpoint, но `run.is_verified()` остаётся false:
+SetActivation, исполнение всего DAG и отдельная финальная goal/preservation
+verification ещё не подключены. Корреляция PV/физических устройств также требует
+расширения до работы с настоящей VG; неизвестный scope сейчас отклоняется.
+Ни один production native write-adapter не зарегистрирован.
+
 ## Аварийный checkpoint вместо истории выполнения
 
 Старый JSONL-журнал удалён. Импорт исторических `.jsonl`, восстановление run и
@@ -473,7 +489,7 @@ checkpoint переживает завершение процесса и тре�
 
 Тесты проверяют I/O-отказы на границах sync/publication/removal, конкуренцию
 hosts и реальные дочерние процессы с `SIGKILL`. Это не проверка отключения питания
-или аппаратной надёжности накопителя. Coordinator, incident assessment и native
+или аппаратной надёжности накопителя. Incident assessment, полный запуск плана и native
 write ещё не реализованы; изменение устройств и незавершённый disks preview
 остаются выключенными.
 

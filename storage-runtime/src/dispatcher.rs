@@ -16,6 +16,15 @@ pub enum DispatchError {
     Progress(#[from] ExecutionRunError),
 }
 
+/// Completed adapter result; an optional native LV UUID never replaces a fresh provider pass.
+#[derive(Debug)]
+pub struct ExecutionReceipt {
+    /// Classified synchronous completion, including partial failure or uncertainty.
+    pub outcome: BackendOutcome,
+    /// UUID returned by a trusted CreateLv adapter; names or planned NodeIds are not evidence.
+    pub created_lv_uuid: Option<String>,
+}
+
 /// Trusted typed backend called only after admission and durable checkpoint publication.
 /// Returns completed outcomes, not asynchronous launch acknowledgments; errors become unknown.
 pub trait BackendDispatcher {
@@ -26,5 +35,5 @@ pub trait BackendDispatcher {
         &mut self,
         action: &ResolvedAction,
         progress: &mut dyn FnMut(String) -> Result<(), ExecutionRunError>,
-    ) -> Result<BackendOutcome, DispatchError>;
+    ) -> Result<ExecutionReceipt, DispatchError>;
 }
