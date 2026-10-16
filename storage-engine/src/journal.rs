@@ -12,7 +12,9 @@ use crate::{
 };
 
 mod file;
+mod recovery;
 pub use file::DurableJournal;
+pub use recovery::{RecoveryAction, RecoveryReview, RecoveryStatus};
 
 /// Initial JSON-lines journal envelope, separate from plan/action schemas.
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
@@ -204,13 +206,12 @@ impl JournalLog {
         let JournalRecord::Header(header) = records.remove(0) else {
             return Err(JournalError::Structure("first record must be the header"));
         };
-        header.validate()?;
         let log = Self {
             header: *header,
             records,
             incomplete_tail: complete != bytes.len(),
         };
-        log.validate_records()?;
+        log.review()?;
         Ok(log)
     }
 
