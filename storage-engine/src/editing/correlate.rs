@@ -1,4 +1,4 @@
-//! Conservative correlation of selected existing LVM and filesystem nodes across observations.
+//! Conservative correlation of selected storage identities and uniquely backed partition tables.
 
 use std::collections::HashSet;
 
@@ -6,14 +6,14 @@ use serde::Serialize;
 use storage_core::model::{CurrentState, ExternalId, GraphError, Node, NodeId, NodeKind, Presence};
 use thiserror::Error;
 
-/// One uniquely matched existing object; planned outputs never need correlation.
+/// One stable match from an original/planned object to an actual observed object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeCorrelation {
     /// Identity in the original observed graph.
     pub source: NodeId,
     /// Identity in the new observed graph, independent of paths and display names.
     pub target: NodeId,
-    /// Exact provider identity shared by both nodes.
+    /// Exact shared identity, or the uniquely backing disk identity for a partition table.
     pub identity: ExternalId,
 }
 
@@ -29,7 +29,7 @@ pub enum CorrelationError {
     /// A nil identity or non-present observation cannot identify an existing object.
     #[error("node {0:?} is not a present, non-nil observed object")]
     NotPresent(NodeId),
-    /// Initial correlation supports LVM VG/LV UUIDs and ordinary filesystem UUID records.
+    /// The selected kind requires a supported durable UUID or WWN; serials and paths are insufficient.
     #[error("node {0:?} has no supported stable identity")]
     NoIdentity(NodeId),
     /// More than one original identity or original node could identify the selected object.
@@ -73,6 +73,14 @@ pub fn correlate_nodes(
             .node(source)
             .ok_or(CorrelationError::MissingSource(*source))?;
         present(*source, node)?;
+        if matches!(node.kind.kind, NodeKind::PartitionTable(_)) {
+            let binding = correlate_partition_table(current, next, *source)?;
+            if !targets.insert(binding.target) {
+                return Err(CorrelationError::AmbiguousTarget(*source));
+            }
+            result.push(binding);
+            continue;
+        }
         let identities: Vec<_> = node
             .size
             .identities
@@ -115,7 +123,13 @@ pub fn correlate_nodes(
         }
         present(*target, candidate)?;
         let compatible = match (&node.kind.kind, &candidate.kind.kind) {
-            (NodeKind::LvmVg { .. }, NodeKind::LvmVg { .. }) => true,
+            (NodeKind::LvmVg { .. }, NodeKind::LvmVg { .. })
+            | (NodeKind::LvmPv, NodeKind::LvmPv)
+            | (NodeKind::Disk, NodeKind::Disk)
+            | (NodeKind::Partition { .. }, NodeKind::Partition { .. }) => true,
+            (NodeKind::NvmeNamespace(left), NodeKind::NvmeNamespace(right)) => {
+                left.format == right.format
+            }
             (NodeKind::LvmLv(left), NodeKind::LvmLv(right)) => left.kind == right.kind,
             (NodeKind::Filesystem { kind: left, .. }, NodeKind::Filesystem { kind: right, .. }) => {
                 left == right
@@ -147,6 +161,80 @@ pub fn correlate_nodes(
     Ok(result)
 }
 
+/// A table has no UUID in this model, so require one table of the same type on a uniquely matched disk.
+/// Only physical disk/namespace parents qualify; malformed graphs cannot recurse through table cycles.
+fn correlate_partition_table(
+    current: &CurrentState,
+    next: &CurrentState,
+    source: NodeId,
+) -> Result<NodeCorrelation, CorrelationError> {
+    use storage_core::model::DependencyKind;
+    let mut parents = current
+        .graph
+        .dependencies()
+        .filter(|edge| edge.to == source);
+    let parent = parents.next().ok_or(CorrelationError::NoIdentity(source))?;
+    if parents.next().is_some()
+        || parent.kind != DependencyKind::Backs
+        || !current.graph.node(&parent.from).is_some_and(|node| {
+            matches!(node.kind.kind, NodeKind::Disk | NodeKind::NvmeNamespace(_))
+        })
+        || current
+            .graph
+            .dependencies()
+            .filter(|edge| {
+                edge.from == parent.from
+                    && edge.kind == DependencyKind::Backs
+                    && current
+                        .graph
+                        .node(&edge.to)
+                        .is_some_and(|node| matches!(node.kind.kind, NodeKind::PartitionTable(_)))
+            })
+            .count()
+            != 1
+    {
+        return Err(CorrelationError::AmbiguousSource(source));
+    }
+    let matched = correlate_nodes(current, next, &[parent.from])
+        .map_err(|error| match error {
+            CorrelationError::NoIdentity(_) => CorrelationError::NoIdentity(source),
+            other => other,
+        })?
+        .pop()
+        .ok_or(CorrelationError::NoIdentity(source))?;
+    let mut tables = next
+        .graph
+        .dependencies()
+        .filter(|edge| edge.from == matched.target && edge.kind == DependencyKind::Backs)
+        .filter_map(|edge| next.graph.node(&edge.to).map(|node| (edge.to, node)))
+        .filter(|(_, node)| matches!(node.kind.kind, NodeKind::PartitionTable(_)));
+    let (target, node) = tables
+        .next()
+        .ok_or(CorrelationError::MissingTarget(source))?;
+    if tables.next().is_some()
+        || next
+            .graph
+            .dependencies()
+            .filter(|edge| edge.to == target)
+            .count()
+            != 1
+    {
+        return Err(CorrelationError::AmbiguousTarget(source));
+    }
+    present(target, node)?;
+    if current.graph.node(&source).map(|node| &node.kind.kind) != Some(&node.kind.kind) {
+        return Err(CorrelationError::KindChanged {
+            source_node: source,
+            target,
+        });
+    }
+    Ok(NodeCorrelation {
+        source,
+        target,
+        identity: matched.identity,
+    })
+}
+
 /// Rejects placeholders and nil canonical identities even when they carry matching UUID text.
 fn present(id: NodeId, node: &Node) -> Result<(), CorrelationError> {
     if id.as_uuid().is_nil() || node.size.presence != Presence::Present {
@@ -155,11 +243,21 @@ fn present(id: NodeId, node: &Node) -> Result<(), CorrelationError> {
     Ok(())
 }
 
-/// Limits the first correlation recipe to durable identities for its supported storage kinds.
+/// Accepts only durable UUID/WWN identities appropriate to the observed storage kind.
 fn supported_identity(node: &Node, identity: &ExternalId) -> bool {
     let value = match (&node.kind.kind, identity) {
         (NodeKind::LvmVg { .. }, ExternalId::LvmVgUuid(value))
-        | (NodeKind::LvmLv(_), ExternalId::LvmLvUuid(value)) => value,
+        | (NodeKind::LvmLv(_), ExternalId::LvmLvUuid(value))
+        | (NodeKind::LvmPv, ExternalId::LvmPvUuid(value))
+        | (NodeKind::Disk, ExternalId::Wwn(value)) => value,
+        (NodeKind::Partition { .. }, ExternalId::GptPartitionUuid(uuid))
+        | (NodeKind::NvmeNamespace(_), ExternalId::NvmeUuid(uuid)) => return !uuid.is_nil(),
+        (NodeKind::NvmeNamespace(_), ExternalId::NvmeNguid(bytes)) => {
+            return bytes.iter().any(|byte| *byte != 0);
+        }
+        (NodeKind::NvmeNamespace(_), ExternalId::NvmeEui64(bytes)) => {
+            return bytes.iter().any(|byte| *byte != 0);
+        }
         (NodeKind::Filesystem { kind, .. }, ExternalId::Filesystem { fs_type, value })
             if fs_type == kind.as_str() =>
         {

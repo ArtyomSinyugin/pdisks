@@ -185,7 +185,7 @@ fn partition_edits_replay_with_stable_ids_and_preserved_obligations()
     assert!(session.draft().operations.is_empty());
     assert_eq!(session.baseline(), &baseline);
     assert_eq!(frozen.document().canonical_json()?, frozen_json);
-    // Partition-table identities have no supported UUID correlation recipe yet.
+    // This fixture has no disk WWN, so its partition table still cannot be correlated.
     session.undo(session.revision())?;
     let mut next = baseline.clone();
     next.id = uuid::Uuid::now_v7();
