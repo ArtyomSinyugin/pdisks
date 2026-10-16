@@ -34,7 +34,7 @@ impl CredentialRef {
 
 /// Typed operations whose semantics belong to the logical LUKS provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LuksAction {
     /// Writes a new LUKS header to a block-providing node.
     Format {
@@ -245,7 +245,7 @@ fn translate_header(header: CryptsetupEntry) -> Result<LuksObservation, LuksVali
 
 /// Checks one LUKS action against the canonical graph.
 pub(crate) fn validate_action(action: &LuksAction, graph: &NodeGraph) -> Vec<Diagnostic> {
-    match action {
+    let mut diagnostics = match action {
         LuksAction::Format { target, .. } => validate_kind(
             graph,
             *target,
@@ -265,11 +265,24 @@ pub(crate) fn validate_action(action: &LuksAction, graph: &NodeGraph) -> Vec<Dia
                 "LUKS open requires a LUKS container",
                 |kind| matches!(kind, NodeKind::LuksContainer { .. }),
             );
-            if mapping_name.is_empty() || mapping_name.contains(['/', '\0']) {
+            if mapping_name.trim().is_empty()
+                || matches!(mapping_name.as_str(), "." | "..")
+                || mapping_name.contains(['/', '\0'])
+            {
                 diagnostics.push(action_diagnostic(
                     "luks.open.invalid_mapping_name",
                     *container,
-                    "device-mapper name must be non-empty and contain neither '/' nor NUL",
+                    "device-mapper name must not be blank, dot, dot-dot, or contain slash or NUL",
+                ));
+            }
+            if graph.nodes().any(|(_, node)| {
+                matches!(&node.kind.kind,
+                NodeKind::DmCryptMapping { name } if name == mapping_name)
+            }) {
+                diagnostics.push(action_diagnostic(
+                    "luks.open.mapping_name_in_use",
+                    *container,
+                    "device-mapper name is already used by a known dm-crypt mapping",
                 ));
             }
             diagnostics
@@ -288,7 +301,28 @@ pub(crate) fn validate_action(action: &LuksAction, graph: &NodeGraph) -> Vec<Dia
             }
             diagnostics
         }
+    };
+    let credential = match action {
+        LuksAction::Format {
+            target, credential, ..
+        } => Some((*target, credential)),
+        LuksAction::Open {
+            container,
+            credential,
+            ..
+        } => Some((*container, credential)),
+        LuksAction::Close { .. } | LuksAction::Resize { .. } => None,
+    };
+    if let Some((node, credential)) = credential
+        && credential.as_uuid().is_nil()
+    {
+        diagnostics.push(action_diagnostic(
+            "luks.action.invalid_credential",
+            node,
+            "credential reference must identify an external credential store entry",
+        ));
     }
+    diagnostics
 }
 
 /// Checks that a node exists and has an accepted semantic kind.
@@ -437,6 +471,92 @@ mod tests {
         assert!(serde_json::from_str::<CredentialRef>(r#""actual-passphrase""#).is_err());
     }
 
+    /// Format/open reject missing credential identities and unsafe or occupied mapping names.
+    #[test]
+    fn preparation_validates_credentials_names_and_action_json()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut graph, container) = graph_with(NodeKind::LuksContainer {
+            version: LuksVersion::Luks2,
+        });
+        let credential = CredentialRef::from_uuid(Uuid::now_v7());
+        for name in ["", " ", ".", "..", "bad/name", "bad\0name", "crypt-data"] {
+            let action = LuksAction::Open {
+                container,
+                planned_node_id: NodeId::new(),
+                mapping_name: name.to_owned(),
+                credential,
+                read_only: false,
+            };
+            let diagnostics = validate_action(&action, &graph);
+            assert_eq!(diagnostics.is_empty(), name == "crypt-data", "{name:?}");
+            assert_eq!(
+                serde_json::from_str::<LuksAction>(&serde_json::to_string(&action)?)?,
+                action
+            );
+        }
+        let occupied = NodeId::new();
+        graph.insert_new(
+            occupied,
+            Node {
+                kind: NodeSpec {
+                    kind: NodeKind::DmCryptMapping {
+                        name: "crypt-data".to_owned(),
+                    },
+                    size: None,
+                },
+                size: NodeFacts::default(),
+            },
+        )?;
+        let action = LuksAction::Open {
+            container,
+            planned_node_id: NodeId::new(),
+            mapping_name: "crypt-data".to_owned(),
+            credential,
+            read_only: false,
+        };
+        assert!(
+            validate_action(&action, &graph)
+                .iter()
+                .any(|d| d.code == "luks.open.mapping_name_in_use")
+        );
+        let (disk_graph, disk) = graph_with(NodeKind::Disk);
+        for action in [
+            LuksAction::Format {
+                target: disk,
+                planned_node_id: NodeId::new(),
+                version: LuksVersion::Luks2,
+                credential: CredentialRef::from_uuid(Uuid::nil()),
+            },
+            LuksAction::Open {
+                container,
+                planned_node_id: NodeId::new(),
+                mapping_name: "crypt-other".to_owned(),
+                credential: CredentialRef::from_uuid(Uuid::nil()),
+                read_only: true,
+            },
+        ] {
+            let context = if matches!(action, LuksAction::Format { .. }) {
+                &disk_graph
+            } else {
+                &graph
+            };
+            assert!(
+                validate_action(&action, context)
+                    .iter()
+                    .any(|d| d.code == "luks.action.invalid_credential")
+            );
+            let mut json = serde_json::to_value(&action)?;
+            let variant = if matches!(action, LuksAction::Format { .. }) {
+                "format"
+            } else {
+                "open"
+            };
+            json[variant]["passphrase"] = serde_json::json!("must not be accepted");
+            assert!(serde_json::from_value::<LuksAction>(json).is_err());
+        }
+        Ok(())
+    }
+
     /// Ensures logical validation rejects opening a non-LUKS node.
     #[test]
     fn open_requires_luks_container() {
@@ -452,7 +572,7 @@ mod tests {
                 container: disk,
                 planned_node_id: NodeId::new(),
                 mapping_name: "crypt-root".to_owned(),
-                credential: CredentialRef::from_uuid(Uuid::nil()),
+                credential: CredentialRef::from_uuid(Uuid::now_v7()),
                 read_only: false,
             },
             &graph,
