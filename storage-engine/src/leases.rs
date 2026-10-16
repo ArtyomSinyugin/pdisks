@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{
     ActionId, ActionRunState, AdmissionReport, ExecutionRun, ExecutionRunError, LiveCheck,
     LiveCheckStatus, LiveObservation,
+    journal::{DurableJournal, JournalError},
 };
 
 /// Permanent name shared by every cooperating host, regardless of transient plan/node IDs.
@@ -44,6 +45,9 @@ pub enum LeaseError {
     /// The requested action or run lifecycle is invalid.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
+    /// Intent was not durably acknowledged; the host must not dispatch.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
 }
 
 /// Exclusive cooperative lease bound to one run/action; dropping it releases the OS lock.
@@ -159,6 +163,19 @@ impl ExecutionLease {
             held_resources: self.resources.clone(),
             checks,
         })?)
+    }
+
+    /// Syncs this admitted action's invocation intent while the OS lease remains held.
+    /// Dispatch requires success here and separate complete live authorization.
+    /// Keep this guard through completion probing, journaling, and verification.
+    pub fn record_dispatch_intent(
+        &self,
+        journal: &mut DurableJournal,
+        run: &ExecutionRun,
+    ) -> Result<(), LeaseError> {
+        self.check_run(run)?;
+        journal.record_dispatch_intent(run, self.action)?;
+        Ok(())
     }
 
     /// Rejects accidental reuse of a lease with another attempt before changing any run state.

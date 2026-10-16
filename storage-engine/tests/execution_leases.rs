@@ -208,3 +208,90 @@ fn leased_admission_binds_run_and_preserves_existing_evidence_rules() -> Result<
     drop(next);
     Ok(())
 }
+
+/// Intent is synced only under matching admission; exclusion survives completion and verification.
+#[test]
+fn lease_remains_held_through_journal_and_result_verification() -> Result<(), Box<dyn Error>> {
+    use storage_engine::{
+        BackendCompletion, BackendOutcome, LiveCheck, LiveCheckStatus, VerificationReport,
+        journal::{DurableJournal, JournalLog, RecoveryStatus},
+    };
+    let root = Scratch::new()?;
+    let (frozen, _) = fixture()?;
+    let mut run = ExecutionRun::new(frozen.document())?;
+    let mut other = ExecutionRun::new(frozen.document())?;
+    let path = root.0.join("run.jsonl");
+    let mut journal = DurableJournal::create(&path, &frozen, &run)?;
+    let other_path = root.0.join("other.jsonl");
+    let mut other_journal = DurableJournal::create(&other_path, &frozen, &other)?;
+    let action = ActionId::new(0);
+    run.begin_check(action)?;
+    other.begin_check(action)?;
+    let lease = ExecutionLease::try_acquire(&root.0, &run, action)?;
+    let before = fs::read(&path)?;
+    assert!(lease.record_dispatch_intent(&mut journal, &run).is_err());
+    assert_eq!(fs::read(&path)?, before);
+    let instance = Uuid::now_v7();
+    let observed = observation(&run, instance, 1);
+    let claims = checks(&run, LiveCheckStatus::Satisfied);
+    assert!(lease.record_admission(&mut run, observed, LiveCheckStatus::Satisfied, claims)?);
+    assert!(matches!(
+        lease.record_dispatch_intent(&mut journal, &other),
+        Err(LeaseError::RunMismatch)
+    ));
+    let before_other = fs::read(&other_path)?;
+    assert!(
+        lease
+            .record_dispatch_intent(&mut other_journal, &run)
+            .is_err()
+    );
+    assert_eq!(fs::read(&other_path)?, before_other);
+    lease.record_dispatch_intent(&mut journal, &run)?;
+    assert_eq!(
+        JournalLog::read(&path)?.review()?.actions[0].status,
+        RecoveryStatus::InvocationUnconfirmed
+    );
+    let bytes = fs::read(&path)?;
+    assert!(lease.record_dispatch_intent(&mut journal, &run).is_err());
+    assert_eq!(fs::read(&path)?, bytes);
+    let completion = BackendCompletion {
+        run_id: run.run_id(),
+        action,
+        outcome: BackendOutcome::Succeeded,
+        observation: observation(&run, instance, 2),
+    };
+    let reference = completion.observation.reference;
+    run.record_completion(completion)?;
+    journal.record_completion(&run, action)?;
+    assert!(matches!(
+        ExecutionLease::try_acquire(&root.0, &other, action),
+        Err(LeaseError::Busy)
+    ));
+    // The synthetic verifier tests guard lifetime only, never native result evidence.
+    let postconditions = run.context().plan.actions()[0]
+        .informational_contract
+        .postconditions
+        .iter()
+        .cloned()
+        .map(|condition| LiveCheck {
+            condition,
+            status: LiveCheckStatus::Satisfied,
+        })
+        .collect();
+    run.record_verification(VerificationReport {
+        run_id: run.run_id(),
+        action,
+        observation: reference,
+        checks: postconditions,
+    })?;
+    journal.flush_events(&run)?;
+    assert!(matches!(
+        ExecutionLease::try_acquire(&root.0, &other, action),
+        Err(LeaseError::Busy)
+    ));
+    assert!(!run.is_verified());
+    drop(lease);
+    let next = ExecutionLease::try_acquire(&root.0, &other, action)?;
+    drop(next);
+    Ok(())
+}
