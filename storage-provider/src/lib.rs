@@ -753,7 +753,8 @@ pub struct LvmPvEntry {
 }
 
 /// One LVM volume group.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LvmVgEntry {
     /// Volume-group name.
     pub name: String,
@@ -769,6 +770,17 @@ pub struct LvmVgEntry {
     pub pv_count: u64,
     /// Whether the volume group is exported.
     pub exported: bool,
+}
+
+/// Raw VG capacity bound to the canonical node assembled during the same provider pass.
+/// Byte counts remain observations; converting them to allocation units belongs to the consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LvmVgObservation {
+    /// Canonical VG identity assigned by the adapter that consumed this record.
+    pub node: storage_core::model::NodeId,
+    /// Original provider record, including UUID, extent size, free bytes, and export status.
+    pub vg: LvmVgEntry,
 }
 
 /// One LVM logical volume.

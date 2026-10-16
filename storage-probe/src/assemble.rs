@@ -1,12 +1,12 @@
 //! Provider orchestration and assembly of the canonical current state.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use storage_core::model::{
     CurrentState, Diagnostic, DiagnosticSeverity, DiagnosticSubject, Environment, MountState,
     NodeGraph, NodeId, ObservedMount, SystemEnvironment,
 };
-use storage_provider::ProviderConnectionKind;
+use storage_provider::{LvmVgObservation, ProviderConnectionKind};
 use thiserror::Error;
 
 /// Successful read-only contribution from one provider.
@@ -16,6 +16,8 @@ pub struct ProviderState {
     pub graph: NodeGraph,
     /// Runtime mounts observed by the provider.
     pub mounts: Vec<ObservedMount>,
+    /// VG records bound to nodes in this same contribution; not independent later measurements.
+    pub lvm_vgs: Vec<LvmVgObservation>,
     /// Environment facts when this provider owns their discovery.
     pub environment: Option<Environment>,
     /// Provider-specific diagnostics produced during successful probing.
@@ -63,6 +65,14 @@ pub trait StateProvider {
 
 /// Calls providers and assembles their observations into one current state.
 pub fn probe(providers: &[&dyn StateProvider]) -> CurrentState {
+    probe_with_observations(providers).0
+}
+
+/// Calls each adapter once and preserves allocation records alongside the resulting graph.
+/// Conflicting node contributions cannot supply trusted capacity to this publication.
+pub fn probe_with_observations(
+    providers: &[&dyn StateProvider],
+) -> (CurrentState, Vec<LvmVgObservation>) {
     let mut by_responsibility: BTreeMap<&str, Vec<&dyn StateProvider>> = BTreeMap::new();
     for provider in providers {
         by_responsibility
@@ -73,6 +83,8 @@ pub fn probe(providers: &[&dyn StateProvider]) -> CurrentState {
 
     let mut state = empty_current_state();
     let mut owners = HashMap::<NodeId, String>::new();
+    let mut lvm_vgs = Vec::new();
+    let mut conflicts = HashSet::new();
 
     for (responsibility, adapters) in by_responsibility {
         if adapters.len() != 1 {
@@ -84,8 +96,15 @@ pub fn probe(providers: &[&dyn StateProvider]) -> CurrentState {
 
         let adapter = adapters[0];
         match adapter.probe() {
-            Ok(contribution) => {
-                merge_provider_state(&mut state, &mut owners, adapter.id(), contribution)
+            Ok(mut contribution) => {
+                lvm_vgs.append(&mut contribution.lvm_vgs);
+                merge_provider_state(
+                    &mut state,
+                    &mut owners,
+                    &mut conflicts,
+                    adapter.id(),
+                    contribution,
+                )
             }
             Err(error) => state.diagnostics.push(provider_failure(
                 adapter.id(),
@@ -95,7 +114,8 @@ pub fn probe(providers: &[&dyn StateProvider]) -> CurrentState {
         }
     }
 
-    state
+    lvm_vgs.retain(|observation| !conflicts.contains(&observation.node));
+    (state, lvm_vgs)
 }
 
 /// Creates an empty state before provider contributions are merged.
@@ -115,21 +135,25 @@ fn empty_current_state() -> CurrentState {
 fn merge_provider_state(
     state: &mut CurrentState,
     owners: &mut HashMap<NodeId, String>,
+    conflicts: &mut HashSet<NodeId>,
     provider_id: &str,
     contribution: ProviderState,
 ) {
     for (id, node) in contribution.graph.nodes() {
         match state.graph.node(id) {
-            Some(existing) if existing != node => state.diagnostics.push(Diagnostic {
-                code: "provider.node_conflict".into(),
-                severity: DiagnosticSeverity::Error,
-                subjects: vec![DiagnosticSubject::Node(*id)],
-                message: format!("providers disagree about node {id:?}"),
-                evidence: owners.get(id).map(|owner| {
-                    format!("first provider: {owner}; conflicting provider: {provider_id}")
-                }),
-                suggested_remedy: Some("repeat probing and inspect provider evidence".into()),
-            }),
+            Some(existing) if existing != node => {
+                conflicts.insert(*id);
+                state.diagnostics.push(Diagnostic {
+                    code: "provider.node_conflict".into(),
+                    severity: DiagnosticSeverity::Error,
+                    subjects: vec![DiagnosticSubject::Node(*id)],
+                    message: format!("providers disagree about node {id:?}"),
+                    evidence: owners.get(id).map(|owner| {
+                        format!("first provider: {owner}; conflicting provider: {provider_id}")
+                    }),
+                    suggested_remedy: Some("repeat probing and inspect provider evidence".into()),
+                });
+            }
             Some(_) => {}
             None => {
                 state
@@ -268,6 +292,111 @@ mod tests {
             graph,
             ..ProviderState::default()
         }
+    }
+
+    /// Builds a raw VG allocation record for publication-boundary tests.
+    fn allocation(node: NodeId) -> LvmVgObservation {
+        LvmVgObservation {
+            node,
+            vg: storage_provider::LvmVgEntry {
+                name: "vg0".to_owned(),
+                uuid: "vg-uuid".to_owned(),
+                size: 400 * 1024 * 1024,
+                extent_size: 4 * 1024 * 1024,
+                free: 200 * 1024 * 1024,
+                pv_count: 1,
+                exported: false,
+            },
+        }
+    }
+
+    /// Graph and capacity come from exactly the same adapter invocation and round-trip together.
+    #[test]
+    fn allocation_records_are_published_without_a_second_probe() {
+        let node = NodeId::new();
+        let calls = Rc::new(Cell::new(0));
+        let mut contribution = disk_state(node);
+        contribution.lvm_vgs.push(allocation(node));
+        let provider = FakeProvider {
+            id: "vg",
+            responsibility: "vg",
+            connection: ProviderConnectionKind::BuiltIn,
+            calls: calls.clone(),
+            result: Ok(contribution),
+        };
+        let (current, lvm_vgs) = probe_with_observations(&[&provider]);
+        assert_eq!(calls.get(), 1);
+        assert!(current.graph.node(&node).is_some());
+        assert_eq!(lvm_vgs, vec![allocation(node)]);
+        let snapshot = crate::ProbeSnapshot {
+            generation: 1,
+            current,
+            lvm_vgs,
+        };
+        let mut value = serde_json::to_value(&snapshot).expect("encode snapshot");
+        assert_eq!(
+            serde_json::from_value::<crate::ProbeSnapshot>(value.clone()).expect("decode snapshot"),
+            snapshot
+        );
+        value
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("lvm_vgs");
+        assert!(
+            serde_json::from_value::<crate::ProbeSnapshot>(value)
+                .expect("legacy snapshot")
+                .lvm_vgs
+                .is_empty()
+        );
+    }
+
+    /// No capacity survives disagreement about its node, even if only the first adapter supplied it.
+    #[test]
+    fn conflicting_nodes_and_responsibilities_cannot_publish_capacity() {
+        let node = NodeId::new();
+        let mut first = disk_state(node);
+        first.lvm_vgs.push(allocation(node));
+        let mut second = disk_state(node);
+        second
+            .graph
+            .replace_existing(
+                node,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Disk,
+                        size: Some(storage_core::model::Bytes::new(1)),
+                    },
+                    size: NodeFacts::default(),
+                },
+            )
+            .expect("change node");
+        let calls = Rc::new(Cell::new(0));
+        let first = FakeProvider {
+            id: "first",
+            responsibility: "one",
+            connection: ProviderConnectionKind::BuiltIn,
+            calls: calls.clone(),
+            result: Ok(first),
+        };
+        let mut second = FakeProvider {
+            id: "second",
+            responsibility: "two",
+            connection: ProviderConnectionKind::BuiltIn,
+            calls: calls.clone(),
+            result: Ok(second),
+        };
+        let (current, observations) = probe_with_observations(&[&first, &second]);
+        assert!(observations.is_empty());
+        assert!(
+            current
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "provider.node_conflict")
+        );
+        second.responsibility = "one";
+        let (_, observations) = probe_with_observations(&[&first, &second]);
+        assert!(observations.is_empty());
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

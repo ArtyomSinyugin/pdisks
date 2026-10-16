@@ -1952,11 +1952,18 @@ impl LinuxProbe {
             .iter()
             .map(|provider| provider.as_ref())
             .collect::<Vec<_>>();
-        let current = assemble::probe(&providers);
-        let generation = self.generation.get().checked_add(1)
+        let (current, lvm_vgs) = assemble::probe_with_observations(&providers);
+        let generation = self
+            .generation
+            .get()
+            .checked_add(1)
             .unwrap_or_else(|| panic!("probe publication generation exhausted"));
         self.generation.set(generation);
-        ProbeSnapshot { generation, current }
+        ProbeSnapshot {
+            generation,
+            current,
+            lvm_vgs,
+        }
     }
 }
 
