@@ -7,6 +7,8 @@ pub mod editing;
 mod effects;
 mod execution;
 pub mod journal;
+#[cfg(target_os = "linux")]
+pub mod leases;
 pub mod live;
 mod observe;
 mod plan;
