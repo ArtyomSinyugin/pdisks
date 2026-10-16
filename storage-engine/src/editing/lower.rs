@@ -142,6 +142,29 @@ pub fn lower_operation(
                 description: "create logical volume".to_owned(),
             }
         }
+        PlanRequest::ResizeLv { lv, new_size } => {
+            operations.push(ProviderAction::Lvm(LvmAction::ResizeLv {
+                lv: *lv,
+                new_size: *new_size,
+            }));
+            FragmentOrigin::Change {
+                subject: *lv,
+                description: "resize logical volume".to_owned(),
+            }
+        }
+        PlanRequest::ResizeFilesystem {
+            filesystem,
+            new_size,
+        } => {
+            operations.push(ProviderAction::Filesystem(FilesystemAction::Resize {
+                filesystem: *filesystem,
+                new_size: *new_size,
+            }));
+            FragmentOrigin::Change {
+                subject: *filesystem,
+                description: "resize ext filesystem".to_owned(),
+            }
+        }
         PlanRequest::CreateFilesystem {
             backing,
             filesystem,

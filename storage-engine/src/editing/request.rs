@@ -63,6 +63,22 @@ pub enum PlanRequest {
         /// Whether the created volume should be activated.
         activate: bool,
     },
+    /// Resizes an identified LV through provider capacity and dependent-layer checks.
+    /// This changes existing capacity rather than editing a CreateLv request.
+    ResizeLv {
+        /// Existing or planned LV to resize, preserving its identity.
+        lv: NodeId,
+        /// Exact requested resulting capacity in bytes.
+        new_size: Bytes,
+    },
+    /// Resizes an ext filesystem; shrink requires explicit unmount and forced Check requests.
+    /// The provider evaluates direction and prerequisites against the shared replay prefix.
+    ResizeFilesystem {
+        /// Existing or planned ext2/ext3/ext4 filesystem.
+        filesystem: NodeId,
+        /// Exact requested resulting capacity in bytes.
+        new_size: Bytes,
+    },
     /// Creates one filesystem on a referenced block node.
     CreateFilesystem {
         /// Existing or planned block-providing node.
@@ -119,11 +135,13 @@ impl PlanRequest {
         match self {
             Self::CreatePartition { table, .. } => vec![*table],
             Self::CreateLv { vg, .. } => vec![*vg],
+            Self::ResizeLv { lv, .. } => vec![*lv],
             Self::CreateFilesystem { backing, .. } | Self::FormatLuks { backing, .. } => {
                 vec![*backing]
             }
             Self::OpenLuks { container, .. } => vec![*container],
-            Self::SetFilesystemLabel { filesystem, .. } => vec![*filesystem],
+            Self::SetFilesystemLabel { filesystem, .. }
+            | Self::ResizeFilesystem { filesystem, .. } => vec![*filesystem],
             Self::Mount(entry) | Self::PersistMount(entry) => match &entry.source {
                 MountSource::Filesystem(node)
                 | MountSource::BtrfsSubvolume(node)
@@ -157,11 +175,13 @@ impl PlanRequest {
         match self {
             Self::CreatePartition { table, .. } => remap(table),
             Self::CreateLv { vg, .. } => remap(vg),
+            Self::ResizeLv { lv, .. } => remap(lv),
             Self::CreateFilesystem { backing, .. } | Self::FormatLuks { backing, .. } => {
                 remap(backing)
             }
             Self::OpenLuks { container, .. } => remap(container),
-            Self::SetFilesystemLabel { filesystem, .. } => remap(filesystem),
+            Self::SetFilesystemLabel { filesystem, .. }
+            | Self::ResizeFilesystem { filesystem, .. } => remap(filesystem),
             Self::Mount(entry) | Self::PersistMount(entry) => match &mut entry.source {
                 MountSource::Filesystem(node)
                 | MountSource::BtrfsSubvolume(node)
@@ -215,6 +235,14 @@ mod remap_tests {
                 mapping_name: "crypt-data".to_owned(),
                 credential: CredentialRef::from_uuid(source.as_uuid()),
                 read_only: true,
+            },
+            PlanRequest::ResizeLv {
+                lv: source,
+                new_size: Bytes::new(1024),
+            },
+            PlanRequest::ResizeFilesystem {
+                filesystem: source,
+                new_size: Bytes::new(1024),
             },
             PlanRequest::Mount(entry.clone()),
             PlanRequest::PersistMount(entry.clone()),

@@ -130,6 +130,27 @@ pub(super) fn request_coverage(
                 }
         }
         (
+            PlanRequest::ResizeLv { lv, new_size },
+            [
+                ProviderAction::Lvm(LvmAction::ResizeLv {
+                    lv: actual,
+                    new_size: actual_size,
+                }),
+            ],
+        ) => lv == actual && new_size == actual_size,
+        (
+            PlanRequest::ResizeFilesystem {
+                filesystem,
+                new_size,
+            },
+            [
+                ProviderAction::Filesystem(FilesystemAction::Resize {
+                    filesystem: actual,
+                    new_size: actual_size,
+                }),
+            ],
+        ) => filesystem == actual && new_size == actual_size,
+        (
             PlanRequest::CreateFilesystem {
                 backing,
                 filesystem,
@@ -224,6 +245,55 @@ mod tests {
     use storage_core::model::{
         Bytes, FilesystemKind, LvmLvKind, MountContext, MountEntry, MountSource, NodeId,
     };
+
+    /// Resize recipes preserve target identity and reject changed sizes, targets, and hidden actions.
+    #[test]
+    fn resize_coverage_requires_exact_actions_and_no_new_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let node = NodeId::new();
+        for request in [
+            PlanRequest::ResizeLv {
+                lv: node,
+                new_size: Bytes::new(4096),
+            },
+            PlanRequest::ResizeFilesystem {
+                filesystem: node,
+                new_size: Bytes::new(4096),
+            },
+        ] {
+            let operation = PlanOperation::new(request);
+            assert!(operation.created_node.is_none());
+            let fragment = lower_operation(&operation, None)
+                .unwrap_or_else(|error| panic!("lower resize: {error:?}"));
+            assert_eq!(fragment.actions.len(), 1);
+            let action = &fragment.actions[0].operation;
+            assert!(request_coverage(&operation, &[action]).covered);
+            assert!(!request_coverage(&operation, &[]).covered);
+            assert!(!request_coverage(&operation, &[action, action]).covered);
+            assert_eq!(
+                serde_json::from_str::<ProviderAction>(&serde_json::to_string(action)?)?,
+                *action
+            );
+            for change_target in [false, true] {
+                let mut changed = action.clone();
+                let (target, size) = match &mut changed {
+                    ProviderAction::Lvm(LvmAction::ResizeLv { lv, new_size }) => (lv, new_size),
+                    ProviderAction::Filesystem(FilesystemAction::Resize {
+                        filesystem,
+                        new_size,
+                    }) => (filesystem, new_size),
+                    _ => return Err("unexpected resize recipe".into()),
+                };
+                if change_target {
+                    *target = NodeId::new();
+                } else {
+                    *size = Bytes::new(8192);
+                }
+                assert!(!request_coverage(&operation, &[&changed]).covered);
+            }
+        }
+        Ok(())
+    }
 
     /// LUKS coverage independently checks identities, credentials, format version, and access mode.
     #[test]

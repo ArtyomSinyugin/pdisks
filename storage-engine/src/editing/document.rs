@@ -206,9 +206,9 @@ mod tests {
     }
 }
 
-/// Version of persisted editable requests; version 3 adds LUKS format/open.
-/// Versions 1 and 2 remain readable with their original request catalogues.
-pub const DRAFT_SCHEMA_VERSION: u32 = 3;
+/// Version of persisted editable requests; version 4 adds LV and filesystem resize.
+/// Versions 1 through 3 remain readable with their original request catalogues.
+pub const DRAFT_SCHEMA_VERSION: u32 = 4;
 
 /// Maximum UTF-8 size accepted by the draft JSON boundary, including its historical snapshot.
 pub const MAX_DRAFT_JSON_BYTES: usize = 1024 * 1024;
@@ -305,6 +305,8 @@ impl DraftDocument {
         }
         if let Some(operation) = self.draft.operations.iter().find(|operation| {
             let required_version = match operation.request {
+                super::PlanRequest::ResizeLv { .. }
+                | super::PlanRequest::ResizeFilesystem { .. } => 4,
                 super::PlanRequest::FormatLuks { .. } | super::PlanRequest::OpenLuks { .. } => 3,
                 super::PlanRequest::CreatePartition { .. } => 2,
                 _ => 1,
@@ -446,7 +448,7 @@ mod draft_tests {
                 assert!(document.to_json().is_err());
                 assert!(PlanSession::from_document(document.clone()).is_err());
             }
-            document.schema_version = DRAFT_SCHEMA_VERSION;
+            document.schema_version = 3;
             let json = document.to_json()?;
             assert_eq!(DraftDocument::from_json(&json)?, document);
             let mut value: serde_json::Value = serde_json::from_str(&json)?;
@@ -464,6 +466,38 @@ mod draft_tests {
                 DraftDocument::from_json(&value.to_string()),
                 Err(DraftDocumentError::Json(_))
             ));
+        }
+        Ok(())
+    }
+
+    /// Resize requests require their declared catalogue even when imported through typed data.
+    #[test]
+    fn resize_requests_require_schema_four() -> Result<(), Box<dyn std::error::Error>> {
+        let mut document = PlanSession::new(baseline())?.draft_document();
+        let node = lv_request().referenced_nodes()[0];
+        for request in [
+            PlanRequest::ResizeLv {
+                lv: node,
+                new_size: Bytes::new(4096),
+            },
+            PlanRequest::ResizeFilesystem {
+                filesystem: node,
+                new_size: Bytes::new(4096),
+            },
+        ] {
+            document.draft.operations = vec![PlanOperation::new(request)];
+            for version in 1..DRAFT_SCHEMA_VERSION {
+                document.schema_version = version;
+                assert!(
+                    matches!(DraftDocument::from_json(&serde_json::to_string(&document)?), Err(DraftDocumentError::RequestVersion { version: actual, .. }) if actual == version)
+                );
+                assert!(PlanSession::from_document(document.clone()).is_err());
+            }
+            document.schema_version = DRAFT_SCHEMA_VERSION;
+            assert_eq!(DraftDocument::from_json(&document.to_json()?)?, document);
+            let mut invalid = document.clone();
+            invalid.draft.operations[0].created_node = Some(NodeId::new());
+            assert!(invalid.to_json().is_err());
         }
         Ok(())
     }
