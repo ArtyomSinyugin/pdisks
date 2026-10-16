@@ -189,7 +189,7 @@ fn check_result(
 }
 
 /// Existing-node bindings never override baseline correlation; only unique present LV UUIDs qualify.
-fn result_node<'a>(
+pub(super) fn result_node<'a>(
     baseline: &HistoricalBaseline,
     observation: &'a LiveObservation,
     source: NodeId,
@@ -290,6 +290,25 @@ mod tests {
             identity: lv.size.identities[0].clone(),
         };
         let condition = Postcondition::NodeReprobed(planned);
+        let prerequisites = [storage_provider::ActionPrerequisite::NodeExists(planned)];
+        assert!(matches!(
+            super::super::check_observed_prerequisites(&baseline, &observation, &prerequisites)?
+                .checks[0]
+                .status,
+            LiveCheckStatus::Unknown { .. }
+        ));
+        assert_eq!(
+            super::super::check_observed_prerequisites_with_bindings(
+                &baseline,
+                &observation,
+                &[],
+                &prerequisites,
+                std::slice::from_ref(&binding)
+            )?
+            .checks[0]
+                .status,
+            LiveCheckStatus::Satisfied
+        );
         assert_eq!(
             check_observed_postconditions_with_bindings(
                 &baseline,
@@ -320,6 +339,18 @@ mod tests {
                 }
                 _ => bindings.clear(),
             }
+            assert!(matches!(
+                super::super::check_observed_prerequisites_with_bindings(
+                    &baseline,
+                    &observed,
+                    &[],
+                    &prerequisites,
+                    &bindings
+                )?
+                .checks[0]
+                    .status,
+                LiveCheckStatus::Unknown { .. }
+            ));
             assert!(
                 matches!(
                     check_observed_postconditions_with_bindings(

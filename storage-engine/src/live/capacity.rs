@@ -1,7 +1,7 @@
 //! Pure same-publication capacity checks; collection belongs to storage-runtime.
 
 use super::{
-    ObservationError, ObservedPrerequisites, check_observed_prerequisites, correlated_node,
+    ObservationError, ObservedPrerequisites, check_prerequisites_with_bindings, correlated_node,
     qualify_observed_status, unknown,
 };
 use crate::{CapacityEvidence, HistoricalBaseline, LiveCheckStatus, LiveObservation};
@@ -16,7 +16,21 @@ pub fn check_observed_prerequisites_with_capacity(
     capacity: &[CapacityEvidence],
     prerequisites: &[ActionPrerequisite],
 ) -> Result<ObservedPrerequisites, ObservationError> {
-    let mut report = check_observed_prerequisites(baseline, observation, prerequisites)?;
+    check_observed_prerequisites_with_bindings(baseline, observation, capacity, prerequisites, &[])
+}
+
+/// Checks actual capacity and UUID-qualified planned outputs without trusting predicted nodes.
+/// The runtime must supply only bindings already verified in this execution attempt.
+/// Existing baseline identities cannot be overridden by an output binding.
+pub fn check_observed_prerequisites_with_bindings(
+    baseline: &HistoricalBaseline,
+    observation: &LiveObservation,
+    capacity: &[CapacityEvidence],
+    prerequisites: &[ActionPrerequisite],
+    bindings: &[crate::editing::NodeCorrelation],
+) -> Result<ObservedPrerequisites, ObservationError> {
+    let mut report =
+        check_prerequisites_with_bindings(baseline, observation, prerequisites, bindings)?;
     for check in &mut report.checks {
         if let ActionPrerequisite::CapacityAvailable { domain, amount } = &check.condition {
             check.status = qualify_observed_status(

@@ -568,6 +568,10 @@ adapter; обычный manifest по-прежнему разрешает тол
 Unknown. Отсутствие endpoint не доказывает inactive. Pure postconditions
 проверяют `Activation` по этому факту и UUID correlation, включая provisional
 bindings созданных LV; это ещё не подтверждение writable block interface.
+`check_observed_prerequisites_with_bindings()` использует ту же строгую UUID
+корреляцию для последующих действий над подтверждёнными outputs. Без binding,
+при неоднозначной identity или blocking diagnostics prerequisites остаются
+Unknown; существующие baseline-узлы нельзя переназначить через output binding.
 
 `ProviderState.lvm_vgs` и `ProbeSnapshot.lvm_vgs` сохраняют исходные LVM VG
 records с соответствующими `NodeId` из того же прохода. `LinuxProbe` вызывает

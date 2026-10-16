@@ -11,6 +11,7 @@ use crate::{
 };
 
 mod capacity;
+pub use capacity::check_observed_prerequisites_with_bindings;
 pub use capacity::check_observed_prerequisites_with_capacity;
 mod verify;
 pub use verify::{
@@ -35,6 +36,16 @@ pub fn check_observed_prerequisites(
     observation: &LiveObservation,
     prerequisites: &[ActionPrerequisite],
 ) -> Result<ObservedPrerequisites, ObservationError> {
+    check_prerequisites_with_bindings(baseline, observation, prerequisites, &[])
+}
+
+/// Reuses strict result correlation for verified outputs supplied by the trusted runtime.
+fn check_prerequisites_with_bindings(
+    baseline: &HistoricalBaseline,
+    observation: &LiveObservation,
+    prerequisites: &[ActionPrerequisite],
+    bindings: &[crate::editing::NodeCorrelation],
+) -> Result<ObservedPrerequisites, ObservationError> {
     observation.validate()?;
     baseline.snapshot.graph.validate_structure()?;
     Ok(ObservedPrerequisites {
@@ -45,7 +56,7 @@ pub fn check_observed_prerequisites(
                 condition: condition.clone(),
                 status: qualify_observed_status(
                     observation,
-                    check_node_fact(baseline, observation, condition),
+                    check_node_fact(baseline, observation, condition, bindings),
                 ),
             })
             .collect(),
@@ -95,6 +106,7 @@ fn check_node_fact(
     baseline: &HistoricalBaseline,
     observation: &LiveObservation,
     condition: &ActionPrerequisite,
+    bindings: &[crate::editing::NodeCorrelation],
 ) -> LiveCheckStatus {
     let source = match condition {
         ActionPrerequisite::NodeExists(node)
@@ -105,7 +117,7 @@ fn check_node_fact(
         | ActionPrerequisite::FilesystemUnmounted(node) => *node,
         _ => return unknown("runtime provider evidence is required for this condition"),
     };
-    let (target, node) = match correlated_node(baseline, observation, source) {
+    let (target, node) = match verify::result_node(baseline, observation, source, bindings) {
         Ok(value) => value,
         Err(status) => return status,
     };
