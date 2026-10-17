@@ -593,6 +593,11 @@ Runtime scope заново коррелирует typed mount sources, вклю�
 компонента. Смена transient ID и порядка options допустима; UUID replacement,
 клонированный UUID, новый target или неоднозначный mount target блокируют admission.
 
+Сквозной native mock DAG содержит существующую ext4 на другом диске. Её transient
+ID меняется на каждом probe; UUID и mount semantics остаются основанием сравнения.
+Финальные option drift, overmount и filesystem UUID replacement не дают Verified
+run после успешных actions. Native mkfs/mount adapters этим не включаются.
+
 `live::check_observed_goal()` независимо проверяет финальный фактический граф
 после UUID correlation, включая подтверждённые outputs, точные связи/размеры
 и последнее запрошенное состояние активации. Host filesystem/tmpfs mounts
@@ -617,8 +622,9 @@ Unsupported или несовпадение backend у позднего дейс
 Сквозной native DAG тест требует независимый final coverage даже после двух
 Verified actions. При final Unknown повторная проверка получает новый probe,
 но не повторяет writes. Непустая protection policy без доказательства сохранности
-остаётся Unknown даже при точном совпадении графа. Mount/boot goal adapters и
-production policies пока не реализованы; default configuration остаётся read-only.
+остаётся Unknown даже при точном совпадении графа. Host mount source/options
+проверяются по actual observations; persistent/managed boot/namespace adapters
+и production policies пока не реализованы. Default configuration остаётся read-only.
 
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся

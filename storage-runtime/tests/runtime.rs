@@ -1647,6 +1647,23 @@ mod native_execution {
                     kind: DependencyKind::Provides,
                 });
             }
+            // Recorded existing filesystems get fresh transient IDs; UUIDs and all relationships remain intact.
+            let filesystems: Vec<_> = state
+                .current
+                .graph
+                .nodes()
+                .filter(|(_, node)| matches!(node.kind.kind, NodeKind::Filesystem { .. }))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in filesystems {
+                state = serde_json::from_str(&serde_json::to_string(&state)?.replace(
+                    &id.as_uuid().to_string(),
+                    &NodeId::new().as_uuid().to_string(),
+                ))?;
+            }
+            for mount in &mut state.current.mounts.entries {
+                mount.options.reverse();
+            }
             Ok(state)
         }
     }
@@ -1937,6 +1954,167 @@ mod native_execution {
             }
             if case != 3 {
                 assert!(!scratch.0.join("active-attempt.json").exists());
+            }
+        }
+        Ok(())
+    }
+    /// Fault injection occurs only on a later probe after activation was already observed once.
+    struct MountedNativeProvider<'backend> {
+        /// Native LV reads plus recorded independent physical/filesystem observations.
+        inner: NativeProvider<'backend>,
+        /// Final fault: zero none, one options, two overmount, three filesystem UUID replacement.
+        fault: u8,
+        /// Distinguishes the action post-probe from the independent final probe.
+        active_seen: Cell<bool>,
+    }
+    impl StateProvider for MountedNativeProvider<'_> {
+        /// Keeps the fixture distinct from installed providers.
+        fn id(&self) -> &str {
+            "mounted-native-fixture"
+        }
+        /// Owns the complete isolated topology in this test only.
+        fn responsibility(&self) -> &str {
+            "fixture.mounted_native"
+        }
+        /// No external process or disk device is involved in this provider.
+        fn connection_kind(&self) -> ProviderConnectionKind {
+            ProviderConnectionKind::BuiltIn
+        }
+        /// Publishes fresh native state, optionally injecting drift only after both actions were Verified.
+        fn probe(&self) -> Result<ProviderState, ProviderProbeError> {
+            let mut state = self.inner.probe()?;
+            let active = state.graph.nodes().any(|(_, node)| {
+                matches!(node.kind.kind, NodeKind::LvmLv(_)) && node.size.lvm_active == Some(true)
+            });
+            if active && self.active_seen.replace(true) {
+                // Equivalent option order in a later publication must not invalidate a mount goal.
+                for mount in &mut state.mounts {
+                    mount.options.reverse();
+                }
+                match self.fault {
+                    1 => state.mounts[0].options = vec!["ro".into(), "nodev".into()],
+                    2 => {
+                        let mut overmount = state.mounts[0].clone();
+                        overmount.source = storage_core::model::MountSource::Tmpfs;
+                        state.mounts.push(overmount);
+                    }
+                    3 => {
+                        let (id, mut node) = state
+                            .graph
+                            .nodes()
+                            .find(|(_, node)| matches!(node.kind.kind, NodeKind::Filesystem { .. }))
+                            .map(|(id, node)| (*id, node.clone()))
+                            .ok_or_else(|| {
+                                ProviderProbeError::new("fixture.fs", "missing filesystem")
+                            })?;
+                        node.size.identities = vec![ExternalId::Filesystem {
+                            fs_type: "ext4".into(),
+                            value: "replacement".into(),
+                        }];
+                        state.graph.replace_existing(id, node).map_err(|error| {
+                            ProviderProbeError::new("fixture.fs", error.to_string())
+                        })?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(state)
+        }
+    }
+
+    /// Existing mounted filesystems survive transient IDs; final drift cannot be hidden by earlier Verified actions.
+    #[test]
+    fn native_run_rechecks_existing_mounts_after_verified_actions() -> Result<(), Box<dyn Error>> {
+        use storage_core::model::{FilesystemKind, MountContext, MountSource, ObservedMount};
+        for fault in 0..4 {
+            let library = mock_lvm::Fixture::new(0)?;
+            let backend = library.registry.backends().next().ok_or("mock backend")?;
+            let (mut template, _) = fixture()?;
+            let original = template
+                .current
+                .graph
+                .nodes()
+                .find(|(_, node)| matches!(node.kind.kind, NodeKind::Disk))
+                .map(|(_, node)| node.clone())
+                .ok_or("disk")?;
+            let disk = NodeId::new();
+            let fs = NodeId::new();
+            let mut disk_node = original.clone();
+            disk_node.size.identities = vec![ExternalId::Wwn("existing-root-disk".into())];
+            template.current.graph.insert_new(disk, disk_node)?;
+            let mut filesystem = original;
+            filesystem.kind.kind = NodeKind::Filesystem {
+                kind: FilesystemKind::Ext4,
+                label: Some("existing".into()),
+            };
+            filesystem.size.identities = vec![ExternalId::Filesystem {
+                fs_type: "ext4".into(),
+                value: "existing-fs-uuid".into(),
+            }];
+            filesystem.size.block = None;
+            template.current.graph.insert_new(fs, filesystem)?;
+            template.current.graph.insert_dependency(Dependency {
+                from: disk,
+                to: fs,
+                kind: DependencyKind::Backs,
+            });
+            template.current.mounts.entries.push(ObservedMount {
+                source: MountSource::Filesystem(fs),
+                target: "/existing".into(),
+                options: vec!["rw".into(), "nodev".into()],
+                context: MountContext::Host,
+            });
+            let inner = NativeProvider { backend, template };
+            let initial = inner.snapshot()?;
+            let baseline =
+                HistoricalBaseline::from_lvm_observations(initial.current, &initial.lvm_vgs)?;
+            let mut session = PlanSession::new(baseline)?;
+            session.add_lv(
+                session.revision(),
+                initial.lvm_vgs[0].node,
+                "data",
+                Bytes::new(4096),
+            )?;
+            let frozen = session.freeze(session.revision())?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let adapter = NativeLvmAdapter::new(backend)?;
+            let scratch = admission::Scratch::new()?;
+            let calls = Rc::new(Cell::new(0));
+            let dispatcher = CheckedDispatcher {
+                native: adapter,
+                root: scratch.0.clone(),
+                calls: calls.clone(),
+            };
+            let provider = MountedNativeProvider {
+                inner,
+                fault,
+                active_seen: Cell::new(false),
+            };
+            let host = LinuxLiveHost::new(
+                LinuxProbe::from_providers(vec![Box::new(provider)]),
+                MockScope(adapter, true),
+                MockApproval {
+                    run_id: run.run_id(),
+                    digest: plan_digest(run.document())?,
+                },
+            );
+            let mut coordinator =
+                ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+            let summary = coordinator.execute_run(&mut run)?;
+            assert_eq!(summary.verified, fault == 0, "fault {fault}");
+            assert_eq!(calls.get(), 2);
+            assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Verified);
+            assert_eq!(run.state(ActionId::new(1))?, ActionRunState::Verified);
+            assert!(summary.stopped_action.is_none());
+            assert!(!scratch.0.join("active-attempt.json").exists());
+            let report = run.goal_verification().ok_or("final report")?;
+            if fault != 0 {
+                assert!(
+                    report
+                        .checks
+                        .iter()
+                        .any(|check| check.status != LiveCheckStatus::Satisfied)
+                );
             }
         }
         Ok(())
