@@ -4,7 +4,7 @@ use crate::{
     bindings::{BindingError, OutputBindings, verify_activation, verify_created_lv},
     checkpoint::{ActiveAttempt, CheckpointError, CheckpointStore},
     dispatcher::{BackendDispatcher, ExecutionReceipt},
-    host::{HostError, RuntimeHost},
+    host::{HostError, RuntimeHost, check_reviewed_plan},
     lease::{ExecutionLease, ExecutionRoot, HostExecutionLock, LeaseError},
 };
 use storage_engine::{
@@ -16,6 +16,9 @@ use thiserror::Error;
 /// Rejected execution never falls back to unchecked dispatch or automatic retry.
 #[derive(Debug, Error)]
 pub enum CoordinatorError {
+    /// At least one frozen operation lacks support; the run has not invoked any backend.
+    #[error("whole-plan readiness is not satisfied: {0:?}")]
+    PlanUnavailable(storage_engine::LiveCheckStatus),
     /// Final success is immutable; an already verified run is never executed again.
     #[error("run is already verified")]
     AlreadyVerified,
@@ -109,10 +112,18 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         if run.is_verified() {
             return Err(CoordinatorError::AlreadyVerified);
         }
+        check_reviewed_plan(run)?;
         let lock = self.root.try_lock_host()?;
         let store = CheckpointStore::new(&lock);
         if store.inspect()?.is_some() {
             return Err(HostError::ActiveAttempt.into());
+        }
+        let initial = self.host.probe()?;
+        let readiness = self
+            .host
+            .check_plan(run, &initial, self.dispatcher.backend_id(), &lock)?;
+        if readiness != storage_engine::LiveCheckStatus::Satisfied {
+            return Err(CoordinatorError::PlanUnavailable(readiness));
         }
         let ordered: Vec<_> = run
             .context()
@@ -182,6 +193,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         if self.halted {
             return Err(CoordinatorError::Stopped);
         }
+        check_reviewed_plan(run)?;
         match run.state(action)? {
             ActionRunState::Waiting => run.begin_check(action)?,
             ActionRunState::Checking => {}

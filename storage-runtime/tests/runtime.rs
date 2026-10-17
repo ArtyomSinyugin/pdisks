@@ -2075,6 +2075,16 @@ mod run_coordinator {
         root: PathBuf,
     }
     impl<H: RuntimeHost> RuntimeHost for LockedHost<H> {
+        /// Keeps whole-plan readiness checks on the actual host implementation.
+        fn check_plan(
+            &mut self,
+            run: &ExecutionRun,
+            observed: &ProbedObservation,
+            backend: &BackendId,
+            lock: &HostExecutionLock,
+        ) -> Result<storage_engine::LiveCheckStatus, HostError> {
+            self.inner.check_plan(run, observed, backend, lock)
+        }
         /// Every entry must see the run lock already held, not merely the preceding action's lease.
         fn probe(&mut self) -> Result<ProbedObservation, HostError> {
             let root = ExecutionRoot::open(&self.root)
@@ -2172,6 +2182,75 @@ mod run_coordinator {
             }
             // The duplicated per-action fd must not leave a hidden lock after the run returns.
             assert!(ExecutionRoot::open(&scratch.0)?.try_lock_host().is_ok());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod plan_gate {
+    use super::*;
+    use storage_engine::{ActionRunState, LiveObservation};
+    use storage_provider::{LvmAction, ProviderAction};
+    use storage_runtime::{
+        capability::{BackendCapabilityCheck, OperationAvailability},
+        coordinator::{CoordinatorError, ExecutionCoordinator},
+        host::LinuxLiveHost,
+        lease::ExecutionRoot,
+    };
+
+    /// Create is available, but the later activation lacks trustworthy backend readiness.
+    struct LaterUnsupported(u8);
+    impl BackendCapabilityCheck for LaterUnsupported {
+        /// Returns an operation-specific failure only for the successor of the first write.
+        fn availability(
+            &self,
+            action: &ProviderAction,
+            _observed: &LiveObservation,
+        ) -> OperationAvailability {
+            if matches!(action, ProviderAction::Lvm(LvmAction::SetActivation { .. })) {
+                match self.0 {
+                    0 => OperationAvailability::Unavailable("activation missing".into()),
+                    1 => OperationAvailability::Unknown("activation readiness unknown".into()),
+                    _ => OperationAvailability::Available(
+                        BackendId::new("other-backend").unwrap_or_else(|| unreachable!()),
+                    ),
+                }
+            } else {
+                OperationAvailability::Available(backend())
+            }
+        }
+    }
+
+    /// Known later unsupported work and historical protection violations cannot leave a partial write.
+    #[test]
+    fn rejects_late_unsupported_action_and_protection_before_any_dispatch()
+    -> Result<(), Box<dyn Error>> {
+        for case in 0..4 {
+            let (state, frozen) = fixture()?;
+            let mut document = frozen.document().clone();
+            if case == 3 {
+                document.protected_scope.nodes.push(state.lvm_vgs[0].node);
+                assert!(ExecutionRun::new(&document).is_err());
+                continue;
+            }
+            let mut run = ExecutionRun::new(&document)?;
+            let state = Rc::new(RefCell::new(state));
+            let scratch = admission::Scratch::new()?;
+            let fake = coordination::dispatcher(&scratch, state.clone());
+            let calls = fake.calls.clone();
+            let host = LinuxLiveHost::new(
+                probe(state),
+                LaterUnsupported(case),
+                admission::authorization(&run)?,
+            );
+            let mut coordinator =
+                ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, fake, &run);
+            let result = coordinator.execute_run(&mut run);
+            assert!(matches!(result, Err(CoordinatorError::PlanUnavailable(_))));
+            assert_eq!(calls.get(), 0);
+            assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Waiting);
+            assert!(!scratch.0.join("active-attempt.json").exists());
         }
         Ok(())
     }

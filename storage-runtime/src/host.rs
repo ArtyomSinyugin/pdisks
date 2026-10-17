@@ -19,6 +19,9 @@ use thiserror::Error;
 /// Failures leave admission without permission to dispatch.
 #[derive(Debug, Error)]
 pub enum HostError {
+    /// Reanalysis found a known contradiction or an uncovered requested intent.
+    #[error("reviewed plan has known goal, prerequisite, protection, or intent violations")]
+    HistoricalRejected,
     /// A custom host has not implemented independent final verification.
     #[error("host final verification is unavailable")]
     FinalVerificationUnavailable,
@@ -61,6 +64,19 @@ pub struct AdmissionDecision {
 pub trait RuntimeHost {
     /// Obtains a new provider pass without substituting predicted effects or saved JSON.
     fn probe(&mut self) -> Result<ProbedObservation, HostError>;
+    /// Checks support for every frozen operation before the run may write anything.
+    /// This does not replace each action's later fresh target, prerequisite and approval checks.
+    fn check_plan(
+        &mut self,
+        _run: &ExecutionRun,
+        _observed: &ProbedObservation,
+        _backend: &storage_provider::BackendId,
+        _lock: &HostExecutionLock,
+    ) -> Result<LiveCheckStatus, HostError> {
+        Ok(LiveCheckStatus::Unknown {
+            required_evidence: "whole-plan backend readiness".into(),
+        })
+    }
     /// Checks prerequisites and applicability while the actual OS lease remains held.
     fn check_admission(
         &mut self,
@@ -115,6 +131,52 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
         let observed = ProbedObservation::collect(&self.probe)?;
         self.last_probe = Some(observed.observation().reference);
         Ok(observed)
+    }
+
+    /// Rejects unsupported later operations before even the first action is admitted.
+    fn check_plan(
+        &mut self,
+        run: &ExecutionRun,
+        observed: &ProbedObservation,
+        backend: &storage_provider::BackendId,
+        lock: &HostExecutionLock,
+    ) -> Result<LiveCheckStatus, HostError> {
+        check_reviewed_plan(run)?;
+        let reference = observed.observation().reference;
+        if self.last_probe != Some(reference)
+            || run.latest_observation().is_some_and(|latest| {
+                latest.reference.probe_instance != reference.probe_instance
+                    || latest.reference.epoch >= reference.epoch
+            })
+        {
+            return Err(HostError::ObservationMismatch);
+        }
+        if CheckpointStore::new(lock).inspect()?.is_some() {
+            return Err(HostError::ActiveAttempt);
+        }
+        for action in run.context().plan.actions() {
+            match self
+                .capability
+                .availability(&action.operation, observed.observation())
+            {
+                OperationAvailability::Available(selected) if &selected == backend => {}
+                OperationAvailability::Available(_) => {
+                    return Ok(LiveCheckStatus::Violated {
+                        reason: "plan requires a different backend than the configured dispatcher"
+                            .into(),
+                    });
+                }
+                OperationAvailability::Unavailable(reason) => {
+                    return Ok(LiveCheckStatus::Violated { reason });
+                }
+                OperationAvailability::Unknown(reason) => {
+                    return Ok(LiveCheckStatus::Unknown {
+                        required_evidence: reason,
+                    });
+                }
+            }
+        }
+        Ok(LiveCheckStatus::Satisfied)
     }
 
     /// Checks actual goal, final coverage and independent preservation after every action is Verified.
@@ -283,4 +345,20 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
             resolved,
         })
     }
+}
+
+/// Reconstructs trusted contracts and rejects known historical contradictions; Unknown still needs live proof.
+pub(crate) fn check_reviewed_plan(run: &ExecutionRun) -> Result<(), HostError> {
+    let analysis = run.document().analyse_historical()?;
+    let report = analysis.report;
+    if report
+        .simulation
+        .steps
+        .iter()
+        .flat_map(|step| &step.checks)
+        .any(|check| matches!(check.status, storage_engine::CheckStatus::Violated { .. }))
+    {
+        return Err(HostError::HistoricalRejected);
+    }
+    Ok(())
 }

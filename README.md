@@ -594,6 +594,10 @@ evidence остаются Unknown. Эта pure проверка не доказ�
 использует тот же admission/checkpoint/dispatch путь; любой не-Verified результат
 останавливает проход без retry. `ExecutionSummary.verified` следует только за
 принятой final goal/preservation проверкой. Уже успешный run повторно не запускается.
+До первого write runtime заново анализирует frozen document и проверяет наличие
+adapter для всех операций DAG, включая ещё не созданные outputs. Unknown,
+Unsupported или несовпадение backend у позднего действия останавливают весь
+запуск до первого arm. Это не отменяет fresh admission каждого отдельного action.
 
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся
