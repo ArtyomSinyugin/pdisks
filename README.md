@@ -589,6 +589,9 @@ Runtime mount postconditions требуют ровно одну запись н�
 UUID-correlated filesystem source (либо typed tmpfs). Дубликаты/overmount,
 unresolved source, отсутствие записи и неподдержанная namespace остаются Unknown;
 подтверждённый чужой source даёт Violated. Native mount writes пока не включены.
+Runtime scope заново коррелирует typed mount sources, включая ФС вне изменяемого
+компонента. Смена transient ID и порядка options допустима; UUID replacement,
+клонированный UUID, новый target или неоднозначный mount target блокируют admission.
 
 `live::check_observed_goal()` независимо проверяет финальный фактический граф
 после UUID correlation, включая подтверждённые outputs, точные связи/размеры

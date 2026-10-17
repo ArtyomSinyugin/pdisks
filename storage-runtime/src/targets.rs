@@ -378,25 +378,38 @@ pub(crate) fn check_scope(
         return Err(TargetError::ScopeChanged);
     }
     let mut mounts = baseline.mounts.entries.clone();
+    let mut actual_mounts = current.mounts.entries.clone();
+    for entries in [&mounts, &actual_mounts] {
+        if entries.iter().enumerate().any(|(index, mount)| {
+            entries[..index]
+                .iter()
+                .any(|other| other.target == mount.target && other.context == mount.context)
+        }) {
+            return Err(TargetError::ScopeChanged);
+        }
+    }
     for mount in &mut mounts {
         match &mut mount.source {
             MountSource::Filesystem(id)
             | MountSource::BtrfsSubvolume(id)
             | MountSource::ZfsDataset(id) => {
-                if let Some(target) = ids.get(id) {
-                    *id = *target;
-                }
+                // Mounts outside the edited component still need stable source correlation.
+                // Equality of unrelated transient IDs could otherwise hide a replacement filesystem.
+                let mapping = correlate_nodes(baseline, current, &[*id])?;
+                *id = mapping.first().ok_or(TargetError::ScopeChanged)?.target;
             }
             _ => {}
         }
+        mount.options.sort_unstable();
+    }
+    for mount in &mut actual_mounts {
+        mount.options.sort_unstable();
     }
     let mut expected: Vec<_> = mounts
         .iter()
         .map(serde_json::to_string)
         .collect::<Result<_, _>>()?;
-    let mut actual: Vec<_> = current
-        .mounts
-        .entries
+    let mut actual: Vec<_> = actual_mounts
         .iter()
         .map(serde_json::to_string)
         .collect::<Result<_, _>>()?;

@@ -2419,3 +2419,76 @@ mod final_preservation_default {
         Ok(())
     }
 }
+
+/// Unrelated existing mounts use durable filesystem UUIDs, not incidental NodeId equality.
+#[test]
+fn mount_scope_correlates_unrelated_sources_and_rejects_replacements() -> Result<(), Box<dyn Error>>
+{
+    use storage_core::model::{FilesystemKind, MountContext, MountSource, ObservedMount};
+    let (mut state, _) = fixture()?;
+    let vg = state.lvm_vgs[0].node;
+    let fs = NodeId::new();
+    let mut node = state.current.graph.node(&vg).ok_or("VG")?.clone();
+    node.kind.kind = NodeKind::Filesystem {
+        kind: FilesystemKind::Ext4,
+        label: Some("existing".into()),
+    };
+    node.size.identities = vec![ExternalId::Filesystem {
+        fs_type: "ext4".into(),
+        value: "existing-fs".into(),
+    }];
+    state.current.graph.insert_new(fs, node.clone())?;
+    state.current.mounts.entries.push(ObservedMount {
+        source: MountSource::Filesystem(fs),
+        target: "/existing".into(),
+        options: vec!["rw".into(), "nodev".into()],
+        context: MountContext::Host,
+    });
+    let mut session = PlanSession::new(HistoricalBaseline::from_lvm_observations(
+        state.current.clone(),
+        &state.lvm_vgs,
+    )?)?;
+    session.add_lv(session.revision(), vg, "data", Bytes::new(16 * 1024 * 1024))?;
+    let frozen = session.freeze(session.revision())?;
+    let run = ExecutionRun::new(frozen.document())?;
+    for case in 0..6 {
+        let mut changed = state.clone();
+        match case {
+            0 => {
+                changed = serde_json::from_str(&serde_json::to_string(&changed)?.replace(
+                    &fs.as_uuid().to_string(),
+                    &NodeId::new().as_uuid().to_string(),
+                ))?;
+                changed.current.mounts.entries[0].options.reverse();
+            }
+            1 => {
+                let mut replacement = node.clone();
+                replacement.size.identities = vec![ExternalId::Filesystem {
+                    fs_type: "ext4".into(),
+                    value: "replacement".into(),
+                }];
+                changed.current.graph.replace_existing(fs, replacement)?;
+            }
+            2 => {
+                changed
+                    .current
+                    .graph
+                    .insert_new(NodeId::new(), node.clone())?;
+            }
+            3 => {
+                let mut overmount = changed.current.mounts.entries[0].clone();
+                overmount.source = MountSource::Tmpfs;
+                changed.current.mounts.entries.push(overmount);
+            }
+            4 => changed.current.mounts.entries[0].target = "/elsewhere".into(),
+            _ => changed.current.mounts.entries[0].options[0] = "ro".into(),
+        }
+        let observed = ProbedObservation::collect(&probe(Rc::new(RefCell::new(changed))))?;
+        assert_eq!(
+            resolve_action(&run, ActionId::new(0), observed.observation(), backend()).is_ok(),
+            case == 0,
+            "case {case}"
+        );
+    }
+    Ok(())
+}
