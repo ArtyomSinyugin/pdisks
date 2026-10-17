@@ -465,8 +465,8 @@ checkpoint. Последующие обращения к binding повторн�
 
 Coordinator привязан к одному `ExecutionRun`. Успешный синтетический `CreateLv`
 проверен до `Verified` и удаления checkpoint, но `run.is_verified()` остаётся false:
-Исполнение всего DAG и отдельная финальная goal/preservation
-verification ещё не подключены. Корреляция PV/физических устройств расширена, но production admission и native
+Последовательное исполнение DAG и отдельная final goal/preservation verification
+подключены и проверены на mock native LVM. Корреляция PV/физических устройств расширена, но production admission и native
 write всё ещё требуют проверки полной физической области; неизвестный scope
 отклоняется.
 Автоматической регистрации write-adapter нет. В provider реализован узкий
@@ -542,7 +542,8 @@ checkpoint переживает завершение процесса и тре�
 
 Тесты проверяют I/O-отказы на границах sync/publication/removal, конкуренцию
 hosts и реальные дочерние процессы с `SIGKILL`. Это не проверка отключения питания
-или аппаратной надёжности накопителя. Полный запуск плана ещё не реализован;
+или аппаратной надёжности накопителя. Полный запуск первого LVM recipe проверен
+через mock native adapter, без изменения реальных устройств;
 настройки по умолчанию не разрешают native writes, незавершённый disks preview
 остаётся выключенным.
 
@@ -598,6 +599,11 @@ evidence остаются Unknown. Эта pure проверка не доказ�
 adapter для всех операций DAG, включая ещё не созданные outputs. Unknown,
 Unsupported или несовпадение backend у позднего действия останавливают весь
 запуск до первого arm. Это не отменяет fresh admission каждого отдельного action.
+Сквозной native DAG тест требует независимый final coverage даже после двух
+Verified actions. При final Unknown повторная проверка получает новый probe,
+но не повторяет writes. Непустая protection policy без доказательства сохранности
+остаётся Unknown даже при точном совпадении графа. Mount/boot goal adapters и
+production policies пока не реализованы; default configuration остаётся read-only.
 
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся

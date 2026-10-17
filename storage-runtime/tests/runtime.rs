@@ -1680,8 +1680,23 @@ mod native_execution {
     }
 
     /// Synthetic scope policy is confined to this disk-free fixture and never exported as production evidence.
-    struct MockScope<'backend>(NativeLvmAdapter<'backend>);
+    struct MockScope<'backend>(NativeLvmAdapter<'backend>, bool);
     impl BackendCapabilityCheck for MockScope<'_> {
+        /// Final scope is a separate explicit proof for this private-memory fixture.
+        fn check_final_scope(
+            &self,
+            _context: &storage_engine::ExecutionContext<'_>,
+            _observed: &LiveObservation,
+        ) -> LiveCheckStatus {
+            if self.1 {
+                LiveCheckStatus::Satisfied
+            } else {
+                LiveCheckStatus::Unknown {
+                    required_evidence: "fixture final coverage missing".into(),
+                }
+            }
+        }
+
         /// Operation support still comes from the actual typed adapter and mock C technology query.
         fn availability(
             &self,
@@ -1799,7 +1814,7 @@ mod native_execution {
             };
             let host = LinuxLiveHost::new(
                 LinuxProbe::from_providers(vec![Box::new(provider)]),
-                MockScope(adapter),
+                MockScope(adapter, true),
                 MockApproval {
                     run_id: run.run_id(),
                     digest: plan_digest(run.document())?,
@@ -1844,6 +1859,84 @@ mod native_execution {
                     Err(CoordinatorError::Stopped)
                 ));
                 assert_eq!(calls.get(), 1);
+            }
+        }
+        Ok(())
+    }
+    /// Whole native runs need final evidence; unavailable successors veto even the first native write.
+    #[test]
+    fn native_dag_summary_requires_independent_final_success() -> Result<(), Box<dyn Error>> {
+        for case in 0..4 {
+            let scenario = match case {
+                2 => 29,
+                3 => 19,
+                _ => 0,
+            };
+            let library = mock_lvm::Fixture::new(scenario)?;
+            let backend = library.registry.backends().next().ok_or("mock backend")?;
+            let (template, _) = fixture()?;
+            let provider = NativeProvider { backend, template };
+            let initial = provider.snapshot()?;
+            let baseline =
+                HistoricalBaseline::from_lvm_observations(initial.current, &initial.lvm_vgs)?;
+            let mut session = PlanSession::new(baseline)?;
+            session.add_lv(
+                session.revision(),
+                initial.lvm_vgs[0].node,
+                "data",
+                Bytes::new(4096),
+            )?;
+            let frozen = session.freeze(session.revision())?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let adapter = NativeLvmAdapter::new(backend)?;
+            let scratch = admission::Scratch::new()?;
+            let calls = Rc::new(Cell::new(0));
+            let dispatcher = CheckedDispatcher {
+                native: adapter,
+                root: scratch.0.clone(),
+                calls: calls.clone(),
+            };
+            let host = LinuxLiveHost::new(
+                LinuxProbe::from_providers(vec![Box::new(provider)]),
+                MockScope(adapter, case != 1),
+                MockApproval {
+                    run_id: run.run_id(),
+                    digest: plan_digest(run.document())?,
+                },
+            );
+            let mut coordinator =
+                ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+            let result = coordinator.execute_run(&mut run);
+            if case == 2 {
+                assert!(matches!(result, Err(CoordinatorError::PlanUnavailable(_))));
+                assert_eq!(calls.get(), 0);
+                assert!(backend.probe_lvm()?.lvs.is_empty());
+            } else {
+                let summary = result?;
+                assert_eq!(summary.verified, case == 0);
+                assert_eq!(calls.get(), 2);
+                assert_eq!(run.is_verified(), case == 0);
+                if case == 3 {
+                    assert_eq!(summary.stopped_action, Some(ActionId::new(1)));
+                    assert!(scratch.0.join("active-attempt.json").exists());
+                    assert!(matches!(
+                        coordinator.execute_run(&mut run),
+                        Err(CoordinatorError::Stopped)
+                    ));
+                } else {
+                    assert!(summary.stopped_action.is_none());
+                    assert!(run.goal_verification().is_some());
+                    assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Verified);
+                    assert_eq!(run.state(ActionId::new(1))?, ActionRunState::Verified);
+                    if case == 1 {
+                        assert!(!coordinator.execute_run(&mut run)?.verified);
+                        assert_eq!(calls.get(), 2);
+                        assert_eq!(backend.probe_lvm()?.lvs[0].copy_percent, 1);
+                    }
+                }
+            }
+            if case != 3 {
+                assert!(!scratch.0.join("active-attempt.json").exists());
             }
         }
         Ok(())
@@ -2252,6 +2345,77 @@ mod plan_gate {
             assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Waiting);
             assert!(!scratch.0.join("active-attempt.json").exists());
         }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod final_preservation_default {
+    use super::*;
+    use storage_engine::{LiveCheckStatus, LiveObservation};
+    use storage_runtime::{
+        bindings::OutputBindings,
+        capability::{BackendCapabilityCheck, OperationAvailability},
+        host::{LinuxLiveHost, RuntimeHost},
+        lease::ExecutionRoot,
+    };
+
+    /// Coverage alone cannot attest protected data contents or preservation throughout execution.
+    struct CoverageOnly;
+    impl BackendCapabilityCheck for CoverageOnly {
+        /// This fixture performs no writes.
+        fn availability(
+            &self,
+            _action: &storage_provider::ProviderAction,
+            _observed: &LiveObservation,
+        ) -> OperationAvailability {
+            OperationAvailability::Unavailable("read-only fixture".into())
+        }
+        /// Explicit synthetic coverage leaves the independent preservation default untouched.
+        fn check_final_scope(
+            &self,
+            _context: &storage_engine::ExecutionContext<'_>,
+            _observed: &LiveObservation,
+        ) -> LiveCheckStatus {
+            LiveCheckStatus::Satisfied
+        }
+    }
+
+    /// An unchanged graph cannot stand in for missing evidence about protected contents.
+    #[test]
+    fn nonempty_protection_requires_independent_preservation_evidence() -> Result<(), Box<dyn Error>>
+    {
+        let (state, _) = fixture()?;
+        let session = PlanSession::new(HistoricalBaseline::from_lvm_observations(
+            state.current.clone(),
+            &state.lvm_vgs,
+        )?)?;
+        let frozen = session.freeze(session.revision())?;
+        let mut document = frozen.document().clone();
+        document.protected_scope.nodes.push(state.lvm_vgs[0].node);
+        let mut run = ExecutionRun::new(&document)?;
+        let mut host = LinuxLiveHost::new(
+            probe(Rc::new(RefCell::new(state))),
+            CoverageOnly,
+            admission::authorization(&run)?,
+        );
+        let observed = host.probe()?;
+        let scratch = admission::Scratch::new()?;
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let lock = root.try_lock_host()?;
+        let report = host.verify_goal(&run, &observed, &OutputBindings::new(&run), &lock)?;
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.status == LiveCheckStatus::Satisfied)
+        );
+        assert!(matches!(
+            report.preservation,
+            LiveCheckStatus::Unknown { .. }
+        ));
+        assert!(!run.record_goal_verification(report)?);
+        assert!(!run.is_verified());
         Ok(())
     }
 }
