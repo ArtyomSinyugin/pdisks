@@ -1951,3 +1951,98 @@ mod activation {
         Ok(())
     }
 }
+
+#[cfg(target_os = "linux")]
+mod final_host {
+    use super::*;
+    use storage_engine::{ExecutionContext, LiveCheckStatus, LiveObservation};
+    use storage_runtime::{
+        bindings::OutputBindings,
+        capability::{BackendCapabilityCheck, OperationAvailability},
+        host::{HostError, LinuxLiveHost, RuntimeHost},
+        lease::ExecutionRoot,
+    };
+
+    /// Explicit synthetic final policy, independent from per-operation availability/admission.
+    struct Policy {
+        /// Whether this final publication covers the private fixture completely.
+        coverage: LiveCheckStatus,
+        /// Independently selected preservation result for the fixture.
+        preservation: LiveCheckStatus,
+    }
+    impl BackendCapabilityCheck for Policy {
+        /// This test contains no actions and never allows any write operation.
+        fn availability(
+            &self,
+            _operation: &storage_provider::ProviderAction,
+            _observed: &LiveObservation,
+        ) -> OperationAvailability {
+            OperationAvailability::Unavailable("read-only final fixture".into())
+        }
+        /// Fixture final coverage is deliberately separate from action admission scope.
+        fn check_final_scope(
+            &self,
+            _context: &ExecutionContext<'_>,
+            _observed: &LiveObservation,
+        ) -> LiveCheckStatus {
+            self.coverage.clone()
+        }
+        /// Even positive final coverage cannot replace a negative preservation result.
+        fn check_preservation(
+            &self,
+            _context: &ExecutionContext<'_>,
+            _observed: &LiveObservation,
+        ) -> LiveCheckStatus {
+            self.preservation.clone()
+        }
+    }
+
+    /// Final success requires complete fresh coverage and independent positive preservation.
+    #[test]
+    fn final_host_requires_fresh_coverage_and_preservation() -> Result<(), Box<dyn Error>> {
+        let (state, _) = fixture()?;
+        let session = PlanSession::new(HistoricalBaseline::from_lvm_observations(
+            state.current.clone(),
+            &state.lvm_vgs,
+        )?)?;
+        let frozen = session.freeze(session.revision())?;
+        for case in 0..4 {
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let policy = Policy {
+                coverage: if case == 0 {
+                    LiveCheckStatus::Unknown {
+                        required_evidence: "coverage".into(),
+                    }
+                } else {
+                    LiveCheckStatus::Satisfied
+                },
+                preservation: if case == 1 {
+                    LiveCheckStatus::Violated {
+                        reason: "protected contents changed".into(),
+                    }
+                } else {
+                    LiveCheckStatus::Satisfied
+                },
+            };
+            let mut host = LinuxLiveHost::new(
+                probe(Rc::new(RefCell::new(state.clone()))),
+                policy,
+                admission::authorization(&run)?,
+            );
+            let observed = host.probe()?;
+            if case == 3 {
+                host.probe()?;
+            }
+            let scratch = admission::Scratch::new()?;
+            let root = ExecutionRoot::open(&scratch.0)?;
+            let lock = root.try_lock_host()?;
+            let report = host.verify_goal(&run, &observed, &OutputBindings::new(&run), &lock);
+            if case == 3 {
+                assert!(matches!(report, Err(HostError::ObservationMismatch)));
+            } else {
+                assert_eq!(run.record_goal_verification(report?)?, case == 2);
+            }
+        }
+        Ok(())
+    }
+}

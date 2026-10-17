@@ -585,6 +585,10 @@ adapter; обычный manifest по-прежнему разрешает тол
 и последнее запрошенное состояние активации. Неизвестные mount/boot/intent
 evidence остаются Unknown. Эта pure проверка не доказывает полноту probe или
 сохранность содержимого защищённых объектов: это отдельная обязанность host.
+`LinuxLiveHost::verify_goal()` требует новый probe после всех Verified actions
+под host lock без checkpoint. `check_final_scope()` по умолчанию Unknown;
+непустая protection policy требует независимого `check_preservation()`.
+Успех action admission не подменяет эти финальные доказательства.
 
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся

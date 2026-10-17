@@ -5,13 +5,13 @@ use crate::{
     bindings::{BindingError, OutputBindings},
     capability::{BackendCapabilityCheck, OperationAvailability},
     checkpoint::{CheckpointError, CheckpointStore, plan_digest},
-    lease::ExecutionLease,
+    lease::{ExecutionLease, HostExecutionLock},
     probe::{ProbeObservationError, ProbedObservation},
     targets::{ResolvedAction, resolve_action_with_bindings},
 };
 use storage_engine::{
-    ActionId, ActionRunState, AdmissionReport, ExecutionRun, ExecutionRunError, LiveCheckStatus,
-    ObservationReference, PlanDocumentError,
+    ActionId, ActionRunState, AdmissionReport, ExecutionRun, ExecutionRunError,
+    GoalVerificationReport, LiveCheckStatus, ObservationReference, PlanDocumentError,
 };
 use storage_probe::LinuxProbe;
 use thiserror::Error;
@@ -19,6 +19,9 @@ use thiserror::Error;
 /// Failures leave admission without permission to dispatch.
 #[derive(Debug, Error)]
 pub enum HostError {
+    /// A custom host has not implemented independent final verification.
+    #[error("host final verification is unavailable")]
+    FinalVerificationUnavailable,
     /// A previously verified output can no longer be identified safely.
     #[error(transparent)]
     Binding(#[from] BindingError),
@@ -67,6 +70,17 @@ pub trait RuntimeHost {
         bindings: &OutputBindings,
         lease: &ExecutionLease,
     ) -> Result<AdmissionDecision, HostError>;
+
+    /// Evaluates fresh final facts under the same host lock, never a simulation or old completion.
+    fn verify_goal(
+        &mut self,
+        _run: &ExecutionRun,
+        _observed: &ProbedObservation,
+        _bindings: &OutputBindings,
+        _lock: &HostExecutionLock,
+    ) -> Result<GoalVerificationReport, HostError> {
+        Err(HostError::FinalVerificationUnavailable)
+    }
 }
 
 /// Linux host with explicit trusted capability and authorization policies.
@@ -101,6 +115,54 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
         let observed = ProbedObservation::collect(&self.probe)?;
         self.last_probe = Some(observed.observation().reference);
         Ok(observed)
+    }
+
+    /// Checks actual goal, final coverage and independent preservation after every action is Verified.
+    fn verify_goal(
+        &mut self,
+        run: &ExecutionRun,
+        observed: &ProbedObservation,
+        bindings: &OutputBindings,
+        lock: &HostExecutionLock,
+    ) -> Result<GoalVerificationReport, HostError> {
+        for action in run.context().plan.actions() {
+            if run.state(action.id)? != ActionRunState::Verified {
+                return Err(ExecutionRunError::ActionsNotVerified.into());
+            }
+        }
+        let actual = observed.observation();
+        if self.last_probe != Some(actual.reference)
+            || run.latest_observation().is_some_and(|latest| {
+                latest.reference.probe_instance != actual.reference.probe_instance
+                    || latest.reference.epoch >= actual.reference.epoch
+            })
+        {
+            return Err(HostError::ObservationMismatch);
+        }
+        let store = CheckpointStore::new(lock);
+        if store.inspect()?.is_some() {
+            return Err(HostError::ActiveAttempt);
+        }
+        let correlations = bindings.correlations(run, actual)?;
+        let context = run.context();
+        let checks = storage_engine::live::check_observed_goal(&context, actual, &correlations)
+            .map_err(ProbeObservationError::from)?;
+        let coverage = self.capability.check_final_scope(&context, actual);
+        let preservation = if coverage == LiveCheckStatus::Satisfied {
+            self.capability.check_preservation(&context, actual)
+        } else {
+            coverage
+        };
+        // A callback cannot insert a marker and still receive a successful final report.
+        if store.inspect()?.is_some() {
+            return Err(HostError::ActiveAttempt);
+        }
+        Ok(GoalVerificationReport {
+            run_id: run.run_id(),
+            observation: actual.clone(),
+            checks,
+            preservation,
+        })
     }
 
     /// Never treats successful discovery, simulation, or root privileges as authorization.

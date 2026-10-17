@@ -37,4 +37,34 @@ pub trait BackendCapabilityCheck {
             required_evidence: "complete provider and mount-namespace scope coverage".into(),
         }
     }
+
+    /// Establishes complete final observation/namespace coverage and exclusion of external writers.
+    /// Operation admission coverage cannot silently stand in for this final publication's evidence.
+    fn check_final_scope(
+        &self,
+        _context: &ExecutionContext<'_>,
+        _observed: &LiveObservation,
+    ) -> LiveCheckStatus {
+        LiveCheckStatus::Unknown {
+            required_evidence: "complete fresh final scope and namespace coverage".into(),
+        }
+    }
+
+    /// Attests actual preservation throughout execution, including protected contents, not graph equality.
+    /// An empty protection policy is vacuous; every nonempty policy needs independent host evidence.
+    fn check_preservation(
+        &self,
+        context: &ExecutionContext<'_>,
+        _observed: &LiveObservation,
+    ) -> LiveCheckStatus {
+        let protected = context.protected_scope;
+        if protected.nodes.is_empty()
+            && protected.runtime_mounts.is_empty()
+            && protected.persistent_mounts.is_empty()
+        {
+            LiveCheckStatus::Satisfied
+        } else {
+            LiveCheckStatus::Unknown { required_evidence: "independent preservation evidence for protected contents and mount configuration".into() }
+        }
+    }
 }
