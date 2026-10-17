@@ -581,6 +581,11 @@ adapter; обычный manifest по-прежнему разрешает тол
 
 ## Наблюдения для нового baseline
 
+Pure postconditions принимают provisional filesystem UUID bindings для ФС с
+совпадающим типом, единственным UUID и Present-наблюдением. Размер, label и
+backing dependency проверяются отдельно. Эти bindings не включают native mkfs:
+runtime по-прежнему обязан доказать происхождение нового UUID и owning backing.
+
 `live::check_observed_goal()` независимо проверяет финальный фактический граф
 после UUID correlation, включая подтверждённые outputs, точные связи/размеры
 и последнее запрошенное состояние активации. Неизвестные mount/boot/intent

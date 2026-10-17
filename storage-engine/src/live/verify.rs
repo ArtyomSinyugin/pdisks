@@ -32,9 +32,9 @@ pub fn check_observed_postconditions(
     check_observed_postconditions_with_bindings(baseline, observation, postconditions, &[])
 }
 
-/// Checks actual result properties with provisional LV identities supplied by the trusted runtime.
+/// Checks actual result properties with provisional LV/filesystem identities supplied by the trusted runtime.
 /// Bindings establish correlation only: size, spec, dependency and diagnostics are still checked.
-/// The runtime must prove a new UUID came from this invocation before publishing a verified binding.
+/// The runtime must prove a new UUID came from this invocation and has the admitted backing before publishing a binding.
 pub fn check_observed_postconditions_with_bindings(
     baseline: &HistoricalBaseline,
     observation: &LiveObservation,
@@ -188,7 +188,7 @@ fn check_result(
     }
 }
 
-/// Existing-node bindings never override baseline correlation; only unique present LV UUIDs qualify.
+/// Existing-node bindings never override baseline correlation; only unique present LV/FS UUIDs qualify.
 pub(super) fn result_node<'a>(
     baseline: &HistoricalBaseline,
     observation: &'a LiveObservation,
@@ -216,15 +216,24 @@ pub(super) fn result_node<'a>(
         .graph
         .node(&binding.target)
         .ok_or_else(|| unknown("bound output is absent"))?;
+    let identity_matches = match (&node.kind.kind, &binding.identity) {
+        (NodeKind::LvmLv(_), ExternalId::LvmLvUuid(uuid)) => {
+            !uuid.trim().is_empty() && uuid.trim() == uuid
+        }
+        (NodeKind::Filesystem { kind, .. }, ExternalId::Filesystem { fs_type, value }) => {
+            fs_type == kind.as_str() && !value.trim().is_empty() && value.trim() == value
+        }
+        _ => false,
+    };
     if source.as_uuid().is_nil()
         || node.size.presence != Presence::Present
-        || !matches!((&node.kind.kind, &binding.identity), (NodeKind::LvmLv(_), ExternalId::LvmLvUuid(uuid)) if !uuid.trim().is_empty() && uuid.trim() == uuid)
+        || !identity_matches
         || !node.size.identities.contains(&binding.identity)
         || node
             .size
             .identities
             .iter()
-            .filter(|id| matches!(id, ExternalId::LvmLvUuid(_)))
+            .filter(|id| std::mem::discriminant(*id) == std::mem::discriminant(&binding.identity))
             .count()
             != 1
         || observation
@@ -236,7 +245,7 @@ pub(super) fn result_node<'a>(
             != 1
     {
         return Err(unknown(
-            "created output needs one unambiguous observed LV UUID",
+            "created output needs one unambiguous observed LV or filesystem UUID",
         ));
     }
     Ok((binding.target, node))
