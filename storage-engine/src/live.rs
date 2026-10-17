@@ -13,7 +13,9 @@ use crate::{
 mod capacity;
 pub use capacity::check_observed_prerequisites_with_bindings;
 pub use capacity::check_observed_prerequisites_with_capacity;
+mod goal;
 mod verify;
+pub use goal::check_observed_goal;
 pub use verify::{
     ObservedPostconditions, check_observed_postconditions,
     check_observed_postconditions_with_bindings,

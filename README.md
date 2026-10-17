@@ -580,6 +580,12 @@ adapter; обычный manifest по-прежнему разрешает тол
 
 ## Наблюдения для нового baseline
 
+`live::check_observed_goal()` независимо проверяет финальный фактический граф
+после UUID correlation, включая подтверждённые outputs, точные связи/размеры
+и последнее запрошенное состояние активации. Неизвестные mount/boot/intent
+evidence остаются Unknown. Эта pure проверка не доказывает полноту probe или
+сохранность содержимого защищённых объектов: это отдельная обязанность host.
+
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся
 Unknown. Отсутствие endpoint не доказывает inactive. Pure postconditions
