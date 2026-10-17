@@ -592,8 +592,11 @@ unresolved source, отсутствие записи и неподдержанн
 
 `live::check_observed_goal()` независимо проверяет финальный фактический граф
 после UUID correlation, включая подтверждённые outputs, точные связи/размеры
-и последнее запрошенное состояние активации. Неизвестные mount/boot/intent
-evidence остаются Unknown. Эта pure проверка не доказывает полноту probe или
+и последнее запрошенное состояние активации. Host filesystem/tmpfs mounts
+сверяются по уникальному target, source и explicit options без учёта порядка.
+Defaults, дубликаты keys, противоречивые flags и неизвестные namespaces остаются
+Unknown; persistent mounts, managed boot и неподдержанные intent evidence тоже
+не объявляются успешными. Эта pure проверка не доказывает полноту probe или
 сохранность содержимого защищённых объектов: это отдельная обязанность host.
 `LinuxLiveHost::verify_goal()` требует новый probe после всех Verified actions
 под host lock без checkpoint. `check_final_scope()` по умолчанию Unknown;

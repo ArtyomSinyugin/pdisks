@@ -286,3 +286,52 @@ fn mount_postcondition_rejects_ambiguous_and_unresolved_sources() -> Result<(), 
     ));
     Ok(())
 }
+
+/// Final mount goals compare durable source and explicit options, not a backend success flag.
+#[test]
+fn final_mount_goal_checks_options_and_preserves_unknown_evidence() -> Result<(), Box<dyn Error>> {
+    use storage_core::model::{MountContext, MountSource, ObservedMount};
+    use storage_engine::{
+        ExecutionRun, GoalAspect, editing::PlanSession, live::check_observed_goal,
+    };
+    let f = Fixture::new()?;
+    // The filesystem is already present for this read-only goal; no filesystem action is authorized.
+    let mut baseline = f.baseline.clone();
+    baseline.snapshot = f.observed.snapshot.clone();
+    let mount = ObservedMount {
+        source: MountSource::Filesystem(f.binding.target),
+        target: "/data".into(),
+        options: vec!["rw".into(), "nodev".into()],
+        context: MountContext::Host,
+    };
+    baseline.snapshot.mounts.entries.push(mount.clone());
+    let session = PlanSession::new(baseline)?;
+    let frozen = session.freeze(session.revision())?;
+    let run = ExecutionRun::new(frozen.document())?;
+    let mut observed = f.observed.clone();
+    observed.snapshot.mounts.entries.push(mount);
+    for (options, expected) in [
+        (vec!["nodev", "rw"], "satisfied"),
+        (vec!["nodev", "ro"], "violated"),
+        (vec!["rw"], "violated"),
+        (vec!["rw", "ro", "nodev"], "unknown"),
+        (vec!["rw", "nodev", "nodev"], "unknown"),
+        (vec!["defaults"], "unknown"),
+        (vec![], "unknown"),
+    ] {
+        observed.snapshot.mounts.entries[0].options =
+            options.into_iter().map(str::to_owned).collect();
+        let checks = check_observed_goal(&run.context(), &observed, &[])?;
+        let status = &checks
+            .iter()
+            .find(|check| matches!(check.condition, GoalAspect::RuntimeMount { .. }))
+            .ok_or("mount check")?
+            .status;
+        match expected {
+            "satisfied" => assert_eq!(*status, LiveCheckStatus::Satisfied),
+            "violated" => assert!(matches!(status, LiveCheckStatus::Violated { .. })),
+            _ => assert!(matches!(status, LiveCheckStatus::Unknown { .. })),
+        }
+    }
+    Ok(())
+}

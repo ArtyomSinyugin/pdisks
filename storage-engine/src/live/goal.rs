@@ -10,7 +10,7 @@ use storage_core::model::{BootSpec, NodeId, OperationIntent};
 use storage_provider::{LvmAction, ProviderAction};
 
 /// Checks every requested aspect using one actual publication and runtime-verified output identities.
-/// Mount configuration and managed boot remain unknown until their independent evidence adapters exist.
+/// Unsupported namespaces, persistent configuration and managed boot retain unknown evidence.
 /// Scope completeness and protected contents must still be established by the runtime host.
 pub fn check_observed_goal(
     context: &ExecutionContext<'_>,
@@ -34,7 +34,20 @@ pub fn check_observed_goal(
                 target: mount.target.clone(),
                 context: mount.context.clone(),
             },
-            status: unknown("independent runtime mount goal verification is required"),
+            status: qualify_observed_status(
+                observed,
+                match super::mount::observed_mount(
+                    context.historical_baseline,
+                    observed,
+                    &mount.source,
+                    &mount.target,
+                    &mount.context,
+                    bindings,
+                ) {
+                    Ok(actual) => super::mount::options_status(&mount.options, &actual.options),
+                    Err(status) => status,
+                },
+            ),
         });
     }
     for mount in &context.requested_goal.mounts.persistent {
