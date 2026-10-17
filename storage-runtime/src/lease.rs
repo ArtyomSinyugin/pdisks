@@ -109,7 +109,7 @@ impl ExecutionRoot {
 pub struct HostExecutionLock {
     /// Retained root for descriptor-relative checkpoint operations while this guard is borrowed.
     directory: OwnedFd,
-    /// Never cloned or exposed: close releases flock.
+    /// Never exposed; internal lease duplicates retain the same flock while the run guard lives.
     _lock: OwnedFd,
 }
 
@@ -135,6 +135,22 @@ pub struct ExecutionLease {
 }
 
 impl ExecutionLease {
+    /// Binds an action to an already held run lock without releasing exclusion between DAG actions.
+    pub(crate) fn under_host_lock(
+        lock: &HostExecutionLock,
+        run: &ExecutionRun,
+        action: ActionId,
+    ) -> Result<Self, LeaseError> {
+        Self::from_lock(
+            HostExecutionLock {
+                directory: lock.directory.try_clone()?,
+                _lock: lock._lock.try_clone()?,
+            },
+            run,
+            action,
+        )
+    }
+
     /// Acquires OS exclusion before the host obtains its admission probe.
     pub fn try_acquire(
         root: &ExecutionRoot,
@@ -145,6 +161,18 @@ impl ExecutionLease {
             return Err(LeaseError::NotChecking);
         }
         let host_lock = root.try_lock_host()?;
+        Self::from_lock(host_lock, run, action)
+    }
+
+    /// Copies trusted resource declarations while retaining ownership of the same OS exclusion.
+    fn from_lock(
+        host_lock: HostExecutionLock,
+        run: &ExecutionRun,
+        action: ActionId,
+    ) -> Result<Self, LeaseError> {
+        if run.state(action)? != ActionRunState::Checking {
+            return Err(LeaseError::NotChecking);
+        }
         let resources = run
             .context()
             .plan

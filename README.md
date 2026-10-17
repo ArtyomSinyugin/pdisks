@@ -589,6 +589,11 @@ evidence остаются Unknown. Эта pure проверка не доказ�
 под host lock без checkpoint. `check_final_scope()` по умолчанию Unknown;
 непустая protection policy требует независимого `check_preservation()`.
 Успех action admission не подменяет эти финальные доказательства.
+`ExecutionCoordinator::execute_run()` идёт по DAG последовательно и удерживает
+один host lock от первого действия до отдельного финального probe. Каждый action
+использует тот же admission/checkpoint/dispatch путь; любой не-Verified результат
+останавливает проход без retry. `ExecutionSummary.verified` следует только за
+принятой final goal/preservation проверкой. Уже успешный run повторно не запускается.
 
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся

@@ -238,6 +238,14 @@ mod admission {
         pub(super) scope: LiveCheckStatus,
     }
     impl BackendCapabilityCheck for Capabilities {
+        /// Explicit final coverage for this synthetic private-memory fixture only.
+        fn check_final_scope(
+            &self,
+            _context: &storage_engine::ExecutionContext<'_>,
+            _observed: &storage_engine::LiveObservation,
+        ) -> LiveCheckStatus {
+            self.scope.clone()
+        }
         /// Supplies the fixture's exact operation availability.
         fn availability(
             &self,
@@ -2042,6 +2050,128 @@ mod final_host {
             } else {
                 assert_eq!(run.record_goal_verification(report?)?, case == 2);
             }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod run_coordinator {
+    use super::*;
+    use std::path::PathBuf;
+    use storage_engine::{ActionRunState, GoalVerificationReport};
+    use storage_runtime::{
+        bindings::OutputBindings,
+        coordinator::{CoordinatorError, ExecutionCoordinator},
+        host::{AdmissionDecision, HostError, RuntimeHost},
+        lease::{ExecutionLease, ExecutionRoot, HostExecutionLock},
+    };
+
+    /// Verifies continuous cooperative exclusion on every probe, including between actions and at final verification.
+    struct LockedHost<H> {
+        /// Real runtime host over recorded private fixture state.
+        inner: H,
+        /// Root shared by the coordinator and the competing lock attempt.
+        root: PathBuf,
+    }
+    impl<H: RuntimeHost> RuntimeHost for LockedHost<H> {
+        /// Every entry must see the run lock already held, not merely the preceding action's lease.
+        fn probe(&mut self) -> Result<ProbedObservation, HostError> {
+            let root = ExecutionRoot::open(&self.root)
+                .unwrap_or_else(|error| panic!("fixture root: {error}"));
+            assert!(root.try_lock_host().is_err());
+            self.inner.probe()
+        }
+        /// Reuses the actual host admission and full binding checks.
+        fn check_admission(
+            &mut self,
+            run: &ExecutionRun,
+            action: ActionId,
+            observed: &ProbedObservation,
+            bindings: &OutputBindings,
+            lease: &ExecutionLease,
+        ) -> Result<AdmissionDecision, HostError> {
+            self.inner
+                .check_admission(run, action, observed, bindings, lease)
+        }
+        /// Reuses independent host final verification under the continuously retained run guard.
+        fn verify_goal(
+            &mut self,
+            run: &ExecutionRun,
+            observed: &ProbedObservation,
+            bindings: &OutputBindings,
+            lock: &HostExecutionLock,
+        ) -> Result<GoalVerificationReport, HostError> {
+            self.inner.verify_goal(run, observed, bindings, lock)
+        }
+    }
+
+    /// A complete DAG gets an independent final publication; unknown/failed actions stop successors.
+    #[test]
+    fn executes_dag_under_one_lock_and_verifies_final_goal() -> Result<(), Box<dyn Error>> {
+        for case in 0..3 {
+            let (state, frozen) = fixture()?;
+            let state = Rc::new(RefCell::new(state));
+            let scratch = admission::Scratch::new()?;
+            let mut run = ExecutionRun::new(frozen.document())?;
+            let mut fake = coordination::dispatcher(&scratch, state.clone());
+            fake.created_uuid = Some("created-lv".into());
+            if case == 1 {
+                fake.created_uuid = None;
+            }
+            if case == 2 {
+                fake.result_case = 8;
+            }
+            let calls = fake.calls.clone();
+            let host = LockedHost {
+                inner: coordination::host(state, &run)?,
+                root: scratch.0.clone(),
+            };
+            let mut coordinator =
+                ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, fake, &run);
+            let summary = coordinator.execute_run(&mut run)?;
+            assert_eq!(summary.verified, case == 0);
+            assert_eq!(summary.run_id, run.run_id());
+            if case == 0 {
+                assert!(summary.stopped_action.is_none());
+                assert!(run.is_verified());
+                let final_epoch = summary
+                    .observation
+                    .ok_or("final observation")?
+                    .reference
+                    .epoch;
+                assert!(
+                    final_epoch
+                        > run
+                            .completion(ActionId::new(1))?
+                            .ok_or("completion")?
+                            .observation
+                            .reference
+                            .epoch
+                );
+                assert_eq!(calls.get(), 2);
+                assert!(!scratch.0.join("active-attempt.json").exists());
+                assert!(matches!(
+                    coordinator.execute_run(&mut run),
+                    Err(CoordinatorError::AlreadyVerified)
+                ));
+            } else {
+                let stopped = if case == 1 {
+                    ActionId::new(0)
+                } else {
+                    ActionId::new(1)
+                };
+                assert_eq!(summary.stopped_action, Some(stopped));
+                assert_eq!(run.state(stopped)?, ActionRunState::OutcomeUnknown);
+                assert_eq!(calls.get(), if case == 1 { 1 } else { 2 });
+                assert!(scratch.0.join("active-attempt.json").exists());
+                assert!(matches!(
+                    coordinator.execute_run(&mut run),
+                    Err(CoordinatorError::Stopped)
+                ));
+            }
+            // The duplicated per-action fd must not leave a hidden lock after the run returns.
+            assert!(ExecutionRoot::open(&scratch.0)?.try_lock_host().is_ok());
         }
         Ok(())
     }

@@ -1,21 +1,24 @@
-//! Single synchronous admission/checkpoint/dispatch/completion path for the first LVM action.
+//! Sequential DAG execution sharing one admission/checkpoint/dispatch path and independent final verification.
 
 use crate::{
     bindings::{BindingError, OutputBindings, verify_activation, verify_created_lv},
     checkpoint::{ActiveAttempt, CheckpointError, CheckpointStore},
     dispatcher::{BackendDispatcher, ExecutionReceipt},
     host::{HostError, RuntimeHost},
-    lease::{ExecutionLease, ExecutionRoot, LeaseError},
+    lease::{ExecutionLease, ExecutionRoot, HostExecutionLock, LeaseError},
 };
 use storage_engine::{
     ActionId, ActionRunState, BackendCompletion, BackendOutcome, ExecutionRun, ExecutionRunError,
-    editing::OperationId,
+    LiveObservation, editing::OperationId,
 };
 use thiserror::Error;
 
 /// Rejected execution never falls back to unchecked dispatch or automatic retry.
 #[derive(Debug, Error)]
 pub enum CoordinatorError {
+    /// Final success is immutable; an already verified run is never executed again.
+    #[error("run is already verified")]
+    AlreadyVerified,
     /// A previous dispatch or clear did not finish with acknowledged verified success.
     #[error("coordinator stopped after an incomplete action; automatic continuation is forbidden")]
     Stopped,
@@ -40,6 +43,19 @@ pub enum CoordinatorError {
     /// The engine rejected a report or lifecycle transition.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
+}
+
+/// Result of a sequential run attempt; stopped admission and final Unknown are not successful runs.
+#[derive(Debug)]
+pub struct ExecutionSummary {
+    /// Attempt whose actions and final report were evaluated.
+    pub run_id: uuid::Uuid,
+    /// True only after independent final goal and preservation checks all pass.
+    pub verified: bool,
+    /// First action that did not become Verified, if the DAG stopped before final verification.
+    pub stopped_action: Option<ActionId>,
+    /// Latest actual publication, retaining its reference; on early stop it need not be a final probe.
+    pub observation: Option<LiveObservation>,
 }
 
 /// Owns the only host-side sequence around a synchronous backend call.
@@ -77,14 +93,88 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         &self.bindings
     }
 
+    /// Executes the trusted DAG sequentially, retaining one host lock through fresh final verification.
+    /// Only Verified predecessors permit progress; admission Unknown stops without a retry loop.
+    /// Already verified actions are skipped only within this same coordinator's attempt and bindings.
+    pub fn execute_run(
+        &mut self,
+        run: &mut ExecutionRun,
+    ) -> Result<ExecutionSummary, CoordinatorError> {
+        if self.run_id != run.run_id() {
+            return Err(CoordinatorError::RunMismatch);
+        }
+        if self.halted {
+            return Err(CoordinatorError::Stopped);
+        }
+        if run.is_verified() {
+            return Err(CoordinatorError::AlreadyVerified);
+        }
+        let lock = self.root.try_lock_host()?;
+        let store = CheckpointStore::new(&lock);
+        if store.inspect()?.is_some() {
+            return Err(HostError::ActiveAttempt.into());
+        }
+        let ordered: Vec<_> = run
+            .context()
+            .plan
+            .ordered_actions()
+            .iter()
+            .map(|action| action.id)
+            .collect();
+        for action in ordered {
+            match run.state(action)? {
+                ActionRunState::Verified => continue,
+                ActionRunState::Waiting | ActionRunState::Checking => {}
+                _ => return Err(CoordinatorError::Stopped),
+            }
+            let state = self.execute_action_locked(run, action, None, Some(&lock))?;
+            if state != ActionRunState::Verified {
+                return Ok(Self::summary(run, Some(action)));
+            }
+        }
+        let observed = self.host.probe()?;
+        let report = self
+            .host
+            .verify_goal(run, &observed, &self.bindings, &lock)?;
+        if report.run_id != run.run_id() || report.observation != *observed.observation() {
+            return Err(CoordinatorError::InvalidDecision);
+        }
+        if store.inspect()?.is_some() {
+            return Err(HostError::ActiveAttempt.into());
+        }
+        run.record_goal_verification(report)?;
+        Ok(Self::summary(run, None))
+    }
+
+    /// Returns evidence already accepted by the engine, never a predicted graph or adapter result.
+    fn summary(run: &ExecutionRun, stopped_action: Option<ActionId>) -> ExecutionSummary {
+        ExecutionSummary {
+            run_id: run.run_id(),
+            verified: run.is_verified(),
+            stopped_action,
+            observation: run.latest_observation().cloned(),
+        }
+    }
+
     /// Executes one waiting/checking action, respecting the engine's verified-predecessor rules.
     /// Unknown admission can be checked again with fresh evidence; an invocation is never retried.
-    /// Action success is separate from final goal verification, which remains unavailable here.
+    /// Action success is separate from final goal verification performed by execute_run.
     pub fn execute_action(
         &mut self,
         run: &mut ExecutionRun,
         action: ActionId,
         operation: Option<OperationId>,
+    ) -> Result<ActionRunState, CoordinatorError> {
+        self.execute_action_locked(run, action, operation, None)
+    }
+
+    /// Shares the exact action path between individual execution and a run holding continuous exclusion.
+    fn execute_action_locked(
+        &mut self,
+        run: &mut ExecutionRun,
+        action: ActionId,
+        operation: Option<OperationId>,
+        lock: Option<&HostExecutionLock>,
     ) -> Result<ActionRunState, CoordinatorError> {
         if self.run_id != run.run_id() {
             return Err(CoordinatorError::RunMismatch);
@@ -97,7 +187,10 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             ActionRunState::Checking => {}
             state => return Err(ExecutionRunError::InvalidTransition { action, state }.into()),
         }
-        let lease = ExecutionLease::try_acquire(&self.root, run, action)?;
+        let lease = match lock {
+            Some(lock) => ExecutionLease::under_host_lock(lock, run, action)?,
+            None => ExecutionLease::try_acquire(&self.root, run, action)?,
+        };
         let store = CheckpointStore::new(lease.host_lock());
         if store.inspect()?.is_some() {
             return Err(HostError::ActiveAttempt.into());
