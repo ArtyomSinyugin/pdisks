@@ -585,6 +585,10 @@ Pure postconditions принимают provisional filesystem UUID bindings дл
 совпадающим типом, единственным UUID и Present-наблюдением. Размер, label и
 backing dependency проверяются отдельно. Эти bindings не включают native mkfs:
 runtime по-прежнему обязан доказать происхождение нового UUID и owning backing.
+Runtime mount postconditions требуют ровно одну запись на Host target и
+UUID-correlated filesystem source (либо typed tmpfs). Дубликаты/overmount,
+unresolved source, отсутствие записи и неподдержанная namespace остаются Unknown;
+подтверждённый чужой source даёт Violated. Native mount writes пока не включены.
 
 `live::check_observed_goal()` независимо проверяет финальный фактический граф
 после UUID correlation, включая подтверждённые outputs, точные связи/размеры

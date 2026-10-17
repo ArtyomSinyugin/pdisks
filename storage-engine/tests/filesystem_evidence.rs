@@ -209,3 +209,80 @@ fn filesystem_output_checks_require_unique_typed_uuid_and_actual_properties()
     ));
     Ok(())
 }
+
+/// Mount evidence must be unique at the target; a matching older row cannot hide an overmount.
+#[test]
+fn mount_postcondition_rejects_ambiguous_and_unresolved_sources() -> Result<(), Box<dyn Error>> {
+    use storage_core::model::{MountContext, MountSource, ObservedMount};
+    let f = Fixture::new()?;
+    let condition = Postcondition::RuntimeMountPresent {
+        source: MountSource::Filesystem(f.binding.source),
+        target: "/data".into(),
+        context: MountContext::Host,
+    };
+    let mount = ObservedMount {
+        source: MountSource::Filesystem(f.binding.target),
+        target: "/data".into(),
+        options: vec!["rw".into()],
+        context: MountContext::Host,
+    };
+    let mut observed = f.observed.clone();
+    observed.snapshot.mounts.entries.push(mount.clone());
+    assert_eq!(
+        check_observed_postconditions_with_bindings(
+            &f.baseline,
+            &observed,
+            std::slice::from_ref(&condition),
+            std::slice::from_ref(&f.binding)
+        )?
+        .checks[0]
+            .status,
+        LiveCheckStatus::Satisfied
+    );
+    for case in 0..6 {
+        let mut changed = observed.clone();
+        match case {
+            0 => changed.snapshot.mounts.entries.clear(),
+            1 => changed.snapshot.mounts.entries.push(mount.clone()),
+            2 => changed.snapshot.mounts.entries[0].source = MountSource::Tmpfs,
+            3 => changed.snapshot.mounts.entries[0].source = MountSource::Other("/dev/dm-1".into()),
+            4 => {
+                changed.snapshot.mounts.entries[0].context = MountContext::Namespace("other".into())
+            }
+            _ => {
+                let mut overmount = mount.clone();
+                overmount.source = MountSource::Tmpfs;
+                changed.snapshot.mounts.entries.push(overmount);
+            }
+        }
+        assert_ne!(
+            check_observed_postconditions_with_bindings(
+                &f.baseline,
+                &changed,
+                std::slice::from_ref(&condition),
+                std::slice::from_ref(&f.binding)
+            )?
+            .checks[0]
+                .status,
+            LiveCheckStatus::Satisfied,
+            "case {case}"
+        );
+    }
+    let namespaced = Postcondition::RuntimeMountPresent {
+        source: MountSource::Filesystem(f.binding.source),
+        target: "/data".into(),
+        context: MountContext::Namespace("other".into()),
+    };
+    assert!(matches!(
+        check_observed_postconditions_with_bindings(
+            &f.baseline,
+            &observed,
+            &[namespaced],
+            &[f.binding]
+        )?
+        .checks[0]
+            .status,
+        LiveCheckStatus::Unknown { .. }
+    ));
+    Ok(())
+}

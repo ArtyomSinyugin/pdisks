@@ -1,9 +1,7 @@
 //! Conservative result checks over one retained actual post-backend observation.
 
 use serde::Serialize;
-use storage_core::model::{
-    ExternalId, MountContext, MountSource, Node, NodeId, NodeKind, Presence,
-};
+use storage_core::model::{ExternalId, Node, NodeId, NodeKind, Presence};
 use storage_provider::Postcondition;
 
 use super::{ObservationError, correlated_node, qualify_observed_status, unknown};
@@ -88,28 +86,20 @@ fn check_result(
             };
         }
         Postcondition::RuntimeMountPresent {
-            source: MountSource::Filesystem(source),
+            source,
             target,
-            context: MountContext::Host,
+            context,
         } => {
-            let (filesystem, node) = match result_node(baseline, observation, *source, bindings) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            if !matches!(node.kind.kind, NodeKind::Filesystem { .. }) {
-                return violated("correlated mount source is not a filesystem");
-            }
-            return if observation.snapshot.mounts.entries.iter().any(|mount| {
-                mount.source == MountSource::Filesystem(filesystem)
-                    && mount.target == *target
-                    && mount.context == MountContext::Host
-            }) {
-                LiveCheckStatus::Satisfied
-            } else {
-                unknown(
-                    "the exact filesystem mount was not observed; complete namespace coverage is required",
-                )
-            };
+            return super::mount::observed_mount(
+                baseline,
+                observation,
+                source,
+                target,
+                context,
+                bindings,
+            )
+            .map(|_| LiveCheckStatus::Satisfied)
+            .unwrap_or_else(|status| status);
         }
         Postcondition::RuntimeMountAbsent { target, context } => {
             return if observation

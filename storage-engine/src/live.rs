@@ -14,6 +14,7 @@ mod capacity;
 pub use capacity::check_observed_prerequisites_with_bindings;
 pub use capacity::check_observed_prerequisites_with_capacity;
 mod goal;
+mod mount;
 mod verify;
 pub use goal::check_observed_goal;
 pub use verify::{
