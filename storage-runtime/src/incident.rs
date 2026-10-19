@@ -286,7 +286,7 @@ pub fn acknowledge_incident(
     if store.inspect()?.as_ref() != Some(&review.inspection.attempt) {
         return Err(IncidentError::Changed);
     }
-    store.clear(fresh.attempt.run_id, fresh.attempt.action_id)?;
+    store.clear(&fresh.attempt)?;
     Ok(fresh)
 }
 

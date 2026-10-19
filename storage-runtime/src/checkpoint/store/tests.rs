@@ -14,6 +14,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 use storage_core::model::{Bytes, ExternalId, LvmLvKind, NodeId};
+use storage_engine::ActionId;
 use storage_provider::{BackendId, LvmAction, ProviderAction};
 
 /// Fork briefly inherits other threads' CLOEXEC fds; isolate immediate lock-release assertions.
@@ -130,21 +131,27 @@ fn arm_and_clear_preserve_exact_attempt_ownership() -> Result<(), Box<dyn Error>
         Err(CheckpointError::AlreadyActive)
     ));
     assert!(matches!(
-        store.clear(Uuid::now_v7(), attempt.action_id),
+        store.clear(&ActiveAttempt {
+            run_id: Uuid::now_v7(),
+            ..attempt.clone()
+        }),
         Err(CheckpointError::AttemptMismatch)
     ));
     assert!(matches!(
-        store.clear(attempt.run_id, ActionId::new(1)),
+        store.clear(&ActiveAttempt {
+            action_id: ActionId::new(1),
+            ..attempt.clone()
+        }),
         Err(CheckpointError::AttemptMismatch)
     ));
     assert_eq!(fs::read(&active)?, bytes);
     assert_eq!(fs::read_dir(&scratch.0)?.count(), 2);
     assert!(matches!(root.try_lock_host(), Err(LeaseError::Busy)));
-    store.clear(attempt.run_id, attempt.action_id)?;
+    store.clear(&attempt)?;
     assert!(store.inspect()?.is_none());
     assert_eq!(fs::read_dir(&scratch.0)?.count(), 1);
     assert!(matches!(
-        store.clear(attempt.run_id, attempt.action_id),
+        store.clear(&attempt),
         Err(CheckpointError::AttemptMismatch)
     ));
     store.arm(&fixture())?;
@@ -169,7 +176,7 @@ fn checkpoint_survives_lock_release() -> Result<(), Box<dyn Error>> {
         store.arm(&fixture()),
         Err(CheckpointError::AlreadyActive)
     ));
-    store.clear(attempt.run_id, attempt.action_id)?;
+    store.clear(&attempt)?;
     Ok(())
 }
 
@@ -208,10 +215,7 @@ fn malformed_and_untrusted_files_fail_closed() -> Result<(), Box<dyn Error>> {
         }
         assert!(store.inspect().is_err(), "inspect case {case}");
         assert!(store.arm(&fixture()).is_err(), "arm case {case}");
-        assert!(
-            store.clear(Uuid::now_v7(), ActionId::new(0)).is_err(),
-            "clear case {case}"
-        );
+        assert!(store.clear(&fixture()).is_err(), "clear case {case}");
         assert!(active.symlink_metadata().is_ok());
         assert_eq!(
             fs::read_dir(&scratch.0)?.count(),
@@ -243,7 +247,7 @@ fn arm_io_failures_stop_dispatch_and_poison_mutations() -> Result<(), Box<dyn Er
             Err(CheckpointError::Poisoned)
         ));
         assert!(matches!(
-            store.clear(attempt.run_id, attempt.action_id),
+            store.clear(&attempt),
             Err(CheckpointError::Poisoned)
         ));
         assert_eq!(store.inspect()?.is_some(), point == Boundary::DirectorySync);
@@ -270,7 +274,7 @@ fn clear_sync_failure_stops_further_mutations() -> Result<(), Box<dyn Error>> {
     let attempt = fixture();
     store.arm(&attempt)?;
     FAULT.set(Some((Boundary::ClearSync, false)));
-    assert!(store.clear(attempt.run_id, attempt.action_id).is_err());
+    assert!(store.clear(&attempt).is_err());
     assert!(store.inspect()?.is_none());
     assert!(matches!(
         store.arm(&fixture()),
@@ -303,7 +307,7 @@ fn checkpoint_crash_child() -> Result<(), Box<dyn Error>> {
     FAULT.set(Some((point, true)));
     if matches!(point, Boundary::Unlink | Boundary::ClearSync) {
         let attempt = store.inspect()?.ok_or("active attempt")?;
-        store.clear(attempt.run_id, attempt.action_id)?;
+        store.clear(&attempt)?;
     } else {
         store.arm(&fixture())?;
     }
@@ -376,14 +380,11 @@ fn unlink_failure_retains_checkpoint_and_blocks_successor() -> Result<(), Box<dy
     store.arm(&attempt)?;
     let bytes = fs::read(scratch.0.join(ACTIVE_FILE))?;
     FAULT.set(Some((Boundary::Unlink, false)));
-    assert!(matches!(
-        store.clear(attempt.run_id, attempt.action_id),
-        Err(CheckpointError::Io(_))
-    ));
+    assert!(matches!(store.clear(&attempt), Err(CheckpointError::Io(_))));
     assert_eq!(fs::read(scratch.0.join(ACTIVE_FILE))?, bytes);
     assert_eq!(store.inspect()?, Some(attempt.clone()));
     assert!(matches!(
-        store.clear(attempt.run_id, attempt.action_id),
+        store.clear(&attempt),
         Err(CheckpointError::Poisoned)
     ));
     assert!(matches!(
@@ -414,10 +415,7 @@ fn read_failure_blocks_inspect_arm_and_clear() -> Result<(), Box<dyn Error>> {
     FAULT.set(Some((Boundary::Read, false)));
     assert!(matches!(store.arm(&fixture()), Err(CheckpointError::Io(_))));
     FAULT.set(Some((Boundary::Read, false)));
-    assert!(matches!(
-        store.clear(attempt.run_id, attempt.action_id),
-        Err(CheckpointError::Io(_))
-    ));
+    assert!(matches!(store.clear(&attempt), Err(CheckpointError::Io(_))));
     assert_eq!(fs::read(scratch.0.join(ACTIVE_FILE))?, bytes);
     assert_eq!(store.inspect()?, Some(attempt));
     assert_eq!(fs::read_dir(&scratch.0)?.count(), 2);

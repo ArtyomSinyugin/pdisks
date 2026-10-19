@@ -212,3 +212,54 @@ fn observer_panic_retains_stop_latch_and_checkpoint() -> Result<(), Box<dyn Erro
     }
     Ok(())
 }
+
+/// Valid JSON with the same run/action IDs must not erase changed evidence during verified clear.
+#[test]
+fn verified_clear_rejects_changed_checkpoint_contract() -> Result<(), Box<dyn Error>> {
+    use storage_runtime::{checkpoint::CheckpointError, coordinator::CoordinatorError};
+    let _process = isolate_processes();
+    let scratch = admission::Scratch::new()?;
+    let (state, frozen) = fixture()?;
+    let state = Rc::new(RefCell::new(state));
+    let mut run = ExecutionRun::new(frozen.document())?;
+    let mut fake = coordination::dispatcher(&scratch, state.clone());
+    fake.created_uuid = Some("created-lv".into());
+    let calls = fake.calls.clone();
+    let mut coordinator = ExecutionCoordinator::new(
+        ExecutionRoot::open(&scratch.0)?,
+        coordination::host(state, &run)?,
+        fake,
+        &run,
+    );
+    let active = scratch.0.join("active-attempt.json");
+    let mut changed = None;
+    let result = coordinator.execute_run_with_updates(&mut run, &mut |run| {
+        if changed.is_none() && run.state(ActionId::new(0)).ok() == Some(ActionRunState::Verified) {
+            let bytes = fs::read(&active).unwrap_or_else(|error| panic!("marker: {error}"));
+            let mut attempt = ActiveAttempt::from_bytes(&bytes)
+                .unwrap_or_else(|error| panic!("attempt: {error}"));
+            attempt.plan_digest = "b".repeat(64);
+            let bytes = attempt
+                .to_bytes()
+                .unwrap_or_else(|error| panic!("changed: {error}"));
+            fs::write(&active, &bytes).unwrap_or_else(|error| panic!("replacement: {error}"));
+            changed = Some(bytes);
+        }
+    });
+    assert!(matches!(
+        result,
+        Err(CoordinatorError::Checkpoint(
+            CheckpointError::AttemptMismatch
+        ))
+    ));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Verified);
+    assert!(!run.is_verified());
+    assert_eq!(fs::read(active)?, changed.ok_or("injected replacement")?);
+    assert!(matches!(
+        coordinator.execute_run(&mut run),
+        Err(CoordinatorError::Stopped)
+    ));
+    assert_eq!(calls.get(), 1);
+    Ok(())
+}

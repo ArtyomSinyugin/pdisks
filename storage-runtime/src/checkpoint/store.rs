@@ -13,7 +13,6 @@ use std::{
     fs::File,
     io::{self, Read, Write},
 };
-use storage_engine::ActionId;
 use uuid::Uuid;
 
 use super::{ActiveAttempt, CheckpointError, MAX_CHECKPOINT_BYTES};
@@ -110,14 +109,15 @@ impl<'lock> CheckpointStore<'lock> {
         result
     }
 
-    /// Removes only this run/action's exact checkpoint and confirms the removal with directory fsync.
+    /// Removes only the complete expected attempt and confirms removal with directory fsync.
+    /// Run/action IDs alone cannot authorize deleting a changed action, target, digest, or backend.
     /// A clear error forbids starting a successor, even when the action was already verified.
-    pub fn clear(&self, run: Uuid, action: ActionId) -> Result<(), CheckpointError> {
+    pub fn clear(&self, expected: &ActiveAttempt) -> Result<(), CheckpointError> {
         self.require_healthy()?;
         let Some((attempt, original)) = self.read_current()? else {
             return Err(CheckpointError::AttemptMismatch);
         };
-        if attempt.run_id != run || attempt.action_id != action {
+        if &attempt != expected {
             return Err(CheckpointError::AttemptMismatch);
         }
         let directory = self.lock.directory();

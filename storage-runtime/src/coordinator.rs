@@ -307,11 +307,17 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             resolved.fingerprints(),
             resolved.backend().clone(),
         )
-        .and_then(|attempt| store.arm(&attempt));
-        if let Err(error) = prepared {
-            run.mark_pre_dispatch_failed(action, error.to_string())?;
-            return Err(error.into());
-        }
+        .and_then(|attempt| {
+            store.arm(&attempt)?;
+            Ok(attempt)
+        });
+        let attempt = match prepared {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                run.mark_pre_dispatch_failed(action, error.to_string())?;
+                return Err(error.into());
+            }
+        };
         // Every exit after this boundary retains the stop latch unless clear is acknowledged.
         self.halted = true;
         // Publish durable arming before any invocation; observer failure must retain the stop latch.
@@ -424,7 +430,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             }
             // Action verification precedes durable clear and is not final run success.
             notifications.publish(run);
-            store.clear(run.run_id(), action)?;
+            store.clear(&attempt)?;
             self.halted = false;
         }
         Ok(state)
