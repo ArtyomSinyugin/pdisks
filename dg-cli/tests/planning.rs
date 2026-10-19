@@ -10,6 +10,108 @@ use disksgraph::{
 };
 use std::error::Error;
 
+/// Review, challenge and revision are checked within one process; only explicit save persists rebase.
+#[test]
+fn repl_rebase_requires_current_review_and_live_configuration() -> Result<(), Box<dyn Error>> {
+    use std::io::{BufRead, BufReader, Write};
+    let (scratch, mut app, probes, writes) = support::application()?;
+    let path = scratch.0.join("rebase.json");
+    execute(
+        &mut app,
+        &Command::New {
+            output: path.clone(),
+        },
+    )?;
+    let original = DraftDocument::from_json(&files::read_document(&path)?)?;
+    let mut output = Vec::new();
+    dg_cli::repl::edit(
+        &mut app,
+        &path,
+        false,
+        &mut b"{\"command\":\"prepare_rebase\"}\n".as_slice(),
+        &mut output,
+    )?;
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&output)?
+            .get("error")
+            .is_some()
+    );
+    assert_eq!(probes.get(), 1);
+    let (server_in, client_out) = rustix::pipe::pipe()?;
+    let (client_in, server_out) = rustix::pipe::pipe()?;
+    let mut server = std::fs::File::from(server_out);
+    let mut input = BufReader::new(std::fs::File::from(server_in));
+    let peer = std::thread::spawn(move || -> std::io::Result<Vec<serde_json::Value>> {
+        /// Exchanges one command/reply pair over a real duplex stream.
+        fn exchange(
+            writer: &mut impl Write,
+            reader: &mut impl BufRead,
+            command: serde_json::Value,
+        ) -> std::io::Result<serde_json::Value> {
+            writeln!(writer, "{command}")?;
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            serde_json::from_str(&line).map_err(std::io::Error::other)
+        }
+        let mut client = std::fs::File::from(client_out);
+        let mut reader = BufReader::new(std::fs::File::from(client_in));
+        let mut replies = Vec::new();
+        let prepared = exchange(
+            &mut client,
+            &mut reader,
+            serde_json::json!({"command":"prepare_rebase"}),
+        )?;
+        let token = prepared["result"]["token"].clone();
+        replies.push(prepared);
+        replies.push(exchange(
+            &mut client,
+            &mut reader,
+            serde_json::json!({"command":"accept_rebase","token":uuid::Uuid::nil()}),
+        )?);
+        replies.push(exchange(
+            &mut client,
+            &mut reader,
+            serde_json::json!({"command":"edit","edit":"clear"}),
+        )?);
+        replies.push(exchange(
+            &mut client,
+            &mut reader,
+            serde_json::json!({"command":"accept_rebase","token":token}),
+        )?);
+        let next = exchange(
+            &mut client,
+            &mut reader,
+            serde_json::json!({"command":"prepare_rebase"}),
+        )?;
+        let token = next["result"]["token"].clone();
+        replies.push(next);
+        replies.push(exchange(
+            &mut client,
+            &mut reader,
+            serde_json::json!({"command":"accept_rebase","token":token}),
+        )?);
+        replies.push(exchange(
+            &mut client,
+            &mut reader,
+            serde_json::json!({"command":"save"}),
+        )?);
+        writeln!(client, "{{\"command\":\"quit\"}}")?;
+        Ok(replies)
+    });
+    let result = dg_cli::repl::edit(&mut app, &path, true, &mut input, &mut server)?;
+    let replies = peer.join().map_err(|_| "peer panicked")??;
+    assert_eq!(replies[1]["error"]["kind"], "usage");
+    assert_eq!(replies[3]["error"]["detail"]["code"], "revision_conflict");
+    assert!(replies[5].get("error").is_none());
+    assert_eq!(result["saved"], true);
+    let saved = DraftDocument::from_json(&files::read_document(&path)?)?;
+    assert_ne!(saved.baseline.id, original.baseline.id);
+    assert_eq!(saved.baseline.snapshot, original.baseline.snapshot);
+    assert_eq!(probes.get(), 3);
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
+
 /// Undo/redo survive only within one REPL, and parsing errors never discard accepted requests.
 #[test]
 fn repl_keeps_history_and_requires_explicit_save() -> Result<(), Box<dyn Error>> {
@@ -32,7 +134,13 @@ fn repl_keeps_history_and_requires_explicit_save() -> Result<(), Box<dyn Error>>
         "{request}\n{{\"command\":\"preview\",\"unexpected\":true}}\n{{\"command\":\"undo\"}}\n{{\"command\":\"preview\"}}\n{{\"command\":\"redo\"}}\n{{\"command\":\"save\"}}\n{{\"command\":\"quit\"}}\n"
     );
     let mut output = Vec::new();
-    let result = dg_cli::repl::edit(&mut app, &draft, &mut commands.as_bytes(), &mut output)?;
+    let result = dg_cli::repl::edit(
+        &mut app,
+        &draft,
+        false,
+        &mut commands.as_bytes(),
+        &mut output,
+    )?;
     assert_eq!(result["saved"], true);
     let replies: Vec<serde_json::Value> = String::from_utf8(output)?
         .lines()
@@ -52,6 +160,7 @@ fn repl_keeps_history_and_requires_explicit_save() -> Result<(), Box<dyn Error>>
     let result = dg_cli::repl::edit(
         &mut app,
         &draft,
+        false,
         &mut b"{\"command\":\"edit\",\"edit\":\"clear\"}\n".as_slice(),
         &mut Vec::new(),
     )?;

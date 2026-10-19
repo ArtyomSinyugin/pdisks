@@ -54,6 +54,8 @@ pub enum Command {
     Edit {
         /// Existing draft to open; history lasts only until this invocation exits.
         draft: PathBuf,
+        /// Enable fresh rebase preparation only when native registrations were explicitly selected.
+        live_rebase: bool,
     },
 }
 
@@ -62,7 +64,14 @@ impl Command {
     pub fn needs_probe(&self) -> bool {
         matches!(
             self,
-            Self::Probe | Self::New { .. } | Self::Apply { .. } | Self::Incident
+            Self::Probe
+                | Self::New { .. }
+                | Self::Apply { .. }
+                | Self::Incident
+                | Self::Edit {
+                    live_rebase: true,
+                    ..
+                }
         )
     }
 }
@@ -144,6 +153,7 @@ impl Invocation {
             ["incident", "show"] => Command::Incident,
             ["plan", "edit"] => Command::Edit {
                 draft: take(&mut flags, "--draft")?,
+                live_rebase: manifest.is_some(),
             },
             _ => return Err(Error::Usage("unknown command; use --help".into())),
         };
@@ -257,9 +267,13 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
             Ok(serde_json::json!({"run": snapshot, "event_output_error": output_error}))
         }
         Command::Incident => Ok(serde_json::json!({"incident": app.incident()?})),
-        Command::Edit { draft } => {
-            crate::repl::edit(app, draft, &mut std::io::stdin().lock(), events)
-        }
+        Command::Edit { draft, live_rebase } => crate::repl::edit(
+            app,
+            draft,
+            *live_rebase,
+            &mut std::io::stdin().lock(),
+            events,
+        ),
     }
 }
 

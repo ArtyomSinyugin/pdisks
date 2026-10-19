@@ -53,6 +53,7 @@ name = "dg-cli"
 version = "0.1.0"
 dependencies = [
  "disksgraph",
+ "rustix",
  "serde",
  "serde_json",
  "storage-provider",

@@ -26,6 +26,10 @@ enum EditCommand {
     Redo {},
     /// Return the forecast for the current revision.
     Preview {},
+    /// Obtain a fresh separately reviewable baseline without changing the draft.
+    PrepareRebase {},
+    /// Accept only the candidate displayed by this process, while its source is still current.
+    AcceptRebase { token: uuid::Uuid },
     /// Atomically replace the opened draft file.
     Save {},
     /// End without implicitly saving pending changes.
@@ -37,6 +41,7 @@ enum EditCommand {
 pub fn edit<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>(
     app: &mut DisksGraph<LinuxLiveHost<'_, C, A>, D>,
     path: &Path,
+    live_rebase: bool,
     input: &mut impl BufRead,
     output: &mut dyn Write,
 ) -> Result<serde_json::Value, Error> {
@@ -45,6 +50,7 @@ pub fn edit<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispat
     let session = app.import_draft(document)?;
     let result = (|| {
         let mut saved = app.revision(session)?;
+        let mut pending: Option<(uuid::Uuid, disksgraph::RebasePreview)> = None;
         loop {
             let mut line = Vec::new();
             // Each command is bounded even for an untrusted producer that never sends a newline.
@@ -76,6 +82,40 @@ pub fn edit<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispat
                     }
                     EditCommand::Preview {} => {
                         Ok(serde_json::to_value(app.preview_document(session)?)?)
+                    }
+                    EditCommand::PrepareRebase {} => {
+                        if !live_rebase {
+                            return Err(Error::Usage(
+                                "rebase requires plan edit with --manifest".into(),
+                            ));
+                        }
+                        let candidate = app.prepare_rebase(session, revision)?;
+                        let token = uuid::Uuid::now_v7();
+                        let reply = serde_json::json!({
+                            "token": token, "source_revision": candidate.source_revision(),
+                            "baseline": candidate.target_baseline(), "draft": candidate.draft(),
+                            "correlations": candidate.correlations(),
+                            "status": candidate.preview().status(),
+                            "diagnostics": candidate.preview().diagnostics(),
+                        });
+                        pending = Some((token, candidate));
+                        Ok(reply)
+                    }
+                    EditCommand::AcceptRebase { token } => {
+                        if !pending
+                            .as_ref()
+                            .is_some_and(|(expected, _)| *expected == token)
+                        {
+                            return Err(Error::Usage(
+                                "rebase token does not match the pending review".into(),
+                            ));
+                        }
+                        let (_, candidate) = pending
+                            .take()
+                            .ok_or_else(|| Error::Usage("no pending rebase".into()))?;
+                        let source = candidate.source_revision();
+                        let revision = app.accept_rebase(session, source, candidate)?;
+                        Ok(serde_json::json!({"revision": revision, "saved": false}))
                     }
                     EditCommand::Save {} => {
                         let document = app

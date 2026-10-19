@@ -17,3 +17,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 storage-provider.workspace = true
+rustix = { version = "1.1.5", features = ["pipe"] }
