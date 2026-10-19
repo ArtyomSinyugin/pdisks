@@ -6,7 +6,7 @@ use storage_core::model::{
     NodeKind, ProbeEpoch,
 };
 use storage_engine::{LiveObservation, ObservationReference};
-use storage_runtime::filesystem::correlate_created_ext4;
+use storage_runtime::filesystem::{correlate_created_ext4, observe_ext4};
 use uuid::Uuid;
 
 /// Same-instance pre/post publications with a new ext4 on an existing UUID-qualified LV.
@@ -117,5 +117,38 @@ fn ext4_correlation_checks_identity_properties_and_backing() -> Result<(), Box<d
         )
         .is_err()
     );
+    Ok(())
+}
+
+/// Revalidation follows UUID and owning LV after both transient IDs have changed.
+#[test]
+fn ext4_revalidation_follows_identity_and_rejects_reparenting() -> Result<(), Box<dyn Error>> {
+    let (_, mut observed, backing, actual, uuid) = fixture()?;
+    let lv = observed.snapshot.graph.node(&backing).ok_or("LV")?.clone();
+    let fs = observed.snapshot.graph.node(&actual).ok_or("FS")?.clone();
+    let edge = observed
+        .snapshot
+        .graph
+        .dependencies()
+        .find(|edge| edge.to == actual)
+        .ok_or("edge")?
+        .clone();
+    observed.snapshot.graph.remove_dependency(&edge);
+    observed.snapshot.graph.remove_node(&actual);
+    observed.snapshot.graph.remove_node(&backing);
+    let new_lv = NodeId::new();
+    let new_fs = NodeId::new();
+    observed.snapshot.graph.insert_new(new_lv, lv.clone())?;
+    observed.snapshot.graph.insert_new(new_fs, fs)?;
+    observed.snapshot.graph.insert_dependency(Dependency {
+        from: new_lv,
+        to: new_fs,
+        kind: DependencyKind::Backs,
+    });
+    assert_eq!(observe_ext4(&observed, new_lv, &uuid, &None)?, new_fs);
+    assert!(observe_ext4(&observed, backing, &uuid, &None).is_err());
+    let foreign = NodeId::new();
+    observed.snapshot.graph.insert_new(foreign, lv)?;
+    assert!(observe_ext4(&observed, foreign, &uuid, &None).is_err());
     Ok(())
 }

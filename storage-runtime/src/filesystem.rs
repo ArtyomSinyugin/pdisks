@@ -63,7 +63,39 @@ pub fn correlate_created_ext4(
     {
         return Err(invalid());
     }
-    let mut matches = after
+    let target = observe_ext4(after, actual_backing, uuid, label)?;
+    Ok(NodeCorrelation {
+        source: planned,
+        target,
+        identity,
+    })
+}
+
+/// Revalidates a known ext4 UUID and its unique owning LV in one current publication.
+/// The supplied backing ID must already be correlated by the caller in this exact publication.
+/// This establishes properties and ownership only, never creation provenance or authorization.
+pub fn observe_ext4(
+    observed: &LiveObservation,
+    backing: NodeId,
+    uuid: &str,
+    label: &Option<String>,
+) -> Result<NodeId, FilesystemEvidenceError> {
+    let invalid = || FilesystemEvidenceError::Identity;
+    observed.validate().map_err(|_| invalid())?;
+    if Uuid::parse_str(uuid)
+        .ok()
+        .is_none_or(|id| id.is_nil() || id.hyphenated().to_string() != uuid)
+        || !observed.snapshot.graph.node(&backing).is_some_and(|node| {
+            node.size.presence == Presence::Present && matches!(node.kind.kind, NodeKind::LvmLv(_))
+        })
+    {
+        return Err(invalid());
+    }
+    let identity = ExternalId::Filesystem {
+        fs_type: "ext4".into(),
+        value: uuid.into(),
+    };
+    let mut matches = observed
         .snapshot
         .graph
         .nodes()
@@ -83,12 +115,12 @@ pub fn correlate_created_ext4(
             .filter(|id| matches!(id, ExternalId::Filesystem { .. }))
             .count()
             != 1
-        || after
+        || observed
             .snapshot
             .graph
             .dependencies()
             .any(|edge| edge.from == *id)
-        || after
+        || observed
             .snapshot
             .graph
             .relations()
@@ -96,19 +128,15 @@ pub fn correlate_created_ext4(
     {
         return Err(invalid());
     }
-    let parents: Vec<_> = after
+    let parents: Vec<_> = observed
         .snapshot
         .graph
         .dependencies()
         .filter(|edge| edge.to == *id)
         .collect();
-    if !matches!(parents.as_slice(), [edge] if edge.from == actual_backing && edge.kind == DependencyKind::Backs)
+    if !matches!(parents.as_slice(), [edge] if edge.from == backing && edge.kind == DependencyKind::Backs)
     {
         return Err(invalid());
     }
-    Ok(NodeCorrelation {
-        source: planned,
-        target: *id,
-        identity,
-    })
+    Ok(*id)
 }
