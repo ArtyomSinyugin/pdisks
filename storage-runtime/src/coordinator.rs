@@ -140,7 +140,8 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         })
     }
 
-    /// Publishes immutable live evidence at the same boundaries as events, including before admission.
+    /// Publishes immutable live evidence, including durable arming and verification before clear.
+    /// These two file boundaries may repeat an event cursor; event adapters suppress duplicates.
     /// The observer cannot change admission or interrupt a native invocation; slow callbacks delay it.
     pub fn execute_run_with_updates(
         &mut self,
@@ -313,6 +314,8 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         }
         // Every exit after this boundary retains the stop latch unless clear is acknowledged.
         self.halted = true;
+        // Publish durable arming before any invocation; observer failure must retain the stop latch.
+        notifications.publish(run);
         run.mark_dispatch_started(action)?;
         notifications.publish(run);
         let receipt = self
@@ -419,6 +422,8 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             if resolved.filesystem_target().is_some() {
                 self.bindings.record_verified_mount(run, action)?;
             }
+            // Action verification precedes durable clear and is not final run success.
+            notifications.publish(run);
             store.clear(run.run_id(), action)?;
             self.halted = false;
         }

@@ -2455,6 +2455,53 @@ mod run_coordinator {
         }
     }
 
+    /// Passive snapshots expose durable boundaries without fabricating final success or event IDs.
+    #[test]
+    fn updates_expose_armed_and_verified_before_clear() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
+        let (state, frozen) = fixture()?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = admission::Scratch::new()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let mut fake = coordination::dispatcher(&scratch, state.clone());
+        fake.created_uuid = Some("created-lv".into());
+        let calls = fake.calls.clone();
+        let mut coordinator = ExecutionCoordinator::new(
+            ExecutionRoot::open(&scratch.0)?,
+            coordination::host(state, &run)?,
+            fake,
+            &run,
+        );
+        let mut phases = Vec::new();
+        let summary = coordinator.execute_run_with_updates(&mut run, &mut |run| {
+            let phase = run
+                .state(ActionId::new(0))
+                .unwrap_or_else(|error| panic!("state: {error}"));
+            if scratch.0.join("active-attempt.json").exists() && calls.get() <= 1 {
+                assert!(!run.is_verified());
+                assert!(
+                    ExecutionRoot::open(&scratch.0)
+                        .unwrap_or_else(|error| panic!("root: {error}"))
+                        .try_lock_host()
+                        .is_err()
+                );
+                phases.push(phase);
+            }
+        })?;
+        assert!(summary.verified);
+        for phase in [
+            ActionRunState::Admitted,
+            ActionRunState::Running,
+            ActionRunState::Verifying,
+            ActionRunState::Verified,
+        ] {
+            assert!(phases.contains(&phase), "missing {phase:?}: {phases:?}");
+        }
+        assert_eq!(calls.get(), 2);
+        assert_eq!(std::fs::read_dir(&scratch.0)?.count(), 1);
+        Ok(())
+    }
+
     /// A complete DAG gets an independent final publication; unknown/failed actions stop successors.
     #[test]
     fn executes_dag_under_one_lock_and_verifies_final_goal() -> Result<(), Box<dyn Error>> {
