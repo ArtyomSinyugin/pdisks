@@ -99,11 +99,33 @@ Focused source-checkout acceptance commands:
 ```sh
 cargo test -p storage-runtime --lib checkpoint::store::tests --offline
 cargo test -p storage-runtime --test checkpoint crash_lifecycle --offline
+cargo test -p storage-runtime --test runtime coordinator_crash --offline
+cargo test -p disksgraph --test recovery --offline
+cargo test -p dg-cli --test recovery --offline
+cargo test -p disksgraph-ffi --test recovery --test checked_consumer --offline
 cargo test -p storage-runtime --test execution_leases --offline
 cargo test -p dg-cli --test exit_codes --offline
 ```
 
 The ignored child helpers are invoked by their normal parent tests; do not run
 all ignored tests manually. Fault switches exist only in unit-test builds.
-SIGKILL phase tests use synthetic engine reports and no native dispatch. They
-verify process/filesystem behavior, not power loss or public-route crash parity.
+The coordinator SIGKILL matrix now covers armed, running (inside the synthetic
+adapter), completed and verified-before-clear through the actual runtime path.
+Restart is rejected before probe/admission/dispatch; observer unwinding retains
+the stop latch. The earlier engine-only matrix remains a separate lower-level test.
+A recorded marker from that coordinator is reused across facade/CLI/job recovery
+tests; the checked .so also preserves it through saved-only reopen/preview/close.
+Those public recovery tests do not kill native write-capable transport calls.
+No native dispatch or power-loss acceptance is implied by this synthetic suite.
+
+Rust embedders of `CheckpointStore` must pass `clear(&expected_attempt)` instead
+of the former `(run_id, action_id)` arguments. Clear compares the complete armed
+attempt, including digest, action, target fingerprints and backend; changed valid
+JSON is preserved and blocks successors even after action verification. The
+coordinator retains the original attempt through clear. Protocol/ABI versions
+and checked signatures are unchanged.
+
+Live snapshot consumers may now receive repeated event cursors at durable arm
+and verified-before-clear boundaries; replace the whole snapshot. Neither an
+Admitted armed action nor a Verified action before clear establishes final run
+success. The events adapter still delivers each event once.

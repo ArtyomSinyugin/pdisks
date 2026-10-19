@@ -728,8 +728,14 @@ UUID VG/LV, размер и фактическую активацию после
 `arm()` создаёт уникальный временный файл 0600, синхронизирует содержимое,
 публикует `active-attempt.json` через `renameat2(RENAME_NOREPLACE)` и синхронизирует
 каталог. Второй checkpoint не заменяет первый. При ошибке после публикации
-активный файл сохраняется. `clear(run, action)` проверяет владельца попытки и
-inode файла, удаляет только совпадающий checkpoint и синхронизирует каталог.
+активный файл сохраняется. `clear(&expected_attempt)` сравнивает **полную**
+ожидаемую попытку, затем inode файла, удаляет только совпадающий checkpoint и
+синхронизирует каталог. Сигнатура Rust API заменяет прежний `clear(run, action)`:
+совпадения IDs недостаточно. Coordinator удерживает исходный `ActiveAttempt` от
+arm до clear; валидный JSON с изменёнными plan digest, backend, targets или action
+сохраняется как инцидент, даже если само действие уже Verified. DAG не продолжится,
+финальный success не выставляется; incident acknowledgment передаёт полную
+повторно проверенную попытку.
 После ошибки мутации handle запрещает дальнейшие изменения: host обязан
 остановить run, даже если имя уже было удалено. Более слабых fallback для
 неподдерживаемой ФС нет.
@@ -747,8 +753,32 @@ sync, до/после публикации и до/после unlink. Ещё о�
 `armed`, `running`, `completed`, `verified_before_clear` с реальным checkpoint и
 переходами engine, но синтетическими admission/completion/verification reports.
 Во всех четырёх фазах marker остаётся неизменным, flock освобождается ядром,
-новая попытка блокируется. Эта матрица не вызывает coordinator/native backend
-и не доказывает crash parity всех публичных transports.
+новая попытка блокируется. Эта первая матрица не вызывает coordinator/backend.
+
+Дополнительная матрица в `storage-runtime/tests/support/coordinator_crash.rs`
+завершает через SIGKILL **реальный coordinator** в тех же четырёх фазах. Host
+получает recorded provider passes, synthetic dispatcher проверяет marker до
+вызова и меняет только private in-memory graph; completion и output bindings
+проходят обычную runtime verification. На `running` уже есть один вход в adapter,
+на `armed` — ни одного. Новый coordinator блокируется до probe и dispatch как
+через run, так и через single-action API. Panic passive observer на armed и
+verified-before-clear также сохраняет stop latch и marker. Отдельная регрессия
+подменяет валидный digest перед clear: checkpoint остаётся, successor не вызывается.
+
+Passive updates теперь публикуются после durable arm (ещё Admitted) и после
+проверки action/bindings, перед clear (уже Verified). Это не final run success;
+один event cursor может встретиться несколько раз. Events adapter подавляет
+дубликаты; snapshots следует заменять целиком. Наблюдатель остаётся синхронным и
+не может отменить native invocation или разрешить admission.
+
+[Записанный synthetic checkpoint](storage-runtime/tests/fixtures/README.md)
+из verified-before-clear используется в recovery tests фасада, CLI command
+adapter и общего ABI job transport: повторное открытие не восстанавливает dead
+run, новый apply получает checkpoint_blocked без probe/dispatch, close не удаляет
+marker. Отдельный checked `.so` consumer проверяет saved-only reopen/preview/close,
+UnknownRun и отказ start без live host. CLI/transport тесты используют явный
+synthetic Rust host; это **не** crash injection native writes через все transports.
+
 Это не проверка отключения питания
 или аппаратной надёжности накопителя. Полный запуск первого LVM recipe проверен
 через mock native adapter, без изменения реальных устройств;
