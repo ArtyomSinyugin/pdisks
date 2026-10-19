@@ -172,11 +172,8 @@ fn merge_provider_state(
     for relation in contribution.graph.relations() {
         state.graph.insert_relation(relation.clone());
     }
-    for mount in contribution.mounts {
-        if !state.mounts.entries.contains(&mount) {
-            state.mounts.entries.push(mount);
-        }
-    }
+    // Identical entries can be stacked mounts; deduplication would hide an ambiguous target.
+    state.mounts.entries.extend(contribution.mounts);
     if let Some(environment) = contribution.environment {
         if state.environment == empty_current_state().environment {
             state.environment = environment;
@@ -502,6 +499,28 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "provider.node_conflict")
         );
+    }
+
+    /// Equal mount records may represent an overmount and must remain visible to live verification.
+    #[test]
+    fn identical_mount_records_are_not_silently_deduplicated() {
+        let mount = ObservedMount {
+            source: MountSource::Tmpfs,
+            target: PathBuf::from("/mnt/data"),
+            options: vec!["rw".into()],
+            context: MountContext::Host,
+        };
+        let provider = FakeProvider {
+            id: "mounts",
+            responsibility: "mounts.runtime",
+            connection: ProviderConnectionKind::BuiltIn,
+            calls: Rc::new(Cell::new(0)),
+            result: Ok(ProviderState {
+                mounts: vec![mount.clone(), mount],
+                ..ProviderState::default()
+            }),
+        };
+        assert_eq!(probe(&[&provider]).mounts.entries.len(), 2);
     }
 
     #[test]

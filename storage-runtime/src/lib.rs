@@ -37,3 +37,6 @@ pub mod native_ext4;
 
 #[cfg(target_os = "linux")]
 pub mod native_storage;
+
+#[cfg(target_os = "linux")]
+pub mod native_mount;

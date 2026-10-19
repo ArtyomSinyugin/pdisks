@@ -106,6 +106,17 @@ pub struct ActiveAttempt {
     pub backend_id: BackendId,
 }
 
+/// Native identity required for the operation's primary target, independent of other fingerprints.
+#[derive(Clone, Copy)]
+enum PrimaryIdentity {
+    /// Existing VG for LV creation.
+    VolumeGroup,
+    /// Verified LV for activation or formatting.
+    LogicalVolume,
+    /// Verified ext4 output for Host mounting.
+    Filesystem,
+}
+
 impl ActiveAttempt {
     /// Captures an admitted action and exact plan; the host must first resolve target fingerprints.
     /// This validates data only and neither publishes a file nor grants write authorization.
@@ -184,14 +195,18 @@ impl ActiveAttempt {
             return Err(CheckpointError::InvalidData("invalid SHA-256 plan digest"));
         }
         // Every added action needs an explicit non-secret persistence rule.
-        let (primary, volume_group) = match &self.action {
+        let (primary, identity_kind) = match &self.action {
             ProviderAction::Lvm(LvmAction::CreateLv {
                 vg,
                 planned_node_id,
                 size,
                 ..
-            }) if !planned_node_id.as_uuid().is_nil() && size.as_u64() != 0 => (*vg, true),
-            ProviderAction::Lvm(LvmAction::SetActivation { target, .. }) => (*target, false),
+            }) if !planned_node_id.as_uuid().is_nil() && size.as_u64() != 0 => {
+                (*vg, PrimaryIdentity::VolumeGroup)
+            }
+            ProviderAction::Lvm(LvmAction::SetActivation { target, .. }) => {
+                (*target, PrimaryIdentity::LogicalVolume)
+            }
             ProviderAction::Filesystem(FilesystemAction::Create {
                 backing,
                 planned_node_id,
@@ -203,7 +218,13 @@ impl ActiveAttempt {
                     .as_ref()
                     .is_none_or(|label| label.len() <= 16 && !label.contains('\0')) =>
             {
-                (*backing, false)
+                (*backing, PrimaryIdentity::LogicalVolume)
+            }
+            storage_provider::ProviderAction::Mount(storage_provider::MountAction::Mount {
+                source: storage_core::model::MountSource::Filesystem(fs),
+                ..
+            }) if storage_provider::is_ext4_host_mount(&self.action) => {
+                (*fs, PrimaryIdentity::Filesystem)
             }
             _ => return Err(CheckpointError::UnsupportedAction),
         };
@@ -235,14 +256,29 @@ impl ActiveAttempt {
                 return Err(CheckpointError::TooLarge);
             }
             if target.planned_id == primary
-                && !target.external_ids.iter().any(|id| match id {
-                    ExternalId::LvmVgUuid(value) if volume_group => !value.trim().is_empty(),
-                    ExternalId::LvmLvUuid(value) if !volume_group => !value.trim().is_empty(),
-                    _ => false,
-                })
+                && !target
+                    .external_ids
+                    .iter()
+                    .any(|id| match (identity_kind, id) {
+                        (PrimaryIdentity::VolumeGroup, ExternalId::LvmVgUuid(value)) => {
+                            !value.trim().is_empty()
+                        }
+                        (PrimaryIdentity::LogicalVolume, ExternalId::LvmLvUuid(value)) => {
+                            !value.trim().is_empty()
+                        }
+                        (
+                            PrimaryIdentity::Filesystem,
+                            ExternalId::Filesystem { fs_type, value },
+                        ) => {
+                            fs_type == "ext4"
+                                && uuid::Uuid::parse_str(value)
+                                    .is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == *value)
+                        }
+                        _ => false,
+                    })
             {
                 return Err(CheckpointError::InvalidData(
-                    "primary target requires its LVM UUID",
+                    "primary target requires its native UUID",
                 ));
             }
         }

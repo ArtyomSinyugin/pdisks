@@ -13,7 +13,7 @@ use storage_engine::{
 };
 use storage_provider::{
     BackendId, FilesystemAction, LinearLvRequest, LvActivationRequest, LvmAction, LvmWriteError,
-    ProviderAction,
+    MountAction, ProviderAction,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ pub enum TargetError {
     /// The requested action does not belong to this run.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
-    /// Only linear creation, activation and ext4 on verified LV outputs are resolved.
+    /// Only linear creation, activation, ext4 creation and Host mount of verified outputs are resolved.
     #[error("target resolution does not support this action")]
     UnsupportedAction,
     /// Ext4 creation requires an active writable verified LV and representable label.
@@ -83,6 +83,17 @@ pub struct ResolvedLvTarget {
     pub block: Option<BlockFacts>,
 }
 
+/// Ext4 identity correlated from this run's verified output in the exact admission publication.
+#[derive(Debug)]
+pub struct ResolvedFilesystemTarget {
+    /// Planned output retained by the immutable plan.
+    pub planned_id: NodeId,
+    /// Fresh provider identity.
+    pub observed_id: NodeId,
+    /// Independently verified ext4 UUID.
+    pub uuid: String,
+}
+
 /// An operation bound to one run, action, probe publication, and concrete backend.
 /// Fields are private so consumers cannot replace the operation after admission.
 #[derive(Debug)]
@@ -99,11 +110,17 @@ pub struct ResolvedAction {
     observation: ObservationReference,
     /// The sole existing metadata target in the initial recipe.
     target: ResolvedTarget,
-    /// Present for activation or ext4 creation on a verified created LV.
+    /// Present for activation, ext4 creation or mount on a verified created LV.
     lv_target: Option<ResolvedLvTarget>,
+    /// Present only for a Host mount of this run's verified ext4 output.
+    filesystem_target: Option<ResolvedFilesystemTarget>,
 }
 
 impl ResolvedAction {
+    /// Returns the UUID-qualified filesystem whose backing LV is retained by the mount adapter.
+    pub fn filesystem_target(&self) -> Option<&ResolvedFilesystemTarget> {
+        self.filesystem_target.as_ref()
+    }
     /// Returns the run bound at resolution.
     pub fn run_id(&self) -> Uuid {
         self.run_id
@@ -144,6 +161,15 @@ impl ResolvedAction {
                 external_ids: vec![ExternalId::LvmLvUuid(lv.lv_uuid.clone())],
             });
         }
+        if let Some(fs) = &self.filesystem_target {
+            targets.push(TargetFingerprint {
+                planned_id: fs.planned_id,
+                external_ids: vec![ExternalId::Filesystem {
+                    fs_type: "ext4".into(),
+                    value: fs.uuid.clone(),
+                }],
+            });
+        }
         targets
     }
 }
@@ -159,7 +185,7 @@ pub fn resolve_action(
     resolve_action_with_bindings(run, action, observed, backend, &OutputBindings::new(run))
 }
 
-/// Resolves linear creation, activation or ext4 on verified outputs and checks accumulated scope.
+/// Resolves the narrow LVM/ext4/Host mount recipe on verified outputs and checks accumulated scope.
 /// An output binding never adopts arbitrary live consumers or changes to existing reviewed devices.
 pub fn resolve_action_with_bindings(
     run: &ExecutionRun,
@@ -179,7 +205,70 @@ pub fn resolve_action_with_bindings(
     let baseline = bindings
         .reviewed_scope(run, observed)
         .map_err(|_| TargetError::UnverifiedOutput)?;
-    let (vg, lv_target) = match &planned.operation {
+    let mut filesystem_target = None;
+    // Reuse the verified LV resolver; this conversion never changes the frozen dispatched operation.
+    let endpoint_operation = if let ProviderAction::Mount(MountAction::Mount {
+        source: MountSource::Filesystem(fs),
+        target,
+        ..
+    }) = &planned.operation
+    {
+        let observed_id = bindings
+            .resolve(run, *fs, observed)
+            .map_err(|_| TargetError::UnverifiedOutput)?;
+        if !storage_provider::is_ext4_host_mount(&planned.operation)
+            || observed.snapshot.mounts.entries.iter().any(|mount| {
+                mount.context == storage_core::model::MountContext::Host
+                    && (mount.target.starts_with(target)
+                        || mount.source == MountSource::Filesystem(observed_id))
+            })
+        {
+            return Err(TargetError::FilesystemEndpoint);
+        }
+        let node = baseline
+            .graph
+            .node(fs)
+            .ok_or(TargetError::UnverifiedOutput)?;
+        if !matches!(
+            node.kind.kind,
+            NodeKind::Filesystem {
+                kind: FilesystemKind::Ext4,
+                ..
+            }
+        ) {
+            return Err(TargetError::UnsupportedAction);
+        }
+        let mut parents = baseline.graph.dependencies().filter(|edge| {
+            edge.to == *fs && edge.kind == storage_core::model::DependencyKind::Backs
+        });
+        let lv = parents.next().ok_or(TargetError::UnverifiedOutput)?.from;
+        if parents.next().is_some() {
+            return Err(TargetError::UnverifiedOutput);
+        }
+        let uuid = node
+            .size
+            .identities
+            .iter()
+            .find_map(|id| match id {
+                ExternalId::Filesystem { fs_type, value } if fs_type == "ext4" => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .ok_or(TargetError::UnverifiedOutput)?;
+        filesystem_target = Some(ResolvedFilesystemTarget {
+            planned_id: *fs,
+            observed_id,
+            uuid,
+        });
+        ProviderAction::Lvm(LvmAction::SetActivation {
+            target: lv,
+            active: true,
+        })
+    } else {
+        planned.operation.clone()
+    };
+    let (vg, lv_target) = match &endpoint_operation {
         ProviderAction::Lvm(LvmAction::CreateLv {
             vg,
             layout: LvmLvKind::Linear,
@@ -270,6 +359,22 @@ pub fn resolve_action_with_bindings(
         }
         _ => return Err(TargetError::UnsupportedAction),
     };
+    if filesystem_target.is_some()
+        && !lv_target.as_ref().is_some_and(|lv| {
+            observed
+                .snapshot
+                .graph
+                .node(&lv.observed_id)
+                .is_some_and(|node| node.size.lvm_active == Some(true))
+                && lv.block.as_ref().is_some_and(|block| {
+                    block.read_only == Some(false)
+                        && block.geometry.is_some()
+                        && block.paths.len() == 1
+                })
+        })
+    {
+        return Err(TargetError::FilesystemEndpoint);
+    }
     let mapping = correlate_nodes(&baseline, &observed.snapshot, &[vg])?;
     let target = &mapping[0];
     let node = observed
@@ -317,6 +422,7 @@ pub fn resolve_action_with_bindings(
             vg_name: vg_name.clone(),
         },
         lv_target,
+        filesystem_target,
     })
 }
 

@@ -1,19 +1,21 @@
-//! Explicit native routing for the supported LVM/ext4 prefix, without implicit scope or approval policies.
+//! Explicit native routing for the supported LVM/ext4/Host mount recipe, without implicit scope or approval policies.
 
 use crate::{
     capability::{BackendCapabilityCheck, OperationAvailability},
     dispatcher::{BackendDispatcher, DispatchError, ExecutionReceipt},
     native_ext4::NativeExt4Adapter,
     native_lvm::NativeLvmAdapter,
+    native_mount::NativeMountAdapter,
     targets::ResolvedAction,
 };
 use storage_engine::{ExecutionRunError, LiveObservation};
 use storage_provider::{
-    BackendId, FilesystemWriteError, LvmWriteError, ProviderAction, RegisteredBackend,
+    BackendId, FilesystemWriteError, LvmWriteError, MountWriteError, ProviderAction,
+    RegisteredBackend,
 };
 use thiserror::Error;
 
-/// Configuration fails before execution if either explicitly selected native recipe is unavailable.
+/// Configuration fails before execution if any explicitly selected native recipe is unavailable.
 #[derive(Debug, Error)]
 pub enum NativeStorageError {
     /// LVM registration cannot provide the linear-create recipe.
@@ -22,9 +24,12 @@ pub enum NativeStorageError {
     /// Filesystem registration cannot provide the ext4 create/readback recipe.
     #[error(transparent)]
     Filesystem(#[from] FilesystemWriteError),
+    /// Mount registration cannot provide the helper-free Host ext4 recipe.
+    #[error(transparent)]
+    Mount(#[from] MountWriteError),
 }
 
-/// Two retained native registrations, fixed before planning readiness and never chosen by saved JSON.
+/// Three retained native registrations, fixed before planning readiness and never chosen by saved JSON.
 /// All scope, consumer, destructive approval and final coverage policies remain fail-closed defaults.
 #[derive(Clone, Copy)]
 pub struct NativeStorageAdapter<'backend> {
@@ -32,16 +37,20 @@ pub struct NativeStorageAdapter<'backend> {
     lvm: NativeLvmAdapter<'backend>,
     /// Sole route for implemented ext4 operations.
     filesystems: NativeExt4Adapter<'backend>,
+    /// Sole route for narrow Host mounts.
+    mounts: NativeMountAdapter<'backend>,
 }
 impl<'backend> NativeStorageAdapter<'backend> {
-    /// Requires execute opt-in and complete native recipes from both host-selected registrations.
+    /// Requires execute opt-in and complete native recipes from all three host-selected registrations.
     pub fn new(
         lvm: &'backend RegisteredBackend,
         filesystems: &'backend RegisteredBackend,
+        mounts: &'backend RegisteredBackend,
     ) -> Result<Self, NativeStorageError> {
         Ok(Self {
             lvm: NativeLvmAdapter::new(lvm)?,
             filesystems: NativeExt4Adapter::new(filesystems)?,
+            mounts: NativeMountAdapter::new(mounts)?,
         })
     }
 }
@@ -54,6 +63,7 @@ impl BackendCapabilityCheck for NativeStorageAdapter<'_> {
     ) -> OperationAvailability {
         match operation {
             ProviderAction::Filesystem(_) => self.filesystems.availability(operation, observed),
+            ProviderAction::Mount(_) => self.mounts.availability(operation, observed),
             _ => self.lvm.availability(operation, observed),
         }
     }
@@ -67,6 +77,7 @@ impl BackendDispatcher for NativeStorageAdapter<'_> {
     fn backend_for(&self, operation: &ProviderAction) -> &BackendId {
         match operation {
             ProviderAction::Filesystem(_) => self.filesystems.backend_id(),
+            ProviderAction::Mount(_) => self.mounts.backend_id(),
             _ => self.lvm.backend_id(),
         }
     }
@@ -83,6 +94,7 @@ impl BackendDispatcher for NativeStorageAdapter<'_> {
         }
         match action.operation() {
             ProviderAction::Filesystem(_) => self.filesystems.execute(action, progress),
+            ProviderAction::Mount(_) => self.mounts.execute(action, progress),
             _ => self.lvm.execute(action, progress),
         }
     }

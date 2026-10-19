@@ -287,7 +287,9 @@ mod admission {
                 || request.run_id != self.run_id
                 || request.backend != backend()
                 || (request.targets.len() != 1
-                    && !(request.targets.len() == 2
+                    && !((2..=3).contains(&request.targets.len())
+                        && (request.targets.len() == 2
+                            || matches!(request.targets[2].external_ids.as_slice(), [ExternalId::Filesystem { fs_type, .. }] if fs_type == "ext4"))
                         && matches!(
                             request.targets[1].external_ids.as_slice(),
                             [ExternalId::LvmLvUuid(_)]

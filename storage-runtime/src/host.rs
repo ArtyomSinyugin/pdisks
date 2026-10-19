@@ -336,6 +336,47 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                         }
                     }
                 }
+                if let storage_provider::ProviderAction::Mount(
+                    storage_provider::MountAction::Mount {
+                        source,
+                        target,
+                        context: mount_context,
+                        ..
+                    },
+                ) = action.operation()
+                {
+                    let exclusion = self.capability.check_mount_exclusion(
+                        &context,
+                        action,
+                        observed.observation(),
+                    );
+                    for check in &mut checks {
+                        if matches!(check.status, LiveCheckStatus::Unknown { .. }) {
+                            match &check.condition {
+                                storage_provider::ActionPrerequisite::MountSourceAvailable(
+                                    value,
+                                ) if value == source && action.filesystem_target().is_some() => {
+                                    check.status = exclusion.clone()
+                                }
+                                storage_provider::ActionPrerequisite::MountTargetAvailable {
+                                    target: value,
+                                    context: scope,
+                                }
+                                | storage_provider::ActionPrerequisite::MountDescendantsAbsent {
+                                    target: value,
+                                    context: scope,
+                                } if value == target && scope == mount_context => {
+                                    check.status = exclusion.clone()
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // Even observable prerequisites cannot replace full-interval namespace exclusion.
+                    if exclusion != LiveCheckStatus::Satisfied {
+                        applicability = exclusion;
+                    }
+                }
                 let facts_ready = checks.iter().all(|check| {
                     check.status == LiveCheckStatus::Satisfied
                         || match check.condition {
@@ -346,7 +387,7 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                             _ => false,
                         }
                 });
-                if facts_ready {
+                if facts_ready && applicability == LiveCheckStatus::Satisfied {
                     let request = ApprovalRequest {
                         run_id: run.run_id(),
                         plan_id: context.plan_id,
@@ -374,7 +415,7 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                             applicability = incomplete.status.clone();
                         }
                     }
-                } else {
+                } else if applicability == LiveCheckStatus::Satisfied {
                     applicability = LiveCheckStatus::Unknown {
                         required_evidence: "authorization deferred until all prerequisites pass"
                             .into(),

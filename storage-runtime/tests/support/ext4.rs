@@ -940,7 +940,7 @@ fn routed_filesystem_backend_is_fixed_before_any_plan_write() -> Result<(), Box<
     Ok(())
 }
 
-/// A supported two-registration native prefix still needs scope policies; unsupported mount stops before LVM.
+/// The native recipe still needs scope policies; an unsupported mount profile stops before LVM.
 #[test]
 fn native_storage_routes_exact_registrations_and_refuses_incomplete_plans()
 -> Result<(), Box<dyn Error>> {
@@ -957,7 +957,7 @@ fn native_storage_routes_exact_registrations_and_refuses_incomplete_plans()
         let fs = mock_ext4::Fixture::new(0, true)?;
         let lvm_backend = lvm.registry.backends().next().ok_or("LVM backend")?;
         let fs_backend = fs.registry.backends().next().ok_or("FS backend")?;
-        let native = NativeStorageAdapter::new(lvm_backend, fs_backend)?;
+        let native = NativeStorageAdapter::new(lvm_backend, fs_backend, fs_backend)?;
         let before = lvm_backend.probe_lvm()?;
         let (state, _) = fixture()?;
         let baseline =
@@ -1131,5 +1131,213 @@ fn native_ext4_descriptor_failure_preserves_checkpoint_and_forbids_retry()
         storage_runtime::incident::IncidentAssessment::Indeterminate
     );
     assert_eq!(incident.attempt.backend_id, attempt.backend_id);
+    Ok(())
+}
+
+/// Independent mount exclusion evidence applies only to this private-memory fixture.
+struct MountPolicy(bool);
+impl storage_runtime::capability::BackendCapabilityCheck for MountPolicy {
+    /// Reuses the fixture's supported typed backend route.
+    fn availability(
+        &self,
+        action: &storage_provider::ProviderAction,
+        observed: &storage_engine::LiveObservation,
+    ) -> storage_runtime::capability::OperationAvailability {
+        FilesystemPolicy.availability(action, observed)
+    }
+    /// There are no devices or outside writers in this fixture.
+    fn check_scope(
+        &self,
+        _: &storage_engine::ExecutionContext<'_>,
+        _: &storage_runtime::targets::ResolvedAction,
+        _: &storage_engine::LiveObservation,
+    ) -> storage_engine::LiveCheckStatus {
+        storage_engine::LiveCheckStatus::Satisfied
+    }
+    /// Every synthetic consumer is owned by this fixture.
+    fn check_consumer_exclusion(
+        &self,
+        _: &storage_engine::ExecutionContext<'_>,
+        _: &storage_runtime::targets::ResolvedAction,
+        _: &storage_engine::LiveObservation,
+    ) -> storage_engine::LiveCheckStatus {
+        storage_engine::LiveCheckStatus::Satisfied
+    }
+    /// Missing namespace evidence must remain blocking even with a verified filesystem binding.
+    fn check_mount_exclusion(
+        &self,
+        _: &storage_engine::ExecutionContext<'_>,
+        _: &storage_runtime::targets::ResolvedAction,
+        _: &storage_engine::LiveObservation,
+    ) -> storage_engine::LiveCheckStatus {
+        if self.0 {
+            storage_engine::LiveCheckStatus::Satisfied
+        } else {
+            storage_engine::LiveCheckStatus::Unknown {
+                required_evidence: "fixture mount namespace exclusion missing".into(),
+            }
+        }
+    }
+    /// The entire synthetic topology is reobserved for final verification.
+    fn check_final_scope(
+        &self,
+        _: &storage_engine::ExecutionContext<'_>,
+        _: &storage_engine::LiveObservation,
+    ) -> storage_engine::LiveCheckStatus {
+        storage_engine::LiveCheckStatus::Satisfied
+    }
+}
+
+/// Publishes synthetic mount facts only after the same arm boundary as a real adapter.
+struct MountDispatcher {
+    /// Existing independently verified LVM/ext4 fixture.
+    filesystem: FilesystemDispatcher,
+    /// Zero succeeds; one reports wrong options; two reports an overmount at the same target.
+    fault: u8,
+}
+impl storage_runtime::dispatcher::BackendDispatcher for MountDispatcher {
+    /// All fixture actions use the same trusted synthetic registration.
+    fn backend_id(&self) -> &BackendId {
+        self.filesystem.backend_id()
+    }
+    /// Only this last step changes synthetic mount records; other operations reuse their existing checks.
+    fn execute(
+        &mut self,
+        action: &storage_runtime::targets::ResolvedAction,
+        progress: &mut dyn FnMut(String) -> Result<(), storage_engine::ExecutionRunError>,
+    ) -> Result<
+        storage_runtime::dispatcher::ExecutionReceipt,
+        storage_runtime::dispatcher::DispatchError,
+    > {
+        use storage_runtime::dispatcher::{DispatchError, ExecutionReceipt};
+        let storage_provider::ProviderAction::Mount(storage_provider::MountAction::Mount {
+            target,
+            options,
+            context,
+            ..
+        }) = action.operation()
+        else {
+            return self.filesystem.execute(action, progress);
+        };
+        let marker = storage_runtime::checkpoint::ActiveAttempt::from_bytes(
+            &std::fs::read(self.filesystem.lvm.root.join("active-attempt.json"))
+                .map_err(|error| DispatchError::Adapter(error.to_string()))?,
+        )
+        .map_err(|error| DispatchError::Adapter(error.to_string()))?;
+        assert_eq!(marker.action, *action.operation());
+        assert_eq!(marker.targets, action.fingerprints());
+        assert_eq!(marker.targets.len(), 3);
+        let fs = action
+            .filesystem_target()
+            .ok_or_else(|| DispatchError::Adapter("resolved filesystem missing".into()))?;
+        let mut mount = storage_core::model::ObservedMount {
+            source: storage_core::model::MountSource::Filesystem(fs.observed_id),
+            target: target.clone(),
+            options: options.clone(),
+            context: context.clone(),
+        };
+        if self.fault == 1 {
+            mount.options.push("ro".into());
+        }
+        let mut state = self.filesystem.lvm.state.borrow_mut();
+        state.current.mounts.entries.push(mount.clone());
+        if self.fault == 2 {
+            state.current.mounts.entries.push(mount);
+        }
+        self.filesystem
+            .lvm
+            .calls
+            .set(self.filesystem.lvm.calls.get() + 1);
+        Ok(ExecutionReceipt {
+            outcome: storage_engine::BackendOutcome::Succeeded,
+            created_lv_uuid: None,
+            created_filesystem_uuid: None,
+        })
+    }
+}
+
+/// Fresh mount completion must have exact options and one target; missing exclusion stops before arm.
+#[test]
+fn mount_vertical_verifies_exact_result_and_blocks_uncertain_namespace()
+-> Result<(), Box<dyn Error>> {
+    use storage_core::model::{MountContext, MountEntry, MountSource};
+    use storage_runtime::{coordinator::CoordinatorError, host::LinuxLiveHost};
+    for (fault, coverage) in [(0, true), (1, true), (2, true), (0, false)] {
+        let (state, _, _) = filesystem_plan()?;
+        let baseline =
+            HistoricalBaseline::from_lvm_observations(state.current.clone(), &state.lvm_vgs)?;
+        let mut session = PlanSession::new(baseline)?;
+        let backing = session
+            .add_lv(
+                session.revision(),
+                state.lvm_vgs[0].node,
+                "data",
+                Bytes::new(16 * 1024 * 1024),
+            )?
+            .created_node
+            .ok_or("LV")?;
+        let filesystem = session
+            .add_filesystem(session.revision(), backing, FilesystemKind::Ext4)?
+            .created_node
+            .ok_or("FS")?;
+        session.mount(
+            session.revision(),
+            MountEntry {
+                source: MountSource::Filesystem(filesystem),
+                target: "/data".into(),
+                options: storage_provider::EXT4_HOST_MOUNT_OPTIONS
+                    .iter()
+                    .map(|option| (*option).into())
+                    .collect(),
+                context: MountContext::Host,
+            },
+        )?;
+        let mut run = ExecutionRun::new(session.freeze(session.revision())?.document())?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = admission::Scratch::new()?;
+        let mut lvm = coordination::dispatcher(&scratch, state.clone());
+        lvm.created_uuid = Some("created-lv".into());
+        let calls = lvm.calls.clone();
+        let dispatcher = MountDispatcher {
+            filesystem: FilesystemDispatcher {
+                lvm,
+                uuid: uuid::Uuid::now_v7().to_string(),
+                fault: FilesystemFault::None,
+                filesystem_backend: None,
+            },
+            fault,
+        };
+        let host = LinuxLiveHost::new(
+            probe(state),
+            MountPolicy(coverage),
+            FilesystemApproval {
+                inner: admission::authorization(&run)?,
+                backing,
+                confirmation: storage_engine::LiveCheckStatus::Satisfied,
+            },
+        );
+        let mut coordinator =
+            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+        let result = coordinator.execute_run(&mut run);
+        if !coverage {
+            assert!(!result?.verified);
+            assert_eq!(calls.get(), 3);
+            assert_eq!(run.state(ActionId::new(3))?, ActionRunState::Checking);
+            assert!(!scratch.0.join("active-attempt.json").exists());
+        } else if fault == 0 {
+            assert!(result?.verified);
+            assert_eq!(calls.get(), 4);
+            assert!(!scratch.0.join("active-attempt.json").exists());
+        } else {
+            assert!(result.is_err());
+            assert_eq!(run.state(ActionId::new(3))?, ActionRunState::OutcomeUnknown);
+            assert!(scratch.0.join("active-attempt.json").exists());
+            assert!(matches!(
+                coordinator.execute_run(&mut run),
+                Err(CoordinatorError::Stopped)
+            ));
+            assert_eq!(calls.get(), 4);
+        }
+    }
     Ok(())
 }

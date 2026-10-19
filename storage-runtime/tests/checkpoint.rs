@@ -252,3 +252,56 @@ fn ext4_checkpoint_requires_lv_identity_and_bounded_label() -> Result<(), Box<dy
     assert!(ActiveAttempt::from_bytes(&serde_json::to_vec(&changed)?).is_err());
     Ok(())
 }
+
+/// Mount checkpoints round-trip only the narrow Host profile with a canonical ext4 UUID fingerprint.
+#[test]
+fn mount_checkpoint_requires_exact_profile_and_filesystem_identity() -> Result<(), Box<dyn Error>> {
+    use storage_core::model::{MountContext, MountSource, NodeId};
+    use storage_provider::MountAction;
+    let mut checkpoint = attempt(&admitted_run()?)?;
+    let filesystem = NodeId::new();
+    checkpoint.action = ProviderAction::Mount(MountAction::Mount {
+        source: MountSource::Filesystem(filesystem),
+        target: "/mnt/c4".into(),
+        options: storage_provider::EXT4_HOST_MOUNT_OPTIONS
+            .iter()
+            .map(|value| (*value).into())
+            .collect(),
+        context: MountContext::Host,
+    });
+    checkpoint.targets.push(TargetFingerprint {
+        planned_id: filesystem,
+        external_ids: vec![ExternalId::Filesystem {
+            fs_type: "ext4".into(),
+            value: Uuid::now_v7().to_string(),
+        }],
+    });
+    assert_eq!(
+        ActiveAttempt::from_bytes(&checkpoint.to_bytes()?)?,
+        checkpoint
+    );
+    for case in 0..4 {
+        let mut bad = checkpoint.clone();
+        match case {
+            0 => {
+                bad.targets.pop();
+            }
+            1 => {
+                bad.targets[1].external_ids = vec![ExternalId::LvmLvUuid("wrong-kind".into())];
+            }
+            2 => {
+                bad.targets[1].external_ids = vec![ExternalId::Filesystem {
+                    fs_type: "ext4".into(),
+                    value: Uuid::nil().to_string(),
+                }];
+            }
+            _ => {
+                if let ProviderAction::Mount(MountAction::Mount { options, .. }) = &mut bad.action {
+                    options.push("bind".into());
+                }
+            }
+        }
+        assert!(bad.to_bytes().is_err(), "case {case}");
+    }
+    Ok(())
+}

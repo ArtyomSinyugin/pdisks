@@ -86,6 +86,8 @@ pub struct OutputBindings {
     entries: HashMap<NodeId, PendingLvBinding>,
     /// Ext4 outputs whose UUID, owner, scope and postconditions were independently verified.
     filesystems: HashMap<NodeId, PendingFilesystemBinding>,
+    /// Exact requested mounts whose actual completion passed full verification.
+    mounts: Vec<storage_core::model::ObservedMount>,
 }
 
 impl OutputBindings {
@@ -95,8 +97,37 @@ impl OutputBindings {
             run_id: run.run_id(),
             entries: HashMap::new(),
             filesystems: HashMap::new(),
+            mounts: Vec::new(),
         }
     }
+    /// Records only a Verified mount whose retained completion has already passed verify_mount.
+    pub(crate) fn record_verified_mount(
+        &mut self,
+        run: &ExecutionRun,
+        action: ActionId,
+    ) -> Result<(), BindingError> {
+        if run.run_id() != self.run_id || run.state(action)? != ActionRunState::Verified {
+            return Err(BindingError::NotVerified);
+        }
+        let operation = &run.context().plan.actions()[action.get() as usize].operation;
+        let ProviderAction::Mount(storage_provider::MountAction::Mount {
+            source,
+            target,
+            options,
+            context,
+        }) = operation
+        else {
+            return Err(BindingError::Identity);
+        };
+        self.mounts.push(storage_core::model::ObservedMount {
+            source: source.clone(),
+            target: target.clone(),
+            options: options.clone(),
+            context: context.clone(),
+        });
+        Ok(())
+    }
+
     /// Reports the number of independently verified LV and filesystem outputs.
     pub fn len(&self) -> usize {
         self.entries.len() + self.filesystems.len()
@@ -252,6 +283,7 @@ impl OutputBindings {
                 kind: DependencyKind::Backs,
             });
         }
+        expected.mounts.entries.extend(self.mounts.iter().cloned());
         Ok(expected)
     }
 
@@ -621,4 +653,68 @@ pub(crate) fn verify_created_filesystem(
         },
         pending,
     ))
+}
+
+/// Verifies exact mount identity/options and all remaining scope from the actual fresh completion.
+pub(crate) fn verify_mount(
+    run: &ExecutionRun,
+    action: ActionId,
+    resolved: &ResolvedAction,
+    bindings: &OutputBindings,
+    before: &LiveObservation,
+) -> Result<VerificationReport, BindingError> {
+    let completion = run.completion(action)?.ok_or(BindingError::NotVerified)?;
+    let actual = &completion.observation;
+    let ProviderAction::Mount(storage_provider::MountAction::Mount {
+        source: storage_core::model::MountSource::Filesystem(fs),
+        target,
+        options,
+        context,
+    }) = resolved.operation()
+    else {
+        return Err(BindingError::Identity);
+    };
+    let fs_id = bindings.resolve(run, *fs, actual)?;
+    let matches: Vec<_> = actual
+        .snapshot
+        .mounts
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, mount)| &mount.target == target && &mount.context == context)
+        .collect();
+    let [(index, mount)] = matches.as_slice() else {
+        return Err(BindingError::Identity);
+    };
+    let mut actual_options = mount.options.clone();
+    let mut expected_options = options.clone();
+    actual_options.sort();
+    expected_options.sort();
+    if mount.source != storage_core::model::MountSource::Filesystem(fs_id)
+        || actual_options != expected_options
+    {
+        return Err(BindingError::Identity);
+    }
+    let mut remaining = actual.snapshot.clone();
+    remaining.mounts.entries.remove(*index);
+    check_scope(
+        &bindings.reviewed_scope(run, before)?,
+        &remaining,
+        resolved.target().planned_id,
+    )?;
+    let context = run.context();
+    let report = check_observed_postconditions_with_bindings(
+        context.historical_baseline,
+        actual,
+        &context.plan.actions()[action.get() as usize]
+            .informational_contract
+            .postconditions,
+        &bindings.correlations(run, actual)?,
+    )?;
+    Ok(VerificationReport {
+        run_id: run.run_id(),
+        action,
+        observation: report.observation,
+        checks: report.checks,
+    })
 }

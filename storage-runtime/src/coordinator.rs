@@ -3,7 +3,7 @@
 use crate::{
     bindings::{
         BindingError, OutputBindings, verify_activation, verify_created_filesystem,
-        verify_created_lv,
+        verify_created_lv, verify_mount,
     },
     checkpoint::{ActiveAttempt, CheckpointError, CheckpointStore},
     dispatcher::{BackendDispatcher, DispatchError, ExecutionReceipt},
@@ -302,6 +302,15 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
                     pending_filesystem = candidate;
                     (report, None)
                 })
+            } else if resolved.filesystem_target().is_some() {
+                verify_mount(
+                    run,
+                    action,
+                    &resolved,
+                    &self.bindings,
+                    observed.observation(),
+                )
+                .map(|report| (report, None))
             } else if resolved.lv_target().is_some() {
                 verify_activation(
                     run,
@@ -339,6 +348,9 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             }
             if let Some(binding) = pending_filesystem {
                 self.bindings.record_verified_filesystem(run, binding)?;
+            }
+            if resolved.filesystem_target().is_some() {
+                self.bindings.record_verified_mount(run, action)?;
             }
             store.clear(run.run_id(), action)?;
             self.halted = false;

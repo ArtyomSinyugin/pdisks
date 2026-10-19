@@ -19,6 +19,9 @@ pub enum EndpointError {
     /// Path, device identity, geometry, size or device-mapper UUID differs from admission.
     #[error("block descriptor does not match the admitted LV endpoint")]
     Changed,
+    /// Mount target must be an empty existing directory pinned without symlink traversal.
+    #[error("mount target is not an empty pinned directory")]
+    MountTarget,
     /// A descriptor, ioctl or sysfs observation could not be obtained.
     #[error(transparent)]
     Io(#[from] std::io::Error),

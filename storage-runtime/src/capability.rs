@@ -53,6 +53,20 @@ pub trait BackendCapabilityCheck {
         }
     }
 
+    /// Excludes outside source writers and mount-target/tree/namespace mutations through verification.
+    /// A directory being empty at admission alone cannot establish that exclusion.
+    fn check_mount_exclusion(
+        &self,
+        _context: &ExecutionContext<'_>,
+        _action: &ResolvedAction,
+        _observed: &LiveObservation,
+    ) -> LiveCheckStatus {
+        LiveCheckStatus::Unknown {
+            required_evidence: "independent Host mount source, target and namespace exclusion"
+                .into(),
+        }
+    }
+
     /// Establishes complete final observation/namespace coverage and exclusion of external writers.
     /// Operation admission coverage cannot silently stand in for this final publication's evidence.
     fn check_final_scope(
