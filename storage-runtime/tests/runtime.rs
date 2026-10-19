@@ -2356,10 +2356,10 @@ mod run_coordinator {
             &mut self,
             run: &ExecutionRun,
             observed: &ProbedObservation,
-            backend: &BackendId,
+            dispatcher: &dyn storage_runtime::dispatcher::BackendDispatcher,
             lock: &HostExecutionLock,
         ) -> Result<storage_engine::LiveCheckStatus, HostError> {
-            self.inner.check_plan(run, observed, backend, lock)
+            self.inner.check_plan(run, observed, dispatcher, lock)
         }
         /// Every entry must see the run lock already held, not merely the preceding action's lease.
         fn probe(&mut self) -> Result<ProbedObservation, HostError> {

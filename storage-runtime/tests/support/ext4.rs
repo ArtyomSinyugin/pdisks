@@ -283,11 +283,23 @@ struct FilesystemDispatcher {
     uuid: String,
     /// Explicit result corruption used to verify checkpoint retention and stopped execution.
     fault: FilesystemFault,
+    /// Optional explicit FS route; existing single-backend fixtures retain their original identity.
+    filesystem_backend: Option<BackendId>,
 }
 impl storage_runtime::dispatcher::BackendDispatcher for FilesystemDispatcher {
     /// One composite test backend is fixed throughout the plan; no dispatch-time fallback exists.
     fn backend_id(&self) -> &BackendId {
         &self.lvm.backend
+    }
+    /// Fixtures can route filesystem actions to a second independently registered backend.
+    fn backend_for(&self, operation: &storage_provider::ProviderAction) -> &BackendId {
+        if matches!(operation, storage_provider::ProviderAction::Filesystem(_)) {
+            self.filesystem_backend
+                .as_ref()
+                .unwrap_or(&self.lvm.backend)
+        } else {
+            &self.lvm.backend
+        }
     }
     /// Changes private recorded state only after checking the durable checkpoint and held OS lock.
     fn execute(
@@ -321,6 +333,11 @@ impl storage_runtime::dispatcher::BackendDispatcher for FilesystemDispatcher {
             .map_err(|e| DispatchError::Adapter(e.to_string()))?;
         assert_eq!(attempt.action, *action.operation());
         assert_eq!(attempt.targets, action.fingerprints());
+        assert_eq!(&attempt.backend_id, action.backend());
+        assert_eq!(
+            action.backend(),
+            storage_runtime::dispatcher::BackendDispatcher::backend_for(self, action.operation())
+        );
         assert!(
             ExecutionRoot::open(&self.lvm.root)
                 .unwrap_or_else(|e| panic!("root: {e}"))
@@ -479,6 +496,7 @@ fn lv_activation_ext4_run_verifies_and_retains_owned_filesystem() -> Result<(), 
         lvm,
         uuid: uuid::Uuid::now_v7().to_string(),
         fault: FilesystemFault::None,
+        filesystem_backend: None,
     };
     let mut coordinator =
         ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
@@ -570,6 +588,7 @@ fn ext4_failures_keep_checkpoint_and_never_publish_a_binding_or_retry() -> Resul
             lvm,
             uuid: uuid::Uuid::now_v7().to_string(),
             fault,
+            filesystem_backend: None,
         };
         let mut coordinator =
             ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
@@ -672,6 +691,7 @@ fn ext4_destructive_veto_stops_before_dispatch() -> Result<(), Box<dyn Error>> {
         lvm,
         uuid: uuid::Uuid::now_v7().to_string(),
         fault: FilesystemFault::None,
+        filesystem_backend: None,
     };
     let mut coordinator =
         ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
@@ -747,5 +767,175 @@ fn native_ext4_adapter_requires_explicit_recipe_and_independent_scope() -> Resul
     ));
     let fixture = mock_ext4::Fixture::new(0, false)?;
     assert!(NativeExt4Adapter::new(fixture.registry.backends().next().ok_or("backend")?).is_err());
+    Ok(())
+}
+
+/// Explicit per-operation routing with complete coverage of this test's recorded state only.
+struct RoutedPolicy {
+    /// Filesystem registration selected by operation capability checks.
+    filesystem_backend: BackendId,
+}
+impl storage_runtime::capability::BackendCapabilityCheck for RoutedPolicy {
+    /// Selects independent LVM/FS registrations; no backend inference comes from a saved plan.
+    fn availability(
+        &self,
+        operation: &storage_provider::ProviderAction,
+        _: &storage_engine::LiveObservation,
+    ) -> storage_runtime::capability::OperationAvailability {
+        storage_runtime::capability::OperationAvailability::Available(
+            if matches!(operation, storage_provider::ProviderAction::Filesystem(_)) {
+                self.filesystem_backend.clone()
+            } else {
+                backend()
+            },
+        )
+    }
+    /// All storage objects are owned by the private recorded fixture.
+    fn check_scope(
+        &self,
+        _: &storage_engine::ExecutionContext<'_>,
+        _: &storage_runtime::targets::ResolvedAction,
+        _: &storage_engine::LiveObservation,
+    ) -> storage_engine::LiveCheckStatus {
+        storage_engine::LiveCheckStatus::Satisfied
+    }
+    /// Synthetic state cannot have unreported kernel consumers or external writers.
+    fn check_consumer_exclusion(
+        &self,
+        _: &storage_engine::ExecutionContext<'_>,
+        _: &storage_runtime::targets::ResolvedAction,
+        _: &storage_engine::LiveObservation,
+    ) -> storage_engine::LiveCheckStatus {
+        storage_engine::LiveCheckStatus::Satisfied
+    }
+    /// Explicit final coverage is independent from successful action completion.
+    fn check_final_scope(
+        &self,
+        _: &storage_engine::ExecutionContext<'_>,
+        _: &storage_engine::LiveObservation,
+    ) -> storage_engine::LiveCheckStatus {
+        storage_engine::LiveCheckStatus::Satisfied
+    }
+}
+
+/// Test principal that binds ordinary and destructive approval to separate concrete operation routes.
+struct RoutedApproval {
+    /// Sole authorized attempt.
+    run_id: uuid::Uuid,
+    /// Reviewed plan identity.
+    plan_id: uuid::Uuid,
+    /// Exact canonical document digest.
+    digest: String,
+    /// Planned LV approved for ext4 replacement.
+    backing: NodeId,
+    /// Exact FS backend accepted for the filesystem action.
+    filesystem_backend: BackendId,
+}
+impl RoutedApproval {
+    /// Constructs explicit test approval for the known three-action prefix, never imported JSON authority.
+    fn new(
+        run: &ExecutionRun,
+        backing: NodeId,
+        filesystem_backend: BackendId,
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            run_id: run.run_id(),
+            plan_id: run.document().plan_id,
+            digest: storage_runtime::checkpoint::plan_digest(run.document())?,
+            backing,
+            filesystem_backend,
+        })
+    }
+}
+impl storage_runtime::authorization::AuthorizationContext for RoutedApproval {
+    /// A backend mismatch cannot be hidden behind an otherwise matching plan and principal.
+    fn check(
+        &mut self,
+        request: &storage_runtime::authorization::ApprovalRequest,
+    ) -> storage_engine::LiveCheckStatus {
+        let expected = if request.action_id == ActionId::new(2) {
+            self.filesystem_backend.clone()
+        } else {
+            backend()
+        };
+        if request.run_id == self.run_id
+            && request.plan_id == self.plan_id
+            && request.plan_digest == self.digest
+            && request.backend == expected
+        {
+            storage_engine::LiveCheckStatus::Satisfied
+        } else {
+            storage_engine::LiveCheckStatus::Violated {
+                reason: "wrong plan, principal or concrete operation backend".into(),
+            }
+        }
+    }
+    /// The additional destructive decision still requires the independently fingerprinted verified LV.
+    fn check_destructive(
+        &mut self,
+        request: &storage_runtime::authorization::ApprovalRequest,
+        target: NodeId,
+    ) -> storage_engine::LiveCheckStatus {
+        if target == self.backing
+            && request.action_id == ActionId::new(2)
+            && request.targets.iter().any(|item| {
+                item.planned_id == target
+                    && matches!(item.external_ids.as_slice(), [ExternalId::LvmLvUuid(_)])
+            })
+        {
+            self.check(request)
+        } else {
+            storage_engine::LiveCheckStatus::Violated {
+                reason: "wrong destructive endpoint".into(),
+            }
+        }
+    }
+}
+
+/// Every selected backend is checked before the first arm and again at admission and dispatch.
+#[test]
+fn routed_filesystem_backend_is_fixed_before_any_plan_write() -> Result<(), Box<dyn Error>> {
+    use storage_runtime::{coordinator::CoordinatorError, host::LinuxLiveHost};
+    for mismatch in [false, true] {
+        let (state, frozen, backing) = filesystem_plan()?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = admission::Scratch::new()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let mut lvm = coordination::dispatcher(&scratch, state.clone());
+        lvm.created_uuid = Some("created-lv".into());
+        let calls = lvm.calls.clone();
+        let fs_backend = BackendId::new("recorded-fs").ok_or("FS backend")?;
+        let available = if mismatch {
+            BackendId::new("another-fs").ok_or("FS backend")?
+        } else {
+            fs_backend.clone()
+        };
+        let host = LinuxLiveHost::new(
+            probe(state),
+            RoutedPolicy {
+                filesystem_backend: available,
+            },
+            RoutedApproval::new(&run, backing, fs_backend.clone())?,
+        );
+        let dispatcher = FilesystemDispatcher {
+            lvm,
+            uuid: uuid::Uuid::now_v7().to_string(),
+            fault: FilesystemFault::None,
+            filesystem_backend: Some(fs_backend),
+        };
+        let mut coordinator =
+            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+        let result = coordinator.execute_run(&mut run);
+        if mismatch {
+            assert!(matches!(result, Err(CoordinatorError::PlanUnavailable(_))));
+            assert_eq!(calls.get(), 0);
+            assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Waiting);
+        } else {
+            assert!(result?.verified);
+            assert_eq!(calls.get(), 3);
+            assert_eq!(coordinator.bindings().len(), 2);
+        }
+        assert!(!scratch.0.join("active-attempt.json").exists());
+    }
     Ok(())
 }

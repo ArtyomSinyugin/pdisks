@@ -30,8 +30,13 @@ pub struct ExecutionReceipt {
 /// Trusted typed backend called only after admission and durable checkpoint publication.
 /// Returns completed outcomes, not asynchronous launch acknowledgments; errors become unknown.
 pub trait BackendDispatcher {
-    /// Concrete adapter identity, checked against the admitted endpoint and checkpoint.
+    /// Primary adapter identity for single-backend callers; routed dispatch uses backend_for.
     fn backend_id(&self) -> &BackendId;
+    /// Selects a fixed concrete backend for this typed operation before admission or invocation.
+    /// The default preserves single-backend dispatch; a composite must never choose a fallback after admission.
+    fn backend_for(&self, _operation: &storage_provider::ProviderAction) -> &BackendId {
+        self.backend_id()
+    }
     /// Executes the immutable resolved action while the coordinator retains its OS lease.
     fn execute(
         &mut self,

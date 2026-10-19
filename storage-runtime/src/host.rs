@@ -70,7 +70,7 @@ pub trait RuntimeHost {
         &mut self,
         _run: &ExecutionRun,
         _observed: &ProbedObservation,
-        _backend: &storage_provider::BackendId,
+        _dispatcher: &dyn crate::dispatcher::BackendDispatcher,
         _lock: &HostExecutionLock,
     ) -> Result<LiveCheckStatus, HostError> {
         Ok(LiveCheckStatus::Unknown {
@@ -138,7 +138,7 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
         &mut self,
         run: &ExecutionRun,
         observed: &ProbedObservation,
-        backend: &storage_provider::BackendId,
+        dispatcher: &dyn crate::dispatcher::BackendDispatcher,
         lock: &HostExecutionLock,
     ) -> Result<LiveCheckStatus, HostError> {
         check_reviewed_plan(run)?;
@@ -159,11 +159,13 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                 .capability
                 .availability(&action.operation, observed.observation())
             {
-                OperationAvailability::Available(selected) if &selected == backend => {}
+                OperationAvailability::Available(selected)
+                    if &selected == dispatcher.backend_for(&action.operation) => {}
                 OperationAvailability::Available(_) => {
                     return Ok(LiveCheckStatus::Violated {
-                        reason: "plan requires a different backend than the configured dispatcher"
-                            .into(),
+                        reason:
+                            "plan requires a different backend than the configured operation route"
+                                .into(),
                     });
                 }
                 OperationAvailability::Unavailable(reason) => {

@@ -127,7 +127,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         let initial = self.host.probe()?;
         let readiness = self
             .host
-            .check_plan(run, &initial, self.dispatcher.backend_id(), &lock)?;
+            .check_plan(run, &initial, &self.dispatcher, &lock)?;
         if readiness != storage_engine::LiveCheckStatus::Satisfied {
             return Err(CoordinatorError::PlanUnavailable(readiness));
         }
@@ -224,7 +224,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
                 || resolved.observation() != observed.observation().reference
                 || resolved.operation()
                     != &run.context().plan.actions()[action.get() as usize].operation
-                || resolved.backend() != self.dispatcher.backend_id())
+                || resolved.backend() != self.dispatcher.backend_for(resolved.operation()))
         {
             return Err(CoordinatorError::InvalidDecision);
         }
