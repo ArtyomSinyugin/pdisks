@@ -64,6 +64,14 @@ pub struct AdmissionDecision {
 pub trait RuntimeHost {
     /// Obtains a new provider pass without substituting predicted effects or saved JSON.
     fn probe(&mut self) -> Result<ProbedObservation, HostError>;
+    /// Reports native recipe support only; coverage and authorization still require live admission.
+    fn operation_availability(
+        &self,
+        _operation: &storage_provider::ProviderAction,
+        _observed: &ProbedObservation,
+    ) -> OperationAvailability {
+        OperationAvailability::Unknown("host operation availability is not configured".into())
+    }
     /// Checks support for every frozen operation before the run may write anything.
     /// This does not replace each action's later fresh target, prerequisite and approval checks.
     fn check_plan(
@@ -131,6 +139,16 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
         let observed = ProbedObservation::collect(&self.probe)?;
         self.last_probe = Some(observed.observation().reference);
         Ok(observed)
+    }
+
+    /// Uses the same trusted capability source as whole-plan and per-action checks.
+    fn operation_availability(
+        &self,
+        operation: &storage_provider::ProviderAction,
+        observed: &ProbedObservation,
+    ) -> OperationAvailability {
+        self.capability
+            .availability(operation, observed.observation())
     }
 
     /// Rejects unsupported later operations before even the first action is admitted.
@@ -460,6 +478,14 @@ impl<H: RuntimeHost + ?Sized> RuntimeHost for &mut H {
     /// The application keeps its configured host while a coordinator borrows it for one attempt.
     fn probe(&mut self) -> Result<ProbedObservation, HostError> {
         (**self).probe()
+    }
+    /// Borrowing must preserve advisory capability results as well as execution checks.
+    fn operation_availability(
+        &self,
+        operation: &storage_provider::ProviderAction,
+        observed: &ProbedObservation,
+    ) -> OperationAvailability {
+        (**self).operation_availability(operation, observed)
     }
     /// Preserves whole-plan native readiness on the original host.
     fn check_plan(

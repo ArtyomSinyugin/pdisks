@@ -1,0 +1,22 @@
+[package]
+name = "disksgraph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+storage-core.workspace = true
+storage-engine.workspace = true
+storage-probe.workspace = true
+storage-provider.workspace = true
+storage-runtime.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

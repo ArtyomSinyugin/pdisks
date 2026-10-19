@@ -59,6 +59,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "disksgraph"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "storage-core",
+ "storage-engine",
+ "storage-probe",
+ "storage-provider",
+ "storage-runtime",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -5,7 +5,8 @@ use storage_engine::{ExecutionContext, LiveCheckStatus, LiveObservation};
 use storage_provider::{BackendId, ProviderAction};
 
 /// Presence of a probe adapter alone never establishes native write support.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OperationAvailability {
     /// Trusted adapter has checked that it implements this exact operation on this host.
     Available(BackendId),
