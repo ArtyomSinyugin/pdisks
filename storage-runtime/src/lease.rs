@@ -4,7 +4,7 @@ use std::{io, path::Path};
 
 use rustix::{
     fd::OwnedFd,
-    fs::{CWD, FileType, FlockOperation, Mode, OFlags, flock, fstat, openat},
+    fs::{AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, flock, fstat, openat, statat},
     io::Errno,
     process::geteuid,
 };
@@ -85,19 +85,14 @@ impl ExecutionRoot {
             Mode::RUSR | Mode::WUSR,
         )
         .map_err(io::Error::from)?;
-        let info = fstat(&lock).map_err(io::Error::from)?;
-        if FileType::from_raw_mode(info.st_mode) != FileType::RegularFile
-            || info.st_uid != geteuid().as_raw()
-            || info.st_mode & 0o077 != 0
-            || info.st_nlink != 1
-        {
-            return Err(LeaseError::InvalidLockFile);
-        }
+        validate_lock(&self.directory, &lock)?;
         match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {}
             Err(Errno::WOULDBLOCK) => return Err(LeaseError::Busy),
             Err(error) => return Err(io::Error::from(error).into()),
         }
+        // Catch replacement or permission changes while acquisition was in progress.
+        validate_lock(&self.directory, &lock)?;
         let host_lock = HostExecutionLock {
             directory: self.directory.try_clone()?,
             _lock: lock,
@@ -108,6 +103,22 @@ impl ExecutionRoot {
         }
         Ok(host_lock)
     }
+}
+
+/// Ensures the held descriptor still names the private permanent lock in this root.
+fn validate_lock(directory: &OwnedFd, lock: &OwnedFd) -> Result<(), LeaseError> {
+    let info = fstat(lock).map_err(io::Error::from)?;
+    let named = statat(directory, LOCK_FILE, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
+    if FileType::from_raw_mode(info.st_mode) != FileType::RegularFile
+        || info.st_uid != geteuid().as_raw()
+        || info.st_mode & 0o077 != 0
+        || info.st_nlink != 1
+        || info.st_dev != named.st_dev
+        || info.st_ino != named.st_ino
+    {
+        return Err(LeaseError::InvalidLockFile);
+    }
+    Ok(())
 }
 
 /// The single OS lock used for both execution and incident inspection.
@@ -216,5 +227,50 @@ impl ExecutionLease {
     /// Describes logical resources covered by the stronger global cooperative exclusion.
     pub fn held_resources(&self) -> &[ResourceAccess] {
         &self.resources
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{DirBuilderExt, PermissionsExt},
+    };
+
+    /// Replacing a permanent name cannot make an old descriptor certify the new lock domain.
+    #[test]
+    fn lock_validation_rejects_replacement_and_permission_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path =
+            std::env::temp_dir().join(format!("disksgraph-lock-identity-{}", Uuid::now_v7()));
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        let root = ExecutionRoot::open(&path)?;
+        let guard = root.try_lock_host()?;
+        let lock = path.join(LOCK_FILE);
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644))?;
+        assert!(matches!(
+            validate_lock(&root.directory, &guard._lock),
+            Err(LeaseError::InvalidLockFile)
+        ));
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600))?;
+        validate_lock(&root.directory, &guard._lock)?;
+        fs::rename(&lock, path.join("old.lock"))?;
+        let replacement = root.try_lock_host()?;
+        assert!(matches!(
+            validate_lock(&root.directory, &guard._lock),
+            Err(LeaseError::InvalidLockFile)
+        ));
+        drop(replacement);
+        fs::remove_file(&lock)?;
+        std::os::unix::fs::symlink(path.join("old.lock"), &lock)?;
+        assert!(matches!(
+            validate_lock(&root.directory, &guard._lock),
+            Err(LeaseError::InvalidLockFile)
+        ));
+        drop(guard);
+        drop(root);
+        fs::remove_dir_all(path)?;
+        Ok(())
     }
 }
