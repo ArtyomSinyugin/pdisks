@@ -39,6 +39,7 @@ pub trait BackendCapabilityCheck {
     }
 
     /// Independently excludes every graph, kernel and namespace consumer of the resolved backing LV.
+    /// Must retain exclusion of mounts, external writes and DM table changes through dispatch and verification.
     /// Absence in the graph and general coverage do not establish endpoint exclusivity.
     fn check_consumer_exclusion(
         &self,

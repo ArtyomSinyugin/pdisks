@@ -31,3 +31,6 @@ pub mod filesystem;
 
 #[cfg(target_os = "linux")]
 pub mod endpoint;
+
+#[cfg(target_os = "linux")]
+pub mod native_ext4;

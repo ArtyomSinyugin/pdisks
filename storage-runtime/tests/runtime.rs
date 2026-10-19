@@ -3,6 +3,9 @@
 #[path = "../../storage-provider/tests/support/lvm.rs"]
 mod mock_lvm;
 
+#[path = "../../storage-provider/tests/support/ext4.rs"]
+mod mock_ext4;
+
 use std::{cell::RefCell, error::Error, rc::Rc};
 use storage_core::model::{Bytes, ExternalId, NodeId, NodeKind};
 use storage_engine::{

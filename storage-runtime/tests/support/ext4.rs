@@ -684,3 +684,68 @@ fn ext4_destructive_veto_stops_before_dispatch() -> Result<(), Box<dyn Error>> {
     assert_eq!(coordinator.bindings().len(), 1);
     Ok(())
 }
+
+/// Installed native symbol support cannot enable other FS recipes or replace host scope evidence.
+#[test]
+fn native_ext4_adapter_requires_explicit_recipe_and_independent_scope() -> Result<(), Box<dyn Error>>
+{
+    use storage_runtime::{
+        capability::{BackendCapabilityCheck, OperationAvailability},
+        dispatcher::BackendDispatcher,
+        native_ext4::NativeExt4Adapter,
+    };
+    let fixture = mock_ext4::Fixture::new(0, true)?;
+    let backend = fixture.registry.backends().next().ok_or("backend")?;
+    let adapter = NativeExt4Adapter::new(backend)?;
+    let (state, frozen, _) = filesystem_plan()?;
+    let run = ExecutionRun::new(frozen.document())?;
+    let observed = ProbedObservation::collect(&probe(Rc::new(RefCell::new(state))))?;
+    let operation = &run.context().plan.actions()[2].operation;
+    assert_eq!(
+        adapter.availability(operation, observed.observation()),
+        OperationAvailability::Available(adapter.backend_id().clone())
+    );
+    for kind in [FilesystemKind::Ext2, FilesystemKind::Xfs] {
+        let mut unsupported = operation.clone();
+        if let storage_provider::ProviderAction::Filesystem(
+            storage_provider::FilesystemAction::Create { filesystem, .. },
+        ) = &mut unsupported
+        {
+            *filesystem = kind;
+        }
+        assert!(matches!(
+            adapter.availability(&unsupported, observed.observation()),
+            OperationAvailability::Unavailable(_)
+        ));
+    }
+    for label in ["", "x".repeat(17).as_str(), "bad\0label"] {
+        let mut unsupported = operation.clone();
+        if let storage_provider::ProviderAction::Filesystem(
+            storage_provider::FilesystemAction::Create { label: actual, .. },
+        ) = &mut unsupported
+        {
+            *actual = Some(label.into());
+        }
+        assert!(matches!(
+            adapter.availability(&unsupported, observed.observation()),
+            OperationAvailability::Unavailable(_)
+        ));
+    }
+    let resolved = resolve_action(
+        &run,
+        ActionId::new(0),
+        observed.observation(),
+        adapter.backend_id().clone(),
+    )?;
+    assert!(matches!(
+        adapter.check_scope(&run.context(), &resolved, observed.observation()),
+        storage_engine::LiveCheckStatus::Unknown { .. }
+    ));
+    assert!(matches!(
+        adapter.check_consumer_exclusion(&run.context(), &resolved, observed.observation()),
+        storage_engine::LiveCheckStatus::Unknown { .. }
+    ));
+    let fixture = mock_ext4::Fixture::new(0, false)?;
+    assert!(NativeExt4Adapter::new(fixture.registry.backends().next().ok_or("backend")?).is_err());
+    Ok(())
+}
