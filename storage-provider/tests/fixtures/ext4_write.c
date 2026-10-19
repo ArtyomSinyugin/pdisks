@@ -5,6 +5,9 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <stdio.h>
 
 #ifndef SCENARIO
 #define SCENARIO 0
@@ -12,13 +15,19 @@
 
 /* Mock-only plugin state; no device or filesystem mutator is called by this library. */
 static atomic_int initialized = 0;
+static int info_live = 0, error_live = 0;
+struct Error { uint32_t domain; int code; char *message; };
+static void set_error(void **output) {
+    struct Error *error = calloc(1, sizeof(*error)); assert(error);
+    error->code = 17; error->message = strdup("sensitive native device path"); *output = error; ++error_live;
+}
 int bd_fs_init(void) {
     if (SCENARIO == 1 || atomic_exchange(&initialized, 1)) return 0;
     struct timespec pause = {0, 1000000};
     nanosleep(&pause, NULL);
     return 1;
 }
-void bd_fs_close(void) { assert(atomic_exchange(&initialized, 0) == 1); }
+void bd_fs_close(void) { assert(atomic_exchange(&initialized, 0) == 1); assert(!info_live && !error_live); }
 void g_free(void *pointer) { free(pointer); }
 
 struct Features {
@@ -26,7 +35,7 @@ struct Features {
     const char *partition_id, *partition_type;
     uint64_t min_size, max_size;
 };
-static const struct Features features = {0, 11, 0, 0, 0, NULL, NULL, 1048576, 0};
+static const struct Features features = {0, 11, 0, 0, 0, NULL, NULL, SCENARIO == 17 ? 33554432 : 1048576, SCENARIO == 18 ? 8388608 : 0};
 const struct Features *bd_fs_features(const char *type, void **error) {
     assert(!strcmp(type, "ext4")); (void)error; return &features;
 }
@@ -50,17 +59,59 @@ SIMPLE(bd_fs_can_get_size)
 SIMPLE(bd_fs_can_get_free_space)
 SIMPLE(bd_fs_can_get_min_size)
 
-/* Full write/readback symbols are present during readiness, but readiness must never call mkfs. */
+
+/* No host mkfs or device writes: creation changes only these private-memory records. */
+static int created = 0;
+static char output_uuid[40], output_label[17];
+struct MkfsOptions {
+    const char *label, *uuid;
+    int dry_run, no_discard, force, no_pt;
+    unsigned char reserve[32];
+};
+struct ExtInfo {
+    char *label, *uuid, *state;
+    uint64_t block_size, block_count, free_blocks;
+};
 int bd_fs_is_tech_avail(int tech, uint64_t modes, void **error) {
     assert(tech == 4 && modes == 33); (void)error; return SCENARIO != 2;
 }
 #if SCENARIO != 3
-int bd_fs_mkfs(const char *path, const char *type, void *options, const void **extra, void **error) {
-    (void)path; (void)type; (void)options; (void)extra; (void)error;
-    assert(!"readiness must not invoke mkfs"); return 0;
+int bd_fs_mkfs(const char *path, const char *type, struct MkfsOptions *options, const void **extra, void **error) {
+    assert(atomic_load(&initialized) == 1 && !created);
+    assert(!strcmp(type, "ext4") && extra == NULL && error && *error == NULL);
+    char prefix[64]; snprintf(prefix, sizeof(prefix), "/proc/%ld/fd/", (long)getpid());
+    assert(!strncmp(path, prefix, strlen(prefix)));
+    struct stat info; assert(!stat(path, &info) && info.st_size == 16 * 1024 * 1024);
+    assert(options && !options->dry_run && options->no_discard == 1 && !options->force && !options->no_pt);
+    for (unsigned i = 0; i < sizeof(options->reserve); ++i) assert(options->reserve[i] == 0);
+    assert(options->uuid && strlen(options->uuid) == 36);
+    strcpy(output_uuid, options->uuid);
+    if (options->label) { assert(strlen(options->label) <= 16); strcpy(output_label, options->label); }
+    assert(SCENARIO != 6 && SCENARIO != 7 && SCENARIO != 17 && SCENARIO != 18);
+    created = 1;
+    if (SCENARIO == 9) set_error(error);
+    return SCENARIO != 8;
 }
 #endif
-char *bd_fs_get_fstype(const char *path, void **error) { (void)path; (void)error; return NULL; }
-void *bd_fs_ext4_get_info(const char *path, void **error) { (void)path; (void)error; return NULL; }
-void bd_fs_ext4_info_free(void *info) { free(info); }
-void g_error_free(void *error) { free(error); }
+char *bd_fs_get_fstype(const char *path, void **error) {
+    (void)path;
+    if (!created && SCENARIO == 6) return strdup("xfs");
+    if (!created && SCENARIO == 7) { set_error(error); return NULL; }
+    if (created && SCENARIO == 16) set_error(error);
+    return created ? strdup(SCENARIO == 11 ? "xfs" : "ext4") : NULL;
+}
+struct ExtInfo *bd_fs_ext4_get_info(const char *path, void **error) {
+    (void)path; assert(created);
+    if (SCENARIO == 13) return NULL;
+    struct ExtInfo *info = calloc(1, sizeof(*info)); assert(info); ++info_live;
+    info->uuid = SCENARIO == 20 ? NULL : strdup(SCENARIO == 10 ? "00000000-0000-0000-0000-000000000001" : output_uuid);
+    info->label = strdup(SCENARIO == 12 ? "unexpected" : output_label); info->state = strdup("clean");
+    info->block_size = SCENARIO == 14 ? 512 : 4096;
+    info->block_count = SCENARIO == 19 ? UINT64_MAX : 4000;
+    if (SCENARIO == 15) set_error(error);
+    return info;
+}
+void bd_fs_ext4_info_free(struct ExtInfo *info) {
+    if (info) { assert(info_live-- == 1); free(info->uuid); free(info->label); free(info->state); free(info); }
+}
+void g_error_free(struct Error *error) { assert(error && error_live-- == 1); free(error->message); free(error); }

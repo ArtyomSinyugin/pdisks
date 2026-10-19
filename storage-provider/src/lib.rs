@@ -16,6 +16,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Lets disk-free unit ABI tests reuse the same fixture builder as integration tests.
+#[cfg(test)]
+extern crate self as storage_provider;
+
 mod action;
 mod contract;
 mod dylib;
@@ -427,6 +431,28 @@ impl RegisteredBackend {
         match &self.access {
             LoadedBackendAccess::Library { library } => library.probe_nvme(),
             LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
+        }
+    }
+
+    /// Creates ext4 once on an already admitted retained block descriptor, with no force or arbitrary extras.
+    /// Caller must hold the checkpoint and exclude external writers/DM changes for the whole invocation.
+    /// Descriptor addressing removes display-path replacement; it does not establish global exclusivity.
+    /// Native signature preflight and UUID/type/label/geometry readback never replace runtime verification.
+    pub fn create_ext4(
+        &self,
+        device: &std::fs::File,
+        request: &Ext4CreateRequest,
+    ) -> Result<String, FilesystemWriteError> {
+        if !self
+            .manifest
+            .capabilities
+            .contains(&BackendCapability::Execute)
+        {
+            return Err(FilesystemWriteError::ExecutionNotDeclared);
+        }
+        match &self.access {
+            LoadedBackendAccess::Library { library } => library.create_ext4(device, request),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
         }
     }
 

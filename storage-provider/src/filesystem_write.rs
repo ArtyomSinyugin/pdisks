@@ -58,6 +58,24 @@ impl Ext4CreateRequest {
         })
     }
 
+    /// Validates a real block descriptor's type and exact capacity without following its old pathname.
+    pub(crate) fn check_descriptor(
+        &self,
+        device: &std::fs::File,
+    ) -> Result<(), FilesystemWriteError> {
+        use std::{
+            io::{Seek, SeekFrom},
+            os::unix::fs::FileTypeExt,
+        };
+        let mut borrowed = device;
+        if !device.metadata()?.file_type().is_block_device()
+            || borrowed.seek(SeekFrom::End(0))? != self.size
+        {
+            return Err(FilesystemWriteError::TargetChanged);
+        }
+        Ok(())
+    }
+
     /// Rejects wrong type, UUID, label and impossible or overflowing ext4 geometry after invocation.
     pub fn check_result(
         &self,

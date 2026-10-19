@@ -206,6 +206,18 @@ impl LoadedLibrary {
         nvme::probe(&self.handle)
     }
 
+    /// Validates a retained block descriptor before the native recipe and checks its capacity again afterward.
+    pub(super) fn create_ext4(
+        &self,
+        device: &std::fs::File,
+        request: &crate::Ext4CreateRequest,
+    ) -> Result<String, crate::FilesystemWriteError> {
+        request.check_descriptor(device)?;
+        let uuid = filesystem_write::create(&self.handle, device, request)?;
+        request.check_descriptor(device)?;
+        Ok(uuid)
+    }
+
     /// Resolves and checks the complete ext4 create/readback recipe without invoking a mutator.
     pub(super) fn check_ext4_create_support(&self) -> Result<(), NativeProbeError> {
         filesystem_write::check_support(&self.handle)

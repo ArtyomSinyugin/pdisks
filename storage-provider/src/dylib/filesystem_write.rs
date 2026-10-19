@@ -4,9 +4,13 @@ use super::{
     filesystem::{FILESYSTEM_SESSION, FeaturesRaw},
     load_symbol,
 };
-use crate::NativeProbeError;
+use crate::{Ext4CreateRequest, FilesystemWriteError, NativeProbeError};
 use libloading::{Library, Symbol};
-use std::ffi::{c_char, c_int, c_void};
+use std::{
+    ffi::{CStr, CString, c_char, c_int, c_void},
+    fs::File,
+    os::fd::AsRawFd,
+};
 
 /// Ext4 technology and the MKFS/QUERY modes from the installed blockdev/fs.h ABI.
 const EXT4_TECH: c_int = 4;
@@ -105,13 +109,13 @@ struct Api<'library> {
     /// Capacity constraints supported by ext4.
     features: Symbol<'library, Features>,
     /// Mutator symbol required even during read-only readiness checks.
-    _mkfs: Symbol<'library, Mkfs>,
+    mkfs: Symbol<'library, Mkfs>,
     /// Signature query required before and after invocation.
-    _fs_type: Symbol<'library, FsType>,
+    fs_type: Symbol<'library, FsType>,
     /// Result metadata query required for independent native readback.
-    _info: Symbol<'library, Info>,
+    info: Symbol<'library, Info>,
     /// Matching result release.
-    _info_free: Symbol<'library, InfoFree>,
+    info_free: Symbol<'library, InfoFree>,
     /// GLib-owned strings.
     free: Symbol<'library, Free>,
     /// GLib-owned errors.
@@ -129,10 +133,10 @@ impl<'library> Api<'library> {
                 tech: load_symbol(library, b"bd_fs_is_tech_avail\0")?,
                 can_mkfs: load_symbol(library, b"bd_fs_can_mkfs\0")?,
                 features: load_symbol(library, b"bd_fs_features\0")?,
-                _mkfs: load_symbol(library, b"bd_fs_mkfs\0")?,
-                _fs_type: load_symbol(library, b"bd_fs_get_fstype\0")?,
-                _info: load_symbol(library, b"bd_fs_ext4_get_info\0")?,
-                _info_free: load_symbol(library, b"bd_fs_ext4_info_free\0")?,
+                mkfs: load_symbol(library, b"bd_fs_mkfs\0")?,
+                fs_type: load_symbol(library, b"bd_fs_get_fstype\0")?,
+                info: load_symbol(library, b"bd_fs_ext4_get_info\0")?,
+                info_free: load_symbol(library, b"bd_fs_ext4_info_free\0")?,
                 free: load_symbol(library, b"g_free\0")?,
                 error_free: load_symbol(library, b"g_error_free\0")?,
             })
@@ -220,6 +224,165 @@ pub(super) fn check_support(library: &Library) -> Result<(), NativeProbeError> {
     api.support().map(|_| ())
 }
 
+/// Invokes ext4 creation on the retained descriptor path; caller validates the actual block endpoint.
+/// Unit ABI tests supply regular files only to a private mock library that never writes their contents.
+pub(super) fn create(
+    library: &Library,
+    device: &File,
+    request: &Ext4CreateRequest,
+) -> Result<String, FilesystemWriteError> {
+    let _lock = FILESYSTEM_SESSION
+        .lock()
+        .map_err(|_| NativeProbeError::InvalidData {
+            operation: "filesystem session lock",
+        })?;
+    let api = Api::load(library)?;
+    // SAFETY: initialization has no arguments; successful init is balanced by the live session guard.
+    if unsafe { (api.init)() } == 0 {
+        return Err(NativeProbeError::CallFailed {
+            operation: "bd_fs_init",
+            code: 0,
+        }
+        .into());
+    }
+    let _session = Session(&api);
+    let (minimum, maximum) = api.support()?;
+    if minimum == 0
+        || request.size < minimum
+        || (maximum != 0 && (maximum < minimum || request.size > maximum))
+    {
+        return Err(FilesystemWriteError::InvalidRequest);
+    }
+    // A parent-PID path survives CLOEXEC in libblockdev's utility child; self/fd would not.
+    let path = CString::new(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        device.as_raw_fd()
+    ))
+    .map_err(|_| FilesystemWriteError::InvalidRequest)?;
+    if api.read_type(&path)?.is_some() {
+        return Err(FilesystemWriteError::ContentMismatch);
+    }
+    let uuid =
+        CString::new(request.uuid.as_str()).map_err(|_| FilesystemWriteError::InvalidRequest)?;
+    let label = request
+        .label
+        .as_deref()
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| FilesystemWriteError::InvalidRequest)?;
+    let mut options = MkfsOptionsRaw {
+        label: label
+            .as_ref()
+            .map_or(std::ptr::null(), |label| label.as_ptr()),
+        uuid: uuid.as_ptr(),
+        dry_run: 0,
+        no_discard: 1,
+        force: 0,
+        no_pt: 0,
+        reserve: [0; 32],
+    };
+    let mut error = std::ptr::null_mut();
+    // SAFETY: the retained File, C strings, options and error storage live through this synchronous call; no extra arguments are accepted.
+    let success = unsafe {
+        (api.mkfs)(
+            path.as_ptr(),
+            c"ext4".as_ptr(),
+            &mut options,
+            std::ptr::null(),
+            &mut error,
+        )
+    };
+    api.check_error("bd_fs_mkfs", error)?;
+    if success == 0 {
+        return Err(NativeProbeError::CallFailed {
+            operation: "bd_fs_mkfs",
+            code: 0,
+        }
+        .into());
+    }
+    let fs_type = api
+        .read_type(&path)?
+        .ok_or(FilesystemWriteError::ContentMismatch)?;
+    if fs_type != "ext4" {
+        return Err(FilesystemWriteError::ContentMismatch);
+    }
+    error = std::ptr::null_mut();
+    // SAFETY: this same descriptor path remains live; successful lookup transfers one ExtInfoRaw allocation.
+    let pointer = unsafe { (api.info)(path.as_ptr(), &mut error) };
+    let info = InfoGuard { pointer, api: &api };
+    api.check_error("bd_fs_ext4_get_info", error)?;
+    if info.pointer.is_null() {
+        return Err(NativeProbeError::InvalidData {
+            operation: "bd_fs_ext4_get_info",
+        }
+        .into());
+    }
+    // SAFETY: the owned result remains live under InfoGuard until all fields have been copied/checked.
+    let raw = unsafe { &*info.pointer };
+    if raw.uuid.is_null() || raw.label.is_null() {
+        return Err(FilesystemWriteError::ContentMismatch);
+    }
+    // SAFETY: non-null fields are documented NUL-terminated strings owned by the still-live info result.
+    let actual_uuid = unsafe { CStr::from_ptr(raw.uuid) }
+        .to_str()
+        .map_err(|_| FilesystemWriteError::ContentMismatch)?;
+    // SAFETY: label is a documented NUL-terminated string retained by InfoGuard.
+    let actual_label = unsafe { CStr::from_ptr(raw.label) }
+        .to_str()
+        .map_err(|_| FilesystemWriteError::ContentMismatch)?;
+    request.check_result(
+        &fs_type,
+        actual_uuid,
+        (!actual_label.is_empty()).then_some(actual_label),
+        raw.block_size,
+        raw.block_count,
+    )?;
+    Ok(actual_uuid.to_owned())
+}
+
+impl Api<'_> {
+    /// Reads a fresh signature; NULL without GError is absence, every native error fails closed.
+    fn read_type(&self, path: &CString) -> Result<Option<String>, NativeProbeError> {
+        let mut error = std::ptr::null_mut();
+        // SAFETY: path and output storage remain live; a non-null result is a transfer-full GLib string.
+        let pointer = unsafe { (self.fs_type)(path.as_ptr(), &mut error) };
+        let result = if pointer.is_null() {
+            Ok(None)
+        } else {
+            // SAFETY: non-null signature is a documented NUL-terminated string, copied before its matching free.
+            let result = unsafe { CStr::from_ptr(pointer) }
+                .to_str()
+                .map(|text| Some(text.to_owned()))
+                .map_err(|_| NativeProbeError::InvalidData {
+                    operation: "bd_fs_get_fstype",
+                });
+            // SAFETY: the native function transferred ownership of this GLib string.
+            unsafe { (self.free)(pointer.cast()) };
+            result
+        };
+        self.check_error("bd_fs_get_fstype", error)?;
+        result
+    }
+}
+
+/// Owns a nullable native ext4 result even when the API returned both a result and an error.
+struct InfoGuard<'api, 'library> {
+    /// Owned result from get_info, or NULL on failure.
+    pointer: *mut ExtInfoRaw,
+    /// Matching release function and retained library lifetime.
+    api: &'api Api<'library>,
+}
+impl Drop for InfoGuard<'_, '_> {
+    /// Releases the info object before closing its plugin session.
+    fn drop(&mut self) {
+        if !self.pointer.is_null() {
+            // SAFETY: non-null pointer came from get_info and has not been freed or transferred.
+            unsafe { (self.api.info_free)(self.pointer) };
+        }
+    }
+}
+
 /// Balances exactly one successful initialization while holding the shared filesystem session lock.
 struct Session<'api, 'library>(&'api Api<'library>);
 impl Drop for Session<'_, '_> {
@@ -229,3 +392,7 @@ impl Drop for Session<'_, '_> {
         unsafe { (self.0.close)() };
     }
 }
+
+#[cfg(test)]
+#[path = "filesystem_write_tests.rs"]
+mod tests;
