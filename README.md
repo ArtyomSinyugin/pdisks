@@ -180,6 +180,47 @@ cross-compiler imports 1.88.0/1.98.1. [Локальный bundle](packaging/READ
 приёмка C7 для текущего API завершена; далее — эксплуатационные gates C8.
 Disks preview остаётся отключённым.
 
+## Публичная сериализация diagnostics
+
+Произвольный текст в перечисленных ниже diagnostic-полях JSON заменяется целиком
+на `[diagnostic redacted]`. Это правило не ищет слова password/token: источник
+может вернуть секрет, private path или весь исходный запрос в любом формате.
+Машинные error codes, state/status variants, run/action IDs, cursor/sequence,
+`finished`/`verified`, наличие/отсутствие причины и результаты проверок сохраняются.
+
+Правило применяется общим Serde-контрактом к:
+
+- `DisksGraphError.message`, строковым protocol/CLI/transport error payloads;
+- `RunEventKind::Progress.detail` в live JSONL, retained events и job polling;
+- причинам `LiveCheckStatus`, `BackendOutcome`, `OperationAvailability`;
+- `ActionStatus.pre_dispatch_failure` и `unknown_reason`;
+- `event_output_error` CLI (exit code `1` по-прежнему имеет приоритет).
+
+JSON error может выглядеть так:
+
+```json
+{"protocol_version":1,"error":{"code":"invalid_request","detail":"[diagnostic redacted]"}}
+```
+
+В Rust исходные messages, status reasons, progress, `Display` и `Debug` остаются
+доступны trusted host. Сериализация не меняет retained engine evidence, admission,
+verification, сравнение checkpoint или stop latch. Не записывайте raw Rust context
+в доступные посторонним логи. JSON с redacted diagnostics — представление для
+клиента: десериализация events/status не восстановит исходный текст и не даёт
+права отправить эти reports обратно как авторизацию. Версии JSON/ABI и сигнатуры
+checked imports прежние; callers должны выбирать поведение по typed codes,
+а не разбирать message strings. Опции вернуть raw diagnostic text через JSON нет.
+
+**Граница этого прохода C8:** это не анонимизация storage data. Probe snapshots,
+provider `Diagnostic` внутри observations, имена/пути/идентификаторы устройств,
+preview/plan diagnostics и экспортируемые draft/plan documents не маскируются.
+Их содержимое по-прежнему требует ограничения доступа; сохранённые документы и
+канонический plan digest не переписываются ради отображения. Прямой stderr native
+libraries, panic hooks и собственные логи embedding host этим правилом не
+контролируются. Credential channel не добавлен, LUKS writes не включены.
+Полная политика экспорта чувствительных observations и production privilege/
+principal/quiescence остаются отдельными незавершёнными задачами C8.
+
 ## CLI C6 — сохранённые черновики и foreground apply
 
 `cargo build -p dg-cli --offline` собирает `target/debug/dg-cli`. Исполняемый файл

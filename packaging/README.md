@@ -82,10 +82,11 @@ trusted principal/scope/quiescence policy and fails closed by default.
 The executable never elevates privileges. Effective UID, directory ownership,
 a provider manifest and a saved plan are not execution authorization. Production
 privilege separation, service principals, ALT package ownership/lifecycle,
-redaction and power-loss acceptance remain unfinished. No service unit,
+full sensitive-data export policy and power-loss acceptance remain unfinished. No service unit,
 privileged helper, setuid bit or system install is supplied by this bundle.
-Treat raw observations, progress and backend diagnostics as potentially sensitive:
-redaction is not implemented, so restrict access to captured output and documents.
+Public opaque diagnostic text is now omitted as described below. Raw observations,
+storage identities, saved documents and trusted-host logs remain sensitive; restrict
+access to captured output and documents.
 
 CLI process codes are `0` for command success (apply requires final verification),
 `1` for host/configuration/application/output failure, `2` for usage or invalid
@@ -129,3 +130,36 @@ Live snapshot consumers may now receive repeated event cursors at durable arm
 and verified-before-clear boundaries; replace the whole snapshot. Neither an
 Admitted armed action nor a Verified action before clear establishes final run
 success. The events adapter still delivers each event once.
+
+## Diagnostic serialization boundary
+
+Opaque public error text and execution progress serialize as the fixed string
+`[diagnostic redacted]`. This applies to facade/protocol/CLI/transport errors,
+progress events (including JSONL and passive job polling), live-check/backend
+outcome/readiness reasons, action failure reasons and CLI event-output errors.
+The implementation suppresses complete messages rather than matching guessed
+secret patterns. Stable error codes, states, IDs, sequence/cursor values,
+verified/finished flags and optional-field presence are preserved. Code that
+parsed diagnostic wording must switch to structured categories.
+
+Raw Rust messages, Display/Debug and retained engine evidence are unchanged;
+trusted hosts must keep them private. JSON events/status are display data and
+cannot round-trip the original diagnostic text. No raw-JSON override is supplied.
+Protocol versions and checked ABI signatures remain unchanged. This shared Serde
+boundary is used by direct serialization, CLI, protocol and job/checked consumers.
+
+This is not a complete privacy guarantee: probe/provider diagnostics embedded in
+observations, preview/plan diagnostics, device paths/names/identities and exported
+drafts/plans remain data. Neither native-library stderr nor panic hooks nor the
+embedding host's own logs are intercepted. The saved-document/checkpoint contract
+and canonical plan digest are not changed. Full sensitive-observation export and
+production privilege/principal policies still require separate C8 acceptance.
+
+Focused checks from the source checkout:
+
+```sh
+cargo test -p disksgraph --test diagnostics --offline
+cargo test -p storage-engine diagnostic_serialization --offline
+cargo test -p dg-cli --test diagnostics --offline
+cargo test -p disksgraph-ffi --all-targets --offline
+```
