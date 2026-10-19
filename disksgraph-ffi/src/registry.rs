@@ -1,6 +1,10 @@
 //! Bounded process-local context ownership; no application objects cross the dynamic-library boundary.
 
-use disksgraph::wire::{Protocol, MAX_REQUEST_BYTES, PROTOCOL_VERSION};
+use crate::jobs::Job;
+use disksgraph::wire::{
+    encode_reply, parse_request, Protocol, ProtocolError, Request, MAX_REQUEST_BYTES,
+    PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -39,6 +43,10 @@ pub(crate) enum Error {
     ResourceLimit,
     /// Handle is closed, unknown or was never successfully opened.
     UnknownContext,
+    /// Job handle is absent from this context, including after explicit mailbox release.
+    UnknownJob,
+    /// Cursor refers to events the job has not published.
+    InvalidEventCursor,
     /// A concurrent call owns this context; there is no unbounded request queue.
     Busy,
     /// Provider/root configuration or thread startup failed.
@@ -87,7 +95,9 @@ impl Drop for Slot {
 /// Bounded worker messages; response channels belong to one synchronous call.
 enum Message {
     /// Process one bounded application JSON document.
-    Call(String, SyncSender<String>),
+    Call(Box<Request>, SyncSender<String>),
+    /// Execute on the same owner and publish passive evidence without holding the context lock.
+    Apply(disksgraph::PlanId, Arc<Job>),
     /// Drop facade/native registrations on their owner thread and exit.
     Stop,
 }
@@ -98,10 +108,21 @@ struct Context {
     sender: SyncSender<Message>,
     /// Joined before the context's reservation can be released.
     worker: Option<JoinHandle<()>>,
+    /// Explicit configuration allows saved-only start rejection before allocating a job.
+    live: bool,
+    /// Exactly one retained mailbox; terminal jobs must be explicitly released before another start.
+    job: Option<Arc<Job>>,
     /// Counts live resources even after removal from the public lookup.
     _slot: Slot,
 }
 impl Context {
+    /// Enforces instance ownership before reading or releasing any mailbox.
+    fn job(&self, id: u64) -> Result<&Arc<Job>, Error> {
+        self.job
+            .as_ref()
+            .filter(|job| job.id == id)
+            .ok_or(Error::UnknownJob)
+    }
     /// Stops and joins exactly once, even if another caller temporarily owns an Arc to this entry.
     fn shutdown(&mut self) {
         if let Some(worker) = self.worker.take() {
@@ -181,18 +202,47 @@ fn worker(config: Config, requests: mpsc::Receiver<Message>, ready: SyncSender<R
     if ready.send(Ok(())).is_err() {
         return;
     }
-    while let Ok(Message::Call(input, response)) = requests.recv() {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| protocol.call_json(&input)))
-        {
-            Ok(result) => {
-                let _ = response.send(result);
+    while let Ok(message) = requests.recv() {
+        match message {
+            Message::Stop => break,
+            Message::Call(input, response) => {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    encode_reply(protocol.call(*input))
+                })) {
+                    Ok(result) => {
+                        let _ = response.send(result);
+                    }
+                    Err(payload) => {
+                        std::mem::forget(payload);
+                        let _ = response.send(reply(Err(Error::Panicked)));
+                        break;
+                    }
+                }
             }
-            Err(payload) => {
-                // A payload's destructor is user code too; never permit a second panic across FFI.
-                std::mem::forget(payload);
-                let _ = response.send(reply(Err(Error::Panicked)));
-                break;
+            Message::Apply(plan, job) => {
+                if !execute_job(&job, || {
+                    protocol.apply_plan_with_updates(plan, &mut |snapshot, events| {
+                        job.update(snapshot, events)
+                    })
+                }) {
+                    break;
+                }
             }
+        }
+    }
+}
+
+/// Contains a job panic before publishing terminal failure; a panicked owner must stop processing.
+fn execute_job(job: &Job, action: impl FnOnce() -> Result<Value, ProtocolError>) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
+        Ok(result) => {
+            job.finish(result.err().map(|error| json!(error)));
+            true
+        }
+        Err(payload) => {
+            std::mem::forget(payload);
+            job.finish(Some(json!({"code":"panicked"})));
+            false
         }
     }
 }
@@ -215,6 +265,8 @@ pub(crate) fn open(input: &str) -> Result<Value, Error> {
         sender,
         worker: Some(worker),
         _slot: slot,
+        live,
+        job: None,
     };
     initialized.recv().map_err(|_| Error::Stopped)??;
     let mut contexts = CONTEXTS
@@ -222,7 +274,9 @@ pub(crate) fn open(input: &str) -> Result<Value, Error> {
         .lock()
         .map_err(|_| Error::Stopped)?;
     contexts.insert(id, Arc::new(Mutex::new(context)));
-    Ok(json!({"context":id,"abi_version":crate::ABI_VERSION,"mode":"synchronous","live_host":live}))
+    Ok(
+        json!({"context":id,"abi_version":crate::ABI_VERSION,"mode":"background_jobs","live_host":live}),
+    )
 }
 
 /// Forwards to the sole owner; try_lock bounds concurrent demand without blocking unrelated contexts.
@@ -237,17 +291,64 @@ pub(crate) fn call(id: u64, input: &str) -> Result<String, Error> {
         .get(&id)
         .cloned()
         .ok_or(Error::UnknownContext)?;
-    let context = context.try_lock().map_err(|error| match error {
+    let mut context = context.try_lock().map_err(|error| match error {
         std::sync::TryLockError::WouldBlock => Error::Busy,
         std::sync::TryLockError::Poisoned(_) => Error::Stopped,
     })?;
     if context.worker.is_none() {
         return Err(Error::UnknownContext);
     }
+    let request = match parse_request(input) {
+        Ok(request) => request,
+        Err(error) => return Ok(encode_reply(Err(error))),
+    };
+    match request {
+        Request::JobPoll { job, since } => return Ok(reply(context.job(job)?.poll(since))),
+        Request::JobClose { job } => {
+            if !context.job(job)?.finished()? {
+                return Err(Error::Busy);
+            }
+            context.job = None;
+            return Ok(reply(Ok(Value::Null)));
+        }
+        Request::JobCancel { job } => {
+            context.job(job)?;
+            return Ok(encode_reply(Err(ProtocolError::UnsupportedOperation(
+                "native invocation cancellation is unsupported; close waits for completion".into(),
+            ))));
+        }
+        Request::ApplyStart { plan } => {
+            if !context.live {
+                return Ok(encode_reply(Err(ProtocolError::LiveUnavailable)));
+            }
+            if let Some(job) = &context.job {
+                return Err(if job.finished()? {
+                    Error::ResourceLimit
+                } else {
+                    Error::Busy
+                });
+            }
+            let job = Arc::new(Job::new()?);
+            context
+                .sender
+                .send(Message::Apply(plan, job.clone()))
+                .map_err(|_| Error::Stopped)?;
+            let id = job.id;
+            context.job = Some(job);
+            return Ok(reply(Ok(json!({"job":id}))));
+        }
+        _ => {
+            if let Some(job) = &context.job {
+                if !job.finished()? {
+                    return Err(Error::Busy);
+                }
+            }
+        }
+    }
     let (response, result) = mpsc::sync_channel(1);
     context
         .sender
-        .send(Message::Call(input.into(), response))
+        .send(Message::Call(Box::new(request), response))
         .map_err(|_| Error::Stopped)?;
     result.recv().map_err(|_| Error::Stopped)
 }
@@ -380,6 +481,124 @@ mod tests {
             close(id).map_err(|error| format!("{error:?}"))?;
         }
         assert_eq!(SLOTS.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+    /// A channel-blocked synthetic owner proves polling is independent and close waits for quiescence.
+    #[test]
+    fn active_job_polling_and_close_do_not_detach_the_owner() -> Result<(), Box<dyn StdError>> {
+        use std::time::{Duration, Instant};
+        let _serial = TESTS.lock().unwrap_or_else(|error| error.into_inner());
+        let slot = Slot::acquire().map_err(|error| format!("{error:?}"))?;
+        let id = NEXT_CONTEXT.fetch_add(1, Ordering::Relaxed);
+        let (sender, requests) = mpsc::sync_channel(1);
+        let (entered, started) = mpsc::sync_channel(1);
+        let (release, blocked) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            if let Ok(Message::Apply(_, job)) = requests.recv() {
+                let _ = entered.send(job.clone());
+                let _ = blocked.recv_timeout(Duration::from_secs(10));
+                execute_job(&job, || Ok(Value::Null));
+            }
+            let _ = requests.recv();
+        });
+        CONTEXTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                id,
+                Arc::new(Mutex::new(Context {
+                    sender,
+                    worker: Some(worker),
+                    _slot: slot,
+                    live: true,
+                    job: None,
+                })),
+            );
+        let request = |method: &str, params: Value| {
+            json!({"protocol_version":1,"request":{"method":method,"params":params}}).to_string()
+        };
+        let plan = json!("00000000-0000-7000-8000-000000000001");
+        let response: Value = serde_json::from_str(
+            &call(id, &request("apply_start", json!({"plan":plan})))
+                .map_err(|error| format!("{error:?}"))?,
+        )?;
+        let job = started.recv_timeout(Duration::from_secs(10))?;
+        assert_eq!(response["result"]["job"], job.id);
+        let polled: Value = serde_json::from_str(
+            &call(id, &request("job_poll", json!({"job":job.id,"since":0})))
+                .map_err(|error| format!("{error:?}"))?,
+        )?;
+        assert_eq!(polled["result"]["finished"], false);
+        assert!(matches!(
+            call(id, &request("probe", json!({}))),
+            Err(Error::Busy)
+        ));
+        assert!(matches!(
+            call(id, &request("apply_start", json!({"plan":plan}))),
+            Err(Error::Busy)
+        ));
+        assert!(matches!(
+            call(id, &request("job_close", json!({"job":job.id}))),
+            Err(Error::Busy)
+        ));
+        assert!(matches!(
+            call(id, &request("job_poll", json!({"job":job.id+1,"since":0}))),
+            Err(Error::UnknownJob)
+        ));
+        let cancellation: Value = serde_json::from_str(
+            &call(id, &request("job_cancel", json!({"job":job.id})))
+                .map_err(|error| format!("{error:?}"))?,
+        )?;
+        assert_eq!(cancellation["error"]["code"], "unsupported_operation");
+        assert!(!job.finished().map_err(|error| format!("{error:?}"))?);
+        let (done, completion) = mpsc::sync_channel(1);
+        let closer = thread::spawn(move || {
+            let _ = done.send(close(id));
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while CONTEXTS
+            .get()
+            .ok_or("registry")?
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&id)
+        {
+            if Instant::now() >= deadline {
+                return Err("close did not remove handle".into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(call(id, "{}"), Err(Error::UnknownContext)));
+        release.send(())?;
+        completion
+            .recv_timeout(Duration::from_secs(10))?
+            .map_err(|error| format!("{error:?}"))?;
+        closer.join().map_err(|_| "close panic")?;
+        assert!(job.finished().map_err(|error| format!("{error:?}"))?);
+        assert_eq!(SLOTS.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    /// Panic ends the background owner rather than leaving a permanently active or successful job.
+    #[test]
+    fn job_panic_is_terminal_and_pre_run_errors_remain_visible() -> Result<(), String> {
+        let job = Job::new().map_err(|error| format!("{error:?}"))?;
+        assert!(!execute_job(&job, || panic!("controlled job panic")));
+        assert_eq!(
+            job.poll(0).map_err(|error| format!("{error:?}"))?["error"]["code"],
+            "panicked"
+        );
+        let failed = Job::new().map_err(|error| format!("{error:?}"))?;
+        assert!(execute_job(&failed, || Err(ProtocolError::LiveUnavailable)));
+        let result = failed.poll(0).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(result["finished"], true);
+        assert_eq!(result["snapshot"], Value::Null);
+        assert_eq!(result["error"]["code"], "live_unavailable");
         Ok(())
     }
 }

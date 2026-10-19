@@ -31,7 +31,7 @@ pub extern "C" fn disksgraph_open(config: StableString) -> StableString {
     boundary(|| crate::registry::reply(crate::registry::open(config.as_str())))
 }
 
-/// Dispatches synchronous versioned application JSON without transferring any Rust application object.
+/// Dispatches versioned application JSON; background jobs expose passive polling without facade transfer.
 #[stabby::export]
 pub extern "C" fn disksgraph_call(context: u64, request: StableString) -> StableString {
     boundary(|| match crate::registry::call(context, request.as_str()) {
