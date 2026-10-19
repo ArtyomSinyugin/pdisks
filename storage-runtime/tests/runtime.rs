@@ -2849,3 +2849,7 @@ fn host_incident_queries_invalidate_prior_admission_publications() -> Result<(),
     ));
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/coordinator_crash.rs"]
+mod coordinator_crash;
