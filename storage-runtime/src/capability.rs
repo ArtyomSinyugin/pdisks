@@ -11,9 +11,9 @@ pub enum OperationAvailability {
     /// Trusted adapter has checked that it implements this exact operation on this host.
     Available(BackendId),
     /// A known missing capability prevents execution.
-    Unavailable(String),
+    Unavailable(#[serde(serialize_with = "storage_core::diagnostics::serialize_message")] String),
     /// Evidence is incomplete; the host must not invoke an adapter.
-    Unknown(String),
+    Unknown(#[serde(serialize_with = "storage_core::diagnostics::serialize_message")] String),
 }
 
 /// Trust boundary for native capability and complete scope/namespace coverage checks.
@@ -96,5 +96,33 @@ pub trait BackendCapabilityCheck {
         } else {
             LiveCheckStatus::Unknown { required_evidence: "independent preservation evidence for protected contents and mount configuration".into() }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Native readiness reasons are opaque diagnostics, while the fixed backend identity remains data.
+    #[test]
+    fn availability_json_omits_untrusted_reasons() -> Result<(), Box<dyn std::error::Error>> {
+        let raw = "SECRET-native-loader-path";
+        for value in [
+            OperationAvailability::Unknown(raw.into()),
+            OperationAvailability::Unavailable(raw.into()),
+        ] {
+            let json = serde_json::to_string(&value)?;
+            assert!(!json.contains("SECRET"));
+            assert!(json.contains(storage_core::diagnostics::REDACTED));
+            assert!(
+                matches!(value, OperationAvailability::Unknown(text) | OperationAvailability::Unavailable(text) if text == raw)
+            );
+        }
+        let backend = BackendId::new("fixture-backend").ok_or("backend")?;
+        assert_eq!(
+            serde_json::to_value(OperationAvailability::Available(backend))?["available"],
+            "fixture-backend"
+        );
+        Ok(())
     }
 }

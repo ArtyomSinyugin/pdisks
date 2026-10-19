@@ -48,11 +48,13 @@ pub enum LiveCheckStatus {
     /// A known contradiction prevents admission or successful verification.
     Violated {
         /// Explanation of the observed contradiction.
+        #[serde(serialize_with = "storage_core::diagnostics::serialize_message")]
         reason: String,
     },
     /// Evidence is incomplete; simulation is not an acceptable substitute.
     Unknown {
         /// Evidence still needed from the runtime environment.
+        #[serde(serialize_with = "storage_core::diagnostics::serialize_message")]
         required_evidence: String,
     },
 }
@@ -114,11 +116,13 @@ pub enum BackendOutcome {
     /// Backend reports a known failure.
     Failed {
         /// Provider-owned explanation of the failure.
+        #[serde(serialize_with = "storage_core::diagnostics::serialize_message")]
         reason: String,
     },
     /// Interruption or partial outcome requires observation and explicit recovery.
     OutcomeUnknown {
         /// Provider-owned explanation of the unknown result.
+        #[serde(serialize_with = "storage_core::diagnostics::serialize_message")]
         reason: String,
     },
 }
@@ -223,7 +227,8 @@ pub enum RunEventKind {
     Progress {
         /// Action reporting progress.
         action: ActionId,
-        /// Provider-owned progress description.
+        /// Provider-owned progress retained raw in Rust and omitted from JSON.
+        #[serde(serialize_with = "storage_core::diagnostics::serialize_message")]
         detail: String,
     },
     /// Complete live evidence was evaluated without necessarily admitting an invocation.
@@ -283,8 +288,10 @@ pub struct ActionStatus {
     /// Complete postcondition checks, absent before verification.
     pub postconditions: Option<Vec<LiveCheck<Postcondition>>>,
     /// Checkpoint preparation or endpoint failure before dispatch.
+    #[serde(serialize_with = "storage_core::diagnostics::serialize_optional_message")]
     pub pre_dispatch_failure: Option<String>,
     /// Why a running invocation could not be classified or observed.
+    #[serde(serialize_with = "storage_core::diagnostics::serialize_optional_message")]
     pub unknown_reason: Option<String>,
 }
 
@@ -1272,11 +1279,21 @@ mod tests {
         );
         let json = serde_json::to_string(&events)
             .unwrap_or_else(|error| panic!("serialize progress: {error}"));
-        assert_eq!(
-            serde_json::from_str::<Vec<RunEvent>>(&json)
-                .unwrap_or_else(|error| panic!("restore progress: {error}")),
-            events
-        );
+        let decoded = serde_json::from_str::<Vec<RunEvent>>(&json)
+            .unwrap_or_else(|error| panic!("decode public progress: {error}"));
+        assert_eq!(decoded.len(), events.len());
+        for (public, raw) in decoded.iter().zip(&events) {
+            assert_eq!((public.run_id, public.sequence), (raw.run_id, raw.sequence));
+            if let RunEventKind::Progress { action, detail } = &public.kind {
+                assert_eq!(*action, ActionId::new(0));
+                assert_eq!(detail, storage_core::diagnostics::REDACTED);
+                assert!(
+                    matches!(&raw.kind, RunEventKind::Progress { detail, .. } if detail == "backend in progress")
+                );
+            } else {
+                assert_eq!(public, raw);
+            }
+        }
         assert_eq!(document, baseline);
         assert_eq!(run.context().historical_baseline, &baseline.baseline);
     }
@@ -1879,6 +1896,69 @@ mod tests {
             serde_json::to_string(&ActionRunState::Admitted)?,
             "\"admitted\""
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_serialization {
+    use super::*;
+    use storage_core::diagnostics::REDACTED;
+
+    /// JSON preserves lifecycle and cursors while every opaque execution explanation stays in Rust.
+    #[test]
+    fn execution_json_omits_free_text_without_mutating_retained_evidence()
+    -> Result<(), serde_json::Error> {
+        let raw = "SECRET token=abc\n/private/backend-path";
+        let status = LiveCheckStatus::Unknown {
+            required_evidence: raw.into(),
+        };
+        let outcome = BackendOutcome::Failed { reason: raw.into() };
+        let action = ActionStatus {
+            action: ActionId::new(0),
+            state: ActionRunState::OutcomeUnknown,
+            applicability: Some(status.clone()),
+            admission_observation: None,
+            completion_observation: None,
+            prerequisites: vec![],
+            outcome: Some(outcome.clone()),
+            postconditions: None,
+            pre_dispatch_failure: Some(raw.into()),
+            unknown_reason: Some(raw.into()),
+        };
+        let event = RunEvent {
+            run_id: Uuid::now_v7(),
+            sequence: 7,
+            kind: RunEventKind::Progress {
+                action: ActionId::new(0),
+                detail: raw.into(),
+            },
+        };
+        let json = serde_json::to_value(&action)?;
+        assert_eq!(json["state"], "outcome_unknown");
+        assert_eq!(
+            json["applicability"]["unknown"]["required_evidence"],
+            REDACTED
+        );
+        assert_eq!(json["outcome"]["failed"]["reason"], REDACTED);
+        assert_eq!(json["pre_dispatch_failure"], REDACTED);
+        assert_eq!(json["unknown_reason"], REDACTED);
+        assert!(!json.to_string().contains("SECRET"));
+        let json = serde_json::to_value(&event)?;
+        assert_eq!(json["sequence"], 7);
+        assert_eq!(json["run_id"], event.run_id.to_string());
+        assert_eq!(json["kind"]["progress"]["detail"], REDACTED);
+        assert_eq!(action.outcome, Some(outcome));
+        assert_eq!(action.applicability, Some(status));
+        assert_eq!(action.unknown_reason.as_deref(), Some(raw));
+        assert!(matches!(&event.kind, RunEventKind::Progress { detail, .. } if detail == raw));
+        for value in [
+            serde_json::to_value(LiveCheckStatus::Violated { reason: raw.into() })?,
+            serde_json::to_value(BackendOutcome::OutcomeUnknown { reason: raw.into() })?,
+        ] {
+            assert!(!value.to_string().contains("SECRET"));
+            assert!(value.to_string().contains(REDACTED));
+        }
         Ok(())
     }
 }
