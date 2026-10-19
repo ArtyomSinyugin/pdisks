@@ -47,7 +47,49 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
         plan: PlanId,
         observer: &mut dyn FnMut(&RunEvent),
     ) -> Result<RunId, DisksGraphError> {
-        self.apply_document_with_events(self.export_plan(plan)?, vec![], observer)
+        let mut cursor = 0;
+        self.apply_document_with_updates(self.export_plan(plan)?, vec![], &mut |run| {
+            for event in run.events_since(cursor) {
+                observer(event);
+                cursor = event.sequence;
+            }
+        })
+    }
+    /// Publishes passive complete state and bounded events while the same coordinator is executing.
+    /// Live snapshots always have finished=false; a final update includes coordinator errors and finished=true.
+    pub fn apply_plan_with_updates(
+        &mut self,
+        plan: PlanId,
+        observer: &mut dyn FnMut(RunSnapshot, EventsPage),
+    ) -> Result<RunId, DisksGraphError> {
+        let result =
+            self.apply_document_with_updates(self.export_plan(plan)?, vec![], &mut |run| {
+                let mut execution = run.snapshot();
+                execution.finished = false;
+                let events: Vec<_> = run.events_since(0).cloned().collect();
+                let page = EventsPage {
+                    gap: events.first().is_some_and(|event| event.sequence > 1),
+                    next_sequence: execution.event_sequence,
+                    events,
+                };
+                observer(
+                    RunSnapshot {
+                        execution,
+                        source_map: vec![],
+                        error: None,
+                    },
+                    page,
+                );
+            });
+        if let Some(id) = result
+            .as_ref()
+            .ok()
+            .copied()
+            .or_else(|| result.as_ref().err().and_then(|error| error.run_id))
+        {
+            observer(self.run_snapshot(id)?, self.events(id, 0)?);
+        }
+        result
     }
     /// Returns the complete current evidence even after event eviction or a failure before the first event.
     pub fn run_snapshot(&self, id: RunId) -> Result<RunSnapshot, DisksGraphError> {
@@ -77,14 +119,14 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
         document: PlanDocument,
         source_map: Vec<OperationActions>,
     ) -> Result<RunId, DisksGraphError> {
-        self.apply_document_with_events(document, source_map, &mut |_| {})
+        self.apply_document_with_updates(document, source_map, &mut |_| {})
     }
     /// Event delivery shares the exact reservation, coordinator and failure-retention path.
-    fn apply_document_with_events(
+    fn apply_document_with_updates(
         &mut self,
         document: PlanDocument,
         source_map: Vec<OperationActions>,
-        observer: &mut dyn FnMut(&RunEvent),
+        observer: &mut dyn FnMut(&ExecutionRun),
     ) -> Result<RunId, DisksGraphError> {
         if self.runs.len() >= MAX_APPLICATION_OBJECTS {
             return Err(DisksGraphError::new(
@@ -105,7 +147,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
                 let mut coordinator =
                     ExecutionCoordinator::new(root, &mut self.host, &mut self.dispatcher, &run);
                 coordinator
-                    .execute_run_with_events(&mut run, observer)
+                    .execute_run_with_updates(&mut run, observer)
                     .map_err(DisksGraphError::from)
             });
         let error = result.err().map(|mut error| {

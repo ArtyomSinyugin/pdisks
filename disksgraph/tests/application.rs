@@ -439,3 +439,56 @@ fn facade_incident_review_requires_confirmation_and_independent_policy()
     assert_eq!(writes.get(), 0);
     Ok(())
 }
+
+/// Live publications remain unfinished until the retained terminal update, including early lock failure.
+#[test]
+fn passive_updates_match_retained_success_and_failure() -> Result<(), Box<dyn Error>> {
+    for blocked in [false, true] {
+        let (scratch, mut app, _, writes) = support::application()?;
+        let session = app.create_session()?;
+        let document = app
+            .freeze(session, app.revision(session)?)?
+            .document()
+            .clone();
+        let plan = app.import_plan(document)?;
+        let root = disksgraph::host::lease::ExecutionRoot::open(&scratch.0)?;
+        let lock = if blocked {
+            Some(root.try_lock_host()?)
+        } else {
+            None
+        };
+        let mut updates = Vec::new();
+        let result = app.apply_plan_with_updates(plan, &mut |snapshot, events| {
+            assert_eq!(snapshot.execution.event_sequence, events.next_sequence);
+            updates.push((snapshot, events));
+        });
+        let run = match result {
+            Ok(run) => {
+                assert!(!blocked);
+                run
+            }
+            Err(error) => {
+                assert!(blocked);
+                error.run_id.ok_or("retained run")?
+            }
+        };
+        assert!(updates.len() >= 2);
+        assert!(
+            updates[..updates.len() - 1]
+                .iter()
+                .all(|(snapshot, _)| !snapshot.execution.finished)
+        );
+        let (final_snapshot, final_events) = updates.last().ok_or("final update")?;
+        assert!(final_snapshot.execution.finished);
+        assert_eq!(final_snapshot.execution.verified, !blocked);
+        assert_eq!(final_snapshot.error.is_some(), blocked);
+        assert_eq!(
+            serde_json::to_value(final_snapshot)?,
+            serde_json::to_value(app.run_snapshot(run)?)?
+        );
+        assert_eq!(*final_events, app.events(run, 0)?);
+        assert_eq!(writes.get(), 0);
+        drop(lock);
+    }
+    Ok(())
+}

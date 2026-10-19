@@ -87,17 +87,12 @@ pub struct ExecutionCoordinator<H, D> {
 /// Borrowed synchronous notifications; callbacks cannot grant admission or mutate run evidence.
 struct RunNotifications<'a> {
     /// Passive caller-owned consumer, retained only for the duration of this blocking call.
-    callback: &'a mut dyn FnMut(&RunEvent),
-    /// Last delivered sequence; draining at each transition boundary prevents ring eviction gaps.
-    cursor: u64,
+    callback: &'a mut dyn FnMut(&ExecutionRun),
 }
 impl RunNotifications<'_> {
     /// Delivers published evidence before the next provider/backend phase and after every progress update.
     fn publish(&mut self, run: &ExecutionRun) {
-        for event in run.events_since(self.cursor) {
-            (self.callback)(event);
-            self.cursor = event.sequence;
-        }
+        (self.callback)(run);
     }
 }
 
@@ -136,10 +131,23 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         run: &mut ExecutionRun,
         callback: &mut dyn FnMut(&RunEvent),
     ) -> Result<ExecutionSummary, CoordinatorError> {
-        let mut notifications = RunNotifications {
-            callback,
-            cursor: 0,
-        };
+        let mut cursor = 0;
+        self.execute_run_with_updates(run, &mut |run| {
+            for event in run.events_since(cursor) {
+                callback(event);
+                cursor = event.sequence;
+            }
+        })
+    }
+
+    /// Publishes immutable live evidence at the same boundaries as events, including before admission.
+    /// The observer cannot change admission or interrupt a native invocation; slow callbacks delay it.
+    pub fn execute_run_with_updates(
+        &mut self,
+        run: &mut ExecutionRun,
+        callback: &mut dyn FnMut(&ExecutionRun),
+    ) -> Result<ExecutionSummary, CoordinatorError> {
+        let mut notifications = RunNotifications { callback };
         notifications.publish(run);
         let result = self.execute_run_inner(run, &mut notifications);
         notifications.publish(run);
@@ -227,10 +235,9 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         action: ActionId,
         operation: Option<OperationId>,
     ) -> Result<ActionRunState, CoordinatorError> {
-        let mut callback = |_: &RunEvent| {};
+        let mut callback = |_: &ExecutionRun| {};
         let mut notifications = RunNotifications {
             callback: &mut callback,
-            cursor: 0,
         };
         self.execute_action_locked(run, action, operation, None, &mut notifications)
     }
