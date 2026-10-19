@@ -335,3 +335,28 @@ fn final_mount_goal_checks_options_and_preserves_unknown_evidence() -> Result<()
     }
     Ok(())
 }
+
+/// A new planned filesystem cannot adopt a preexisting UUID even after transient IDs change.
+#[test]
+fn filesystem_output_cannot_reuse_a_historical_uuid() -> Result<(), Box<dyn Error>> {
+    let mut f = Fixture::new()?;
+    let node = f
+        .observed
+        .snapshot
+        .graph
+        .node(&f.binding.target)
+        .ok_or("FS")?
+        .clone();
+    f.baseline.snapshot.graph.insert_new(NodeId::new(), node)?;
+    let report = check_observed_postconditions_with_bindings(
+        &f.baseline,
+        &f.observed,
+        &[Postcondition::NodeReprobed(f.binding.source)],
+        &[f.binding],
+    )?;
+    assert!(matches!(
+        report.checks[0].status,
+        LiveCheckStatus::Unknown { .. }
+    ));
+    Ok(())
+}

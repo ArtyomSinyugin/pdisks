@@ -201,6 +201,17 @@ pub(super) fn result_node<'a>(
     {
         return Err(unknown("created output binding is ambiguous"));
     }
+    // A new output cannot adopt an identity that already belonged to the reviewed system.
+    if baseline
+        .snapshot
+        .graph
+        .nodes()
+        .any(|(_, node)| node.size.identities.contains(&binding.identity))
+    {
+        return Err(unknown(
+            "created output UUID already exists in the historical baseline",
+        ));
+    }
     let node = observation
         .snapshot
         .graph
