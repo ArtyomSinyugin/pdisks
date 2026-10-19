@@ -74,8 +74,8 @@ fn dialog(
     policy: &mut Policy,
     reply: impl FnOnce(&serde_json::Value) -> serde_json::Value + Send + 'static,
 ) -> Result<Result<serde_json::Value, dg_cli::Error>, Box<dyn Error>> {
-    let (server_in, peer_out) = rustix::pipe::pipe()?;
-    let (peer_in, server_out) = rustix::pipe::pipe()?;
+    let (server_in, peer_out) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    let (peer_in, server_out) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
     let peer = std::thread::spawn(move || -> std::io::Result<()> {
         let mut reader = BufReader::new(std::fs::File::from(peer_in));
         let mut line = String::new();
@@ -166,6 +166,24 @@ fn empty_or_canceled_review_leaves_marker_untouched() -> Result<(), Box<dyn Erro
         assert_eq!(result["acknowledged"], false);
         assert!(scratch.0.join("active-attempt.json").exists());
     }
+    assert_eq!(policy.calls, 0);
+    // A failed review writer stops before reading confirmation or clearing anything.
+    let before = std::fs::read(scratch.0.join("active-attempt.json"))?;
+    let mut failed_writer = std::fs::File::open(scratch.0.join("active-attempt.json"))?;
+    assert!(matches!(
+        dg_cli::execute_with_io(
+            &mut app,
+            &dg_cli::Command::AcknowledgeIncident,
+            &mut b"".as_slice(),
+            &mut failed_writer,
+            &mut policy
+        ),
+        Err(dg_cli::Error::Io(_))
+    ));
+    assert_eq!(
+        std::fs::read(scratch.0.join("active-attempt.json"))?,
+        before
+    );
     assert_eq!(policy.calls, 0);
     assert_eq!(writes.get(), 0);
     Ok(())

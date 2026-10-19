@@ -252,16 +252,50 @@ draft/status/diagnostics и token, не изменяя черновик. Пос�
 после prepare отклоняются. Затем требуется явный save. Candidate/token живут только
 в текущем процессе; offline edit не подменяет native probe пустым наблюдением.
 
-**C6 пока не завершён.** Production scope/authorization остаются Unknown, native
-dispatcher в executable отключён. Даже manifest с Execute не включает запись.
-Тесты проверяют parity preview/plan (кроме нового plan_id), одинаковый отказ
-readiness, retained failures, independent empty-plan verification в synthetic host
-и отдельные процессы редактирования. Реального write через CLI в VM ещё не было;
-incident acknowledgment и положительный write parity CLI/API остаются впереди.
-Native smoke-probe в текущем host namespace теперь возвращает структурную
-публикацию (30 nodes, 59 mounts). Пять скрытых/неразрешённых `/dev` sources
-сохраняются как Other с исходным path и блокирующей `mount.unresolved_source`
-diagnostic; graph nodes и положительная coverage при этом не выдумываются.
+`dg-cli incident acknowledge --manifest providers.json --root PRIVATE_DIR`
+сначала показывает в stderr JSONL review: `type=incident_review`, полную inspection
+и свежий token. В **том же процессе** подтвердите одной строкой на stdin:
+
+```json
+{"command":"acknowledge","run_id":"<run UUID из inspection.attempt>","token":"<token из review>"}
+```
+
+EOF или `{"command":"cancel"}` оставляют checkpoint и возвращают
+`acknowledged=false`. Run ID/token должны соответствовать показанному review;
+сохранённый review не импортируется, flags `--confirm/--yes` не заменяют диалог.
+Runtime повторно проверяет root inode, неизменность marker и actual observations,
+а затем независимую principal/scope/quiescence policy под тем же lock. Смена
+transient NodeIds также консервативно отклоняет acknowledgment. Ошибка review
+writer останавливает диалог до подтверждения; одна строка ограничена 16 MiB.
+Удаление checkpoint не делает старый run Verified и не повторяет native effects.
+
+`execute_with_io(app, command, input, output, incident_policy)` позволяет trusted
+Rust host использовать **тот же** command adapter и собственную policy. Она не
+десериализуется из пользовательского JSON. `execute()` и обычный executable
+используют `incident::UnconfiguredPolicy`, всегда Unknown: правильного token
+недостаточно для удаления marker. `result_exit_code()` общий для executable и
+embedding host. Production scope/authorization остаются Unknown, native dispatcher
+обычного executable отключён; даже manifest с Execute не включает запись.
+
+**Приёмочный проход C6 command layer завершён.** В
+[изолированной VM](storage-runtime/tests/vm/README.md) проверены Rust и CLI routes
+с одинаковыми guest-only host policies для native `CreateLv → activation → ext4 →
+Mount`: success даёт четыре Verified и отдельный final probe, отказ mount сохраняет
+checkpoint и блокирует повторный apply. CLI использует настоящий parser и общий
+adapter; preview сравнивается по всем полям (graph sets — по typed equality),
+executable plan — по canonical JSON, кроме нового plan_id отдельного freeze.
+Результат JSON и live events совпадают с retained facade snapshot/events.
+Imported CLI plan не присваивает trusted source map live FrozenPlan.
+Native incident с правильным token остаётся заблокирован conservative review/
+Unknown policy; положительный acknowledgment с независимой разрешающей policy
+проверен только на synthetic host без native операций.
+
+Это проверка общей командной логики с явно настроенным host, а не разрешение
+production writes обычного executable. Production policy/configuration, C3 crash/
+power-loss и эксплуатационная готовность остаются отдельной работой C8. Следующий
+интерфейсный этап — C7/Stabby. Межпроцессная run history не добавляется.
+Native smoke-probe на текущем host возвращает 30 nodes/59 mounts; пять unresolved
+`/dev` sources остаются Other с blocking `mount.unresolved_source` diagnostic.
 
 ## Редактирование плана без доступа к дискам
 

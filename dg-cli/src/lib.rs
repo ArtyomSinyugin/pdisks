@@ -49,8 +49,12 @@ impl From<std::io::Error> for Error {
 }
 
 impl From<serde_json::Error> for Error {
-    /// Malformed JSON never becomes a partially accepted command.
+    /// Encoding I/O failures retain the same exit category as other broken output streams.
     fn from(error: serde_json::Error) -> Self {
-        Self::Document(error.to_string())
+        if error.is_io() {
+            Self::Io(error.to_string())
+        } else {
+            Self::Document(error.to_string())
+        }
     }
 }

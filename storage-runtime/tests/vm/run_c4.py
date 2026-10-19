@@ -120,6 +120,8 @@ def main():
     sentinel = "C4_VERTICAL_VERIFIED" if args.case == "success" else "C4_EXPECTED_FAILURE_VERIFIED"
     if args.interface == "cli" and "C6_CLI_VERIFIED\n" not in result:
         raise SystemExit(f"CLI command experiment failed; retained {log} and {disk}")
+    if args.interface == "cli" and args.case == "mount-target-change" and "C6_INCIDENT_REFUSAL_VERIFIED\n" not in result:
+        raise SystemExit(f"CLI incident refusal failed; retained {log} and {disk}")
     if f"{sentinel}\n" not in result or "C4_EXIT=0\n" not in result or "C5_FACADE_VERIFIED\n" not in result:
         raise SystemExit(f"C4 experiment failed; retained {log} and {disk}")
 

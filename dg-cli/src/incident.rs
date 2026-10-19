@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::io::{BufRead, Write};
 
 /// Explicitly absent production authorization/coverage/quiescence configuration.
-pub(crate) struct UnconfiguredPolicy;
+pub struct UnconfiguredPolicy;
 impl IncidentAcknowledgmentPolicy for UnconfiguredPolicy {
     /// A token, root privilege and an available lock cannot establish native backend quiescence.
     fn check(&mut self, _: &IncidentInspection, _: &IncidentInspection) -> LiveCheckStatus {

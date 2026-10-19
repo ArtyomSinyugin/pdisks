@@ -38,6 +38,13 @@ policies. CLI preview and executable plan inputs match the direct API; separate
 freeze calls allocate distinct plan IDs. The JSON result matches the facade's
 retained snapshot, events match its sequence, and imported plans have no fabricated
 trusted source map. CLI success requires `C6_CLI_VERIFIED` and verified exit status.
+The CLI failure case additionally retries through the command adapter (blocked
+before any fifth dispatch), inspects the actual marker, and sends the exact token
+from a same-process incident review. The executable's default Unknown acknowledgment
+policy and runtime freshness checks cannot remove that marker. GuestProbe deliberately
+regenerates transient NodeIds on each pass, so Changed may refuse before the safety
+policy; the test does not weaken comparison or claim backend quiescence.
+
 This tests the command adapter with trusted guest configuration; the ordinary
 `dg-cli` executable still has no permissive production write policy or VM bypass flag.
 

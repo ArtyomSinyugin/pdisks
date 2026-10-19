@@ -553,6 +553,58 @@ impl BackendDispatcher for GuestDispatch<'_> {
     }
 }
 
+/// Confirms the real incident consciously while retaining the executable's conservative checks.
+fn refuse_cli_acknowledgment<
+    C: BackendCapabilityCheck,
+    A: AuthorizationContext,
+    D: BackendDispatcher,
+>(
+    app: &mut DisksGraph<LinuxLiveHost<'_, C, A>, D>,
+) -> Result<(), Box<dyn Error>> {
+    use std::io::{BufRead, BufReader, Write};
+    let (server_in, peer_out) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    let (peer_in, server_out) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    let peer = std::thread::spawn(move || -> std::io::Result<()> {
+        let mut reader = BufReader::new(fs::File::from(peer_in));
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let review: serde_json::Value =
+            serde_json::from_str(&line).map_err(std::io::Error::other)?;
+        assert_eq!(review["type"], "incident_review");
+        writeln!(
+            fs::File::from(peer_out),
+            "{}",
+            serde_json::json!({
+                "command":"acknowledge", "run_id":review["incident"]["attempt"]["run_id"], "token":review["token"],
+            })
+        )?;
+        Ok(())
+    });
+    let before = fs::read("/run/c4-execution/active-attempt.json")?;
+    let mut policy = dg_cli::incident::UnconfiguredPolicy;
+    let result = dg_cli::execute_with_io(
+        app,
+        &dg_cli::Command::AcknowledgeIncident,
+        &mut BufReader::new(fs::File::from(server_in)),
+        &mut fs::File::from(server_out),
+        &mut policy,
+    );
+    peer.join()
+        .map_err(|_| "incident confirmation peer panicked")??;
+    // GuestProbe deliberately regenerates NodeIds each pass; Changed may refuse before the
+    // default Unknown safety policy. Neither condition permits removing the native checkpoint.
+    assert!(matches!(
+        result,
+        Err(dg_cli::Error::Application(disksgraph::DisksGraphError {
+            code: disksgraph::ErrorCode::IncidentRejected,
+            ..
+        }))
+    ));
+    assert_eq!(fs::read("/run/c4-execution/active-attempt.json")?, before);
+    println!("C6_INCIDENT_REFUSAL_VERIFIED");
+    Ok(())
+}
+
 /// Runs exactly CreateLv, activation, ext4 and Host Mount through the normal coordinator.
 fn main() -> Result<(), Box<dyn Error>> {
     guard()?;
@@ -817,12 +869,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         assert_eq!(marker.action_id, ActionId::new(3));
         assert_eq!(marker.backend_id.as_str(), "vm-mount");
         assert_eq!(marker.targets.len(), 3);
-        // A new facade attempt is also blocked by the retained marker, before another native call.
-        let rejected = app
-            .apply_blocking(document.clone())
-            .err()
-            .ok_or("incident must block another attempt")?;
-        assert_eq!(rejected.code, disksgraph::ErrorCode::CheckpointBlocked);
+        // A new attempt on either public route is blocked before another native invocation.
+        if cli {
+            let rejected = dg_cli::execute(
+                &mut app,
+                &dg_cli::Command::Apply {
+                    file: plan_path.into(),
+                    events: false,
+                },
+                &mut Vec::new(),
+            )?;
+            assert_eq!(dg_cli::result_exit_code(&rejected), 3);
+            assert_eq!(rejected["run"]["error"]["code"], "checkpoint_blocked");
+            assert_eq!(
+                app.run_snapshot(run)?.execution.actions,
+                status.execution.actions
+            );
+            let inspection =
+                dg_cli::execute(&mut app, &dg_cli::Command::Incident, &mut Vec::new())?;
+            assert_eq!(
+                inspection["incident"]["attempt"],
+                serde_json::to_value(&marker)?
+            );
+            refuse_cli_acknowledgment(&mut app)?;
+        } else {
+            let rejected = app
+                .apply_blocking(document.clone())
+                .err()
+                .ok_or("incident must block another attempt")?;
+            assert_eq!(rejected.code, disksgraph::ErrorCode::CheckpointBlocked);
+        }
         assert_eq!(calls.get(), 4);
         assert!(app.incident()?.is_some());
         if cli {
