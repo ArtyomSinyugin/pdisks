@@ -28,7 +28,7 @@ fn method(api: &Api, context: u64, name: &str, params: Value) -> Result<Value, E
 fn main() -> Result<(), Error> {
     guest::guard().map_err(|error| error.to_string())?;
     let case = std::env::args().nth(1).ok_or("guest case")?;
-    if case != "success" {
+    if case != "success" && case != "mount-target-change" {
         return Err("unsupported guest case".into());
     }
     fs::write("/run/c7-case", &case)?;
@@ -40,9 +40,9 @@ fn main() -> Result<(), Error> {
     let api = Api::load(Path::new("/usr/lib64/libc7_vm_library.so"), "disksgraph_vm")?;
     assert_eq!(api.version()?, 1);
     assert!(api.rejects_wrong_signature());
-    let opened = api.open(
-        &json!({"abi_version":1,"protocol_version":1,"root":root,"manifest":"/run/providers.json"}),
-    )?;
+    let config =
+        json!({"abi_version":1,"protocol_version":1,"root":root,"manifest":"/run/providers.json"});
+    let opened = api.open(&config)?;
     let context = opened["result"]["context"]
         .as_u64()
         .ok_or_else(|| format!("open: {opened}"))?;
@@ -140,26 +140,91 @@ fn main() -> Result<(), Error> {
         json!(delivered)
     );
     assert_eq!(snapshot["finished"], true);
-    assert_eq!(snapshot["verified"], true, "{snapshot}");
     let actions = snapshot["actions"].as_array().ok_or("actions")?;
     assert_eq!(actions.len(), 4);
-    assert!(actions.iter().all(|action| action["state"] == "verified"));
+    assert!(actions[..3]
+        .iter()
+        .all(|action| action["state"] == "verified"));
     assert_eq!(snapshot["source_map"], json!([]));
-    assert!(
-        snapshot["goal_verification"]["observation"]["reference"]["epoch"].as_u64()
-            > actions[3]["completion_observation"]["epoch"].as_u64()
-    );
-    assert!(!root.join("active-attempt.json").exists());
-    fs::write("/mnt/c4/proof", b"C7 checked ABI real mounted ext4")?;
-    assert_eq!(
-        fs::read("/mnt/c4/proof")?,
-        b"C7 checked ABI real mounted ext4"
-    );
+    for (index, action) in actions.iter().enumerate() {
+        println!("C4_ACTION_{index}={}", action["state"]);
+        println!("C4_BACKEND_{index}={}", action["outcome"]);
+    }
+    let marker = if case == "mount-target-change" {
+        assert_eq!(snapshot["verified"], false, "{snapshot}");
+        assert_eq!(actions[3]["state"], "outcome_unknown");
+        let bytes = fs::read(root.join("active-attempt.json"))?;
+        let marker = disksgraph::host::checkpoint::ActiveAttempt::from_bytes(&bytes)?;
+        assert_eq!(marker.action_id, disksgraph::ActionId::new(3));
+        assert_eq!(marker.backend_id.as_str(), "vm-mount");
+        assert_eq!(marker.targets.len(), 3);
+        let rejected = method(&api, context, "apply_blocking", json!({"plan":plan}))?;
+        assert_eq!(rejected["error"]["code"], "checkpoint_blocked");
+        assert_eq!(
+            method(&api, context, "run_snapshot", json!({"run":run}))?,
+            *snapshot
+        );
+        let inspection = method(&api, context, "incident_inspect", json!({}))?;
+        assert_eq!(inspection["attempt"], serde_json::to_value(&marker)?);
+        let review = method(&api, context, "incident_review", json!({}))?;
+        let refused = api.method(
+            context,
+            "incident_acknowledge",
+            json!({"review":review["review"],"run_id":marker.run_id,"token":review["token"]}),
+        )?;
+        assert_eq!(
+            refused["error"]["detail"]["code"], "incident_rejected",
+            "{refused}"
+        );
+        assert_eq!(fs::read(root.join("active-attempt.json"))?, bytes);
+        println!("C7_INCIDENT_REFUSAL_VERIFIED");
+        Some(bytes)
+    } else {
+        assert_eq!(snapshot["verified"], true, "{snapshot}");
+        assert_eq!(actions[3]["state"], "verified");
+        assert!(
+            snapshot["goal_verification"]["observation"]["reference"]["epoch"].as_u64()
+                > actions[3]["completion_observation"]["epoch"].as_u64()
+        );
+        assert!(!root.join("active-attempt.json").exists());
+        fs::write("/mnt/c4/proof", b"C7 checked ABI real mounted ext4")?;
+        assert_eq!(
+            fs::read("/mnt/c4/proof")?,
+            b"C7 checked ABI real mounted ext4"
+        );
+        None
+    };
     method(&api, context, "job_close", json!({"job":job}))?;
     api.close(context)?;
     assert_eq!(fs::read_to_string("/run/c7-native-calls")?, "4");
+    if let Some(bytes) = marker {
+        assert_eq!(fs::read(root.join("active-attempt.json"))?, bytes);
+        let reopened = api.open(&config)?;
+        let next = reopened["result"]["context"]
+            .as_u64()
+            .ok_or_else(|| format!("reopen: {reopened}"))?;
+        assert_ne!(next, context);
+        let missing = api.method(next, "run_snapshot", json!({"run":run}))?;
+        assert_eq!(missing["error"]["detail"]["code"], "unknown_run");
+        let pending = method(&api, next, "incident_inspect", json!({}))?;
+        assert_eq!(pending["attempt"], serde_json::from_slice::<Value>(&bytes)?);
+        let imported =
+            method(&api, next, "plan_import", json!({"document":frozen}))?["plan"].clone();
+        let refused = method(&api, next, "apply_blocking", json!({"plan":imported}))?;
+        assert_eq!(refused["error"]["code"], "checkpoint_blocked");
+        api.close(next)?;
+        assert_eq!(fs::read_to_string("/run/c7-native-calls")?, "0");
+        assert_eq!(fs::read(root.join("active-attempt.json"))?, bytes);
+        println!("C7_CLOSE_PRESERVATION_VERIFIED");
+        println!("C4_EXPECTED_FAILURE_VERIFIED");
+    } else {
+        let files: Vec<_> = fs::read_dir(root)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(files, [std::ffi::OsString::from("execution.lock")]);
+        println!("C4_VERTICAL_VERIFIED");
+    }
     println!("C7_LIVE_POLL_VERIFIED");
     println!("C7_ABI_VERIFIED");
-    println!("C4_VERTICAL_VERIFIED");
     Ok(())
 }

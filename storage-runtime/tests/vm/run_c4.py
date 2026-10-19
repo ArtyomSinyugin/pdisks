@@ -129,6 +129,9 @@ def main():
         raise SystemExit(f"CLI command experiment failed; retained {log} and {disk}")
     if args.interface == "cli" and args.case == "mount-target-change" and "C6_INCIDENT_REFUSAL_VERIFIED\n" not in result:
         raise SystemExit(f"CLI incident refusal failed; retained {log} and {disk}")
+    if args.interface == "ffi" and args.case == "mount-target-change":
+        if "C7_INCIDENT_REFUSAL_VERIFIED\n" not in result or "C7_CLOSE_PRESERVATION_VERIFIED\n" not in result:
+            raise SystemExit(f"ABI incident preservation failed; retained {log} and {disk}")
     facade_sentinel = "C7_ABI_VERIFIED" if args.interface == "ffi" else "C5_FACADE_VERIFIED"
     if args.interface == "ffi" and "C7_LIVE_POLL_VERIFIED\n" not in result:
         raise SystemExit(f"ABI live polling failed; retained {log} and {disk}")
