@@ -289,16 +289,19 @@ fn checkpoint_crash_child() -> Result<(), Box<dyn Error>> {
     let lock = root.try_lock_host()?;
     let store = CheckpointStore::new(&lock);
     let point = match mode.as_str() {
+        "partial_write" => Boundary::Write,
+        "before_file_sync" => Boundary::FileSync,
         "before_publish" => Boundary::Publish,
         "after_publish" => Boundary::DirectorySync,
+        "before_unlink" => Boundary::Unlink,
         "after_clear" => Boundary::ClearSync,
         _ => return Err("invalid crash mode".into()),
     };
-    if point == Boundary::ClearSync {
+    if matches!(point, Boundary::Unlink | Boundary::ClearSync) {
         store.arm(&fixture())?;
     }
     FAULT.set(Some((point, true)));
-    if point == Boundary::ClearSync {
+    if matches!(point, Boundary::Unlink | Boundary::ClearSync) {
         let attempt = store.inspect()?.ok_or("active attempt")?;
         store.clear(attempt.run_id, attempt.action_id)?;
     } else {
@@ -312,7 +315,14 @@ fn checkpoint_crash_child() -> Result<(), Box<dyn Error>> {
 fn sigkill_preserves_conservative_checkpoint_state() -> Result<(), Box<dyn Error>> {
     let _serial = serialize_process_tests();
     use std::os::unix::process::ExitStatusExt;
-    for mode in ["before_publish", "after_publish", "after_clear"] {
+    for mode in [
+        "partial_write",
+        "before_file_sync",
+        "before_publish",
+        "after_publish",
+        "before_unlink",
+        "after_clear",
+    ] {
         let scratch = Scratch::new()?;
         let result = std::process::Command::new(std::env::current_exe()?)
             .args([
@@ -334,7 +344,7 @@ fn sigkill_preserves_conservative_checkpoint_state() -> Result<(), Box<dyn Error
         let root = ExecutionRoot::open(&scratch.0)?;
         let lock = root.try_lock_host()?;
         let store = CheckpointStore::new(&lock);
-        if mode == "after_publish" {
+        if matches!(mode, "after_publish" | "before_unlink") {
             assert!(store.inspect()?.is_some());
             assert!(matches!(
                 store.arm(&fixture()),
@@ -343,7 +353,10 @@ fn sigkill_preserves_conservative_checkpoint_state() -> Result<(), Box<dyn Error
         } else {
             assert!(store.inspect()?.is_none());
         }
-        if mode == "before_publish" {
+        if matches!(
+            mode,
+            "partial_write" | "before_file_sync" | "before_publish"
+        ) {
             // An unpublished staging file is inert; no backend could have been invoked.
             assert_eq!(fs::read_dir(&scratch.0)?.count(), 2);
         }
