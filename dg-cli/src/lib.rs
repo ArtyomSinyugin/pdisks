@@ -4,6 +4,7 @@
 
 mod commands;
 pub mod files;
+pub mod incident;
 pub mod repl;
 pub use commands::{Command, Invocation, execute};
 

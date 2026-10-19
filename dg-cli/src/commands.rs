@@ -50,6 +50,8 @@ pub enum Command {
     },
     /// Inspect a persistent unresolved attempt without acknowledging or retrying it.
     Incident,
+    /// Review and consciously confirm one incident during this same foreground invocation.
+    AcknowledgeIncident,
     /// Edit one living session using JSONL stdin and explicit save commands.
     Edit {
         /// Existing draft to open; history lasts only until this invocation exits.
@@ -68,6 +70,7 @@ impl Command {
                 | Self::New { .. }
                 | Self::Apply { .. }
                 | Self::Incident
+                | Self::AcknowledgeIncident
                 | Self::Edit {
                     live_rebase: true,
                     ..
@@ -151,6 +154,7 @@ impl Invocation {
                 }
             }
             ["incident", "show"] => Command::Incident,
+            ["incident", "acknowledge"] => Command::AcknowledgeIncident,
             ["plan", "edit"] => Command::Edit {
                 draft: take(&mut flags, "--draft")?,
                 live_rebase: manifest.is_some(),
@@ -272,6 +276,12 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
             Ok(serde_json::json!({"run": snapshot, "event_output_error": output_error}))
         }
         Command::Incident => Ok(serde_json::json!({"incident": app.incident()?})),
+        Command::AcknowledgeIncident => crate::incident::acknowledge(
+            app,
+            &mut std::io::stdin().lock(),
+            events,
+            &mut crate::incident::UnconfiguredPolicy,
+        ),
         Command::Edit { draft, live_rebase } => crate::repl::edit(
             app,
             draft,
@@ -283,7 +293,7 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
 }
 
 /// Flushes each live record before execution proceeds; writer failures do not authorize or undo effects.
-fn write_event(
+pub(crate) fn write_event(
     output: &mut dyn std::io::Write,
     event: &impl serde::Serialize,
 ) -> Result<(), Error> {
