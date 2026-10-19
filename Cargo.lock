@@ -49,6 +49,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dg-cli"
+version = "0.1.0"
+dependencies = [
+ "disksgraph",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
