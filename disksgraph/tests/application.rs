@@ -302,3 +302,140 @@ fn facade_apply_retains_actual_runs_errors_and_source_map_boundaries() -> Result
     assert_eq!(writes.get(), 0);
     Ok(())
 }
+
+/// Explicit release frees bounded slots and invalidates handles without touching recovery files.
+#[test]
+fn facade_releases_memory_without_acknowledging_incidents() -> Result<(), Box<dyn Error>> {
+    let (scratch, mut app, probes, writes) = support::application()?;
+    let session = app.create_session()?;
+    let frozen = app.freeze(session, app.revision(session)?)?;
+    let plan = app.import_plan(frozen.document().clone())?;
+    app.close_plan(plan)?;
+    assert_eq!(
+        app.export_plan(plan).err().ok_or("closed plan")?.code,
+        ErrorCode::UnknownPlan
+    );
+    app.close_session(session)?;
+    assert_eq!(
+        app.revision(session).err().ok_or("closed session")?.code,
+        ErrorCode::UnknownSession
+    );
+    let first = app.apply_frozen(&frozen)?;
+    for _ in 1..disksgraph::MAX_APPLICATION_OBJECTS {
+        app.apply_frozen(&frozen)?;
+    }
+    let before = probes.get();
+    assert_eq!(
+        app.apply_frozen(&frozen).err().ok_or("run limit")?.code,
+        ErrorCode::ResourceLimit
+    );
+    assert_eq!(probes.get(), before);
+    app.close_run(first)?;
+    assert_eq!(
+        app.run_snapshot(first).err().ok_or("closed run")?.code,
+        ErrorCode::UnknownRun
+    );
+    let next = app.apply_frozen(&frozen)?;
+    assert_ne!(first, next);
+    std::fs::write(scratch.0.join("active-attempt.json"), b"retained incident")?;
+    app.close_run(next)?;
+    assert_eq!(
+        std::fs::read(scratch.0.join("active-attempt.json"))?,
+        b"retained incident"
+    );
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
+
+/// Facade incident acknowledgment retains explicit confirmation and quiescence checks from runtime.
+#[test]
+fn facade_incident_review_requires_confirmation_and_independent_policy()
+-> Result<(), Box<dyn Error>> {
+    use disksgraph::model::{Bytes, ExternalId, LvmLvKind, NodeId, NodeKind};
+    use disksgraph::{
+        IncidentAcknowledgmentPolicy, IncidentInspection, LiveCheckStatus,
+        host::{
+            BackendId,
+            checkpoint::{ActiveAttempt, CHECKPOINT_SCHEMA_VERSION, TargetFingerprint},
+        },
+    };
+    /// This fixture has no native backend or outside writers, so only its explicit decision is tested.
+    struct Policy(bool);
+    impl IncidentAcknowledgmentPolicy for Policy {
+        /// Ordinary graph compatibility does not grant this independent authorization.
+        fn check(&mut self, _: &IncidentInspection, _: &IncidentInspection) -> LiveCheckStatus {
+            if self.0 {
+                LiveCheckStatus::Satisfied
+            } else {
+                LiveCheckStatus::Unknown {
+                    required_evidence: "fixture quiescence absent".into(),
+                }
+            }
+        }
+    }
+    let (scratch, mut app, probes, writes) = support::application()?;
+    assert!(app.incident()?.is_none());
+    assert_eq!(probes.get(), 0);
+    let session = app.create_session()?;
+    let document = app.export_draft(session)?;
+    let vg = document
+        .baseline
+        .snapshot
+        .graph
+        .nodes()
+        .find_map(|(id, node)| matches!(node.kind.kind, NodeKind::LvmVg { .. }).then_some(*id))
+        .ok_or("VG")?;
+    let marker = ActiveAttempt {
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        run_id: uuid::Uuid::now_v7(),
+        plan_id: uuid::Uuid::now_v7(),
+        action_id: disksgraph::ActionId::new(0),
+        operation_id: None,
+        action: ProviderAction::Lvm(storage_provider::LvmAction::CreateLv {
+            vg,
+            planned_node_id: NodeId::new(),
+            name: "data".into(),
+            size: Bytes::new(16 * 1024 * 1024),
+            layout: LvmLvKind::Linear,
+        }),
+        targets: vec![TargetFingerprint {
+            planned_id: vg,
+            external_ids: vec![ExternalId::LvmVgUuid("example-vg-uuid".into())],
+        }],
+        plan_digest: "a".repeat(64),
+        backend_id: BackendId::new("application-no-writes").ok_or("backend")?,
+    };
+    std::fs::write(scratch.0.join("active-attempt.json"), marker.to_bytes()?)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            scratch.0.join("active-attempt.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+    }
+    assert!(app.incident()?.is_some());
+    let review = app.review_incident()?.ok_or("review")?;
+    assert_eq!(
+        app.acknowledge_incident(review, uuid::Uuid::now_v7(), &mut Policy(true))
+            .err()
+            .ok_or("wrong challenge")?
+            .code,
+        ErrorCode::IncidentRejected
+    );
+    let review = app.review_incident()?.ok_or("review")?;
+    let challenge = review.confirmation_token();
+    assert_eq!(
+        app.acknowledge_incident(review, challenge, &mut Policy(false))
+            .err()
+            .ok_or("unknown safety")?
+            .code,
+        ErrorCode::IncidentRejected
+    );
+    assert!(scratch.0.join("active-attempt.json").exists());
+    let review = app.review_incident()?.ok_or("review")?;
+    let challenge = review.confirmation_token();
+    app.acknowledge_incident(review, challenge, &mut Policy(true))?;
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}

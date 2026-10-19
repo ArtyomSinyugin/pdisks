@@ -5,9 +5,13 @@
 
 mod error;
 mod handles;
+mod lifecycle;
 mod plans;
 mod runs;
 pub use runs::RunSnapshot;
+pub use storage_runtime::incident::{
+    IncidentAcknowledgmentPolicy, IncidentAssessment, IncidentInspection, IncidentReview,
+};
 mod sessions;
 pub use error::{DisksGraphError, ErrorCode};
 pub use handles::{PlanId, RunId, SessionId};
