@@ -41,8 +41,8 @@ pub use wire::{
 };
 
 pub use execution::{
-    ActionRunState, AdmissionReport, BackendCompletion, BackendOutcome, ExecutionContext,
-    ExecutionRun, ExecutionRunError, GoalVerificationReport, LiveCheck, LiveCheckStatus,
-    LiveExecutionChecks, LiveObservation, MAX_PROGRESS_BYTES, MAX_RUN_EVENTS, ObservationReference,
-    RunEvent, RunEventKind, VerificationReport,
+    ActionRunState, AdmissionReport, BackendCompletion, BackendOutcome, EventsPage,
+    ExecutionContext, ExecutionRun, ExecutionRunError, GoalVerificationReport, LiveCheck,
+    LiveCheckStatus, LiveExecutionChecks, LiveObservation, MAX_PROGRESS_BYTES, MAX_RUN_EVENTS,
+    ObservationReference, RunEvent, RunEventKind, VerificationReport,
 };

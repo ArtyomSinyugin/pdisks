@@ -251,6 +251,18 @@ pub struct RunEvent {
     pub kind: RunEventKind,
 }
 
+/// Bounded replay after an exclusive last-consumed cursor; a gap requires a fresh run snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventsPage {
+    /// All retained events newer than the requested cursor, in sequence order.
+    pub events: Vec<RunEvent>,
+    /// Last published sequence; pass this unchanged as `since` for the next page, initially zero.
+    pub next_sequence: u64,
+    /// True when at least one event newer than the requested cursor was already evicted.
+    pub gap: bool,
+}
+
 /// Retained evidence and state for one action, mutable only through run transitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActionRun {
@@ -344,6 +356,14 @@ pub enum ExecutionRunError {
     /// No transition may wrap the event cursor or partially publish a multi-event admission.
     #[error("run event sequence exhausted")]
     EventSequenceExhausted,
+    /// A future cursor cannot acknowledge events that this run has never published.
+    #[error("event cursor {requested} exceeds latest sequence {latest}")]
+    InvalidEventCursor {
+        /// Exclusive last-consumed sequence supplied by the client.
+        requested: u64,
+        /// Last event published by this run.
+        latest: u64,
+    },
     /// Provider progress cannot grow the bounded event buffer without a byte limit.
     #[error("progress exceeds {MAX_PROGRESS_BYTES} bytes")]
     ProgressTooLarge,
@@ -451,6 +471,26 @@ impl ExecutionRun {
     /// Returns why an invocation was left unclassified when a new probe could not be obtained.
     pub fn unknown_reason(&self, action: ActionId) -> Result<Option<&str>, ExecutionRunError> {
         Ok(self.action(action)?.unknown_reason.as_deref())
+    }
+
+    /// Returns bounded ordered replay and detects events lost since an exclusive cursor.
+    /// Future cursors are rejected so a client cannot silently skip subsequent updates.
+    pub fn events_page(&self, since: u64) -> Result<EventsPage, ExecutionRunError> {
+        let latest = self.next_event_sequence - 1;
+        if since > latest {
+            return Err(ExecutionRunError::InvalidEventCursor {
+                requested: since,
+                latest,
+            });
+        }
+        Ok(EventsPage {
+            events: self.events_since(since).cloned().collect(),
+            next_sequence: latest,
+            gap: self
+                .events
+                .front()
+                .is_some_and(|first| since < first.sequence - 1),
+        })
     }
 
     /// Returns ordered events after a client's last consumed sequence.
@@ -918,6 +958,44 @@ mod tests {
             run.record_verification(report)
                 .unwrap_or_else(|error| panic!("record verification: {error}"))
         );
+    }
+
+    /// Exclusive cursors report eviction gaps, reject future acknowledgments and resume without duplicates.
+    #[test]
+    fn event_pages_detect_gaps_at_the_exact_eviction_boundary() -> Result<(), ExecutionRunError> {
+        let mut run = ExecutionRun::new(&crate::wire::tests::document_fixture())?;
+        assert_eq!(
+            run.events_page(0)?,
+            EventsPage {
+                events: vec![],
+                next_sequence: 0,
+                gap: false
+            }
+        );
+        assert!(matches!(
+            run.events_page(1),
+            Err(ExecutionRunError::InvalidEventCursor { .. })
+        ));
+        for _ in 0..MAX_RUN_EVENTS + 3 {
+            run.push_event(RunEventKind::Progress {
+                action: ActionId::new(0),
+                detail: "observed progress".into(),
+            })?;
+        }
+        let page = run.events_page(0)?;
+        assert!(page.gap);
+        assert_eq!(page.events.len(), MAX_RUN_EVENTS);
+        let first = page.events[0].sequence;
+        assert!(!run.events_page(first - 1)?.gap);
+        assert!(run.events_page(first - 2)?.gap);
+        let next = run.events_page(page.next_sequence)?;
+        assert!(!next.gap);
+        assert!(next.events.is_empty());
+        assert_eq!(next.next_sequence, page.next_sequence);
+        run.push_event(RunEventKind::GoalVerification { verified: false })?;
+        assert_eq!(run.events_page(page.next_sequence)?.events.len(), 1);
+        assert!(serde_json::to_string(&page).is_ok());
+        Ok(())
     }
 
     /// Event identities survive eviction, oversized progress is rejected, and exhaustion is atomic.
