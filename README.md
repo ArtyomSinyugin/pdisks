@@ -588,7 +588,7 @@ runtime по-прежнему обязан доказать происхожде
 Runtime mount postconditions требуют ровно одну запись на Host target и
 UUID-correlated filesystem source (либо typed tmpfs). Дубликаты/overmount,
 unresolved source, отсутствие записи и неподдержанная namespace остаются Unknown;
-подтверждённый чужой source даёт Violated. Native mount writes пока не включены.
+подтверждённый чужой source даёт Violated. Условия native Mount описаны ниже.
 Runtime scope заново коррелирует typed mount sources, включая ФС вне изменяемого
 компонента. Смена transient ID и порядка options допустима; UUID replacement,
 клонированный UUID, новый target или неоднозначный mount target блокируют admission.
@@ -596,7 +596,7 @@ Runtime scope заново коррелирует typed mount sources, вклю�
 Сквозной native mock DAG содержит существующую ext4 на другом диске. Её transient
 ID меняется на каждом probe; UUID и mount semantics остаются основанием сравнения.
 Финальные option drift, overmount и filesystem UUID replacement не дают Verified
-run после успешных actions. Native mkfs/mount adapters этим не включаются.
+run после успешных actions. Эти pure checks сами по себе не разрешают native writes.
 
 `live::check_observed_goal()` независимо проверяет финальный фактический граф
 после UUID correlation, включая подтверждённые outputs, точные связи/размеры
@@ -626,8 +626,8 @@ Verified actions. При final Unknown повторная проверка по�
 проверяются по actual observations; persistent/managed boot/namespace adapters
 и production policies пока не реализованы. Default configuration остаётся read-only.
 
-C4 runtime поддерживает проверяемый ext4 prefix на явно настроенном dispatcher:
-`CreateLv → SetActivation → CreateFilesystem(ext4)`. Resolver принимает только
+C4 runtime поддерживает узкую вертикаль на явно настроенном dispatcher:
+`CreateLv → SetActivation → CreateFilesystem(ext4) → Mount(Host)`. Resolver принимает только
 подтверждённый LV этой попытки с active/writable endpoint evidence. Отдельные
 `check_consumer_exclusion()` и `check_destructive()` по умолчанию Unknown;
 обычный scope/authorization не подтверждает отсутствие потребителей и согласие
@@ -655,16 +655,29 @@ Native recipe получает `/proc/<parent-pid>/fd/<fd>`, проверяет 
 вызывает `bd_fs_mkfs(ext4)` без force, dry-run и extras, выполняет sync_all и проверяет
 свежие type/UUID/label и допустимую ext4 geometry. Произвольного path-параметра в
 provider write API нет; обычные файлы отвергаются. `NativeStorageAdapter` фиксирует
-отдельные LVM/FS регистрации; `backend_for(operation)` сверяется в whole-plan readiness
+отдельные LVM/FS/Mount регистрации (`new(lvm, filesystems, mounts)`); `backend_for(operation)` сверяется в whole-plan readiness
 и каждом dispatch. Он не добавляет положительных scope/approval/final policies.
-Mount dispatch пока не реализован и блокирует native DAG до первого write.
+`NativeMountAdapter` принимает только ext4 output этого же run и профиль
+`rw,nosuid,nodev,noexec,relatime` в Host namespace. Source удерживается через
+`LvBlockEndpoint`; существующий пустой target открывается через openat2 без symlinks.
+Libmount получает descriptor paths; у directory path обязателен завершающий `/`,
+иначе fd-based move_mount может отвергнуть конечный magic-link. Helpers, ambient
+fstab, mtab writes и read-only fallback отключены. Native status не заменяет fresh
+probe: runtime проверяет единственный target, filesystem UUID, точные options и
+неизменность остального scope. Checkpoint Mount включает VG/LV/FS fingerprints.
+Отдельная host policy должна исключать внешние source writers и изменения target
+и namespace на весь интервал; `check_mount_exclusion()` по умолчанию Unknown.
+Unmount, произвольные options, другие sources/namespaces и persist не реализованы.
 
 Native ABI success/failure проверены на частной C-библиотеке, которая меняет только
 свои записи в памяти. Только private unit ABI tests обходят block-type gate на
 новых sparse temporary files; публичный API такого обхода не предоставляет.
 Runtime тесты проверяют разные backend routes и сохранение checkpoint при отказе
-native descriptor guard. Успешный native ext4 на loop-VG/VM и исключение внешних
-writers в production ещё не проверены. C4 целиком не завершён.
+native descriptor guard. Контролируемая QEMU VM проверяет реальную четырёхшаговую
+цепочку через coordinator, отдельный final probe и запись/чтение файла на ext4.
+Отказ после arm на последнем шаге сохраняет checkpoint и запрещает retry.
+Исключение внешних writers в production и power loss не проверены. Критерий C4 для этого узкого
+сценария выполнен; эксплуатационные ограничения остаются отдельной работой. Стенд и воспроизводимые команды: [C4 VM](storage-runtime/tests/vm/README.md).
 
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся
