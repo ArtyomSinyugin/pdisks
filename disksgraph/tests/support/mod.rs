@@ -1,5 +1,7 @@
 //! Recorded observations and an adapter that must never write, for application boundary tests.
 
+// Shared with edition-2021 ABI tests; keep one import order across both rustfmt editions.
+#[rustfmt::skip]
 use disksgraph::{
     DisksGraph, LiveCheckStatus,
     host::{

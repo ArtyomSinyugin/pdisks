@@ -545,3 +545,34 @@ fn vm_library_refuses_an_unguarded_host() -> Result<(), Error> {
     assert_eq!(fs::read_dir(&scratch.0)?.count(), 0);
     Ok(())
 }
+
+/// Actual checked imports reopen saved-only owners without restoring dead runs or clearing evidence.
+#[test]
+fn checked_owner_preserves_recorded_coordinator_crash_checkpoint() -> Result<(), Error> {
+    let scratch = Scratch::new()?;
+    let bytes =
+        include_bytes!("../../storage-runtime/tests/fixtures/coordinator-active-attempt.json");
+    let attempt = disksgraph::host::checkpoint::ActiveAttempt::from_bytes(bytes)?;
+    let active = scratch.0.join("active-attempt.json");
+    fs::write(&active, bytes)?;
+    fs::set_permissions(&active, fs::Permissions::from_mode(0o600))?;
+    let api = Api::load(&library()?, "disksgraph")?;
+    for _ in 0..2 {
+        let opened = api.open(&scratch.config())?;
+        let context = opened["result"]["context"].as_u64().ok_or("context")?;
+        let old = api.method(context, "run_snapshot", json!({"run":attempt.run_id}))?;
+        assert_eq!(old["error"]["detail"]["code"], "unknown_run");
+        let imported = api.method(context, "session_import", json!({"draft":draft()?}))?;
+        let session = imported["result"]["session"].clone();
+        assert!(session.is_string(), "{imported}");
+        assert!(
+            api.method(context, "session_preview", json!({"session":session}))?["error"].is_null()
+        );
+        // Saved-only production contexts still cannot start writes merely because a marker is readable.
+        let started = api.method(context, "apply_start", json!({"plan":attempt.plan_id}))?;
+        assert_eq!(started["error"]["code"], "live_unavailable");
+        api.close(context)?;
+        assert_eq!(fs::read(&active)?, bytes);
+    }
+    Ok(())
+}
