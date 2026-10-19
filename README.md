@@ -631,7 +631,8 @@ C4 runtime поддерживает проверяемый ext4 prefix на яв
 подтверждённый LV этой попытки с active/writable endpoint evidence. Отдельные
 `check_consumer_exclusion()` и `check_destructive()` по умолчанию Unknown;
 обычный scope/authorization не подтверждает отсутствие потребителей и согласие
-на уничтожение содержимого. Endpoint facts ещё не являются удерживаемым native fd.
+на уничтожение содержимого. Native dispatch дополнительно требует удерживаемый endpoint;
+одних BlockFacts для вызова mkfs недостаточно.
 
 Receipt различает LV и filesystem UUID. Ext4 completion требует нового
 канонического UUID, единственной Present ФС с точным label, единственной Backs
@@ -642,9 +643,28 @@ UUID и первоначально наблюдённый размер ФС. И�
 Сквозные mock-тесты проверяют Verified run, смену transient IDs и сохранение
 checkpoint/запрет retry при ошибочных receipts, duplicate UUID, неверном владельце,
 label drift, дополнительных consumers и blocking diagnostics.
-Native ext4 mkfs, удержание/проверка device descriptors и mount dispatch ещё не
-реализованы; NativeLvmAdapter по-прежнему отклоняет FS actions до первого write.
-Это подготовка C4 runtime, а не завершение C4 или проверка на реальных дисках.
+`NativeExt4Adapter` использует execute-enabled `libbd_fs`: полная MKFS/QUERY ABI,
+UUID/label/no-discard options и зависимости проверяются до первого write.
+`LvBlockEndpoint` требует один `/dev` path без final symlink, проверяет через O_PATH
+block type и major/minor, затем удерживает открытый RW descriptor. До/после вызова
+сверяются capacity, logical/physical geometry и sysfs DM UUID/ro/size с VG/LV UUID.
+Guard не использует O_EXCL: host обязан исключать mounts, external writes и DM
+table changes на всё время dispatch и verification; default policy остаётся Unknown.
+
+Native recipe получает `/proc/<parent-pid>/fd/<fd>`, проверяет отсутствие сигнатуры,
+вызывает `bd_fs_mkfs(ext4)` без force, dry-run и extras, выполняет sync_all и проверяет
+свежие type/UUID/label и допустимую ext4 geometry. Произвольного path-параметра в
+provider write API нет; обычные файлы отвергаются. `NativeStorageAdapter` фиксирует
+отдельные LVM/FS регистрации; `backend_for(operation)` сверяется в whole-plan readiness
+и каждом dispatch. Он не добавляет положительных scope/approval/final policies.
+Mount dispatch пока не реализован и блокирует native DAG до первого write.
+
+Native ABI success/failure проверены на частной C-библиотеке, которая меняет только
+свои записи в памяти. Только private unit ABI tests обходят block-type gate на
+новых sparse temporary files; публичный API такого обхода не предоставляет.
+Runtime тесты проверяют разные backend routes и сохранение checkpoint при отказе
+native descriptor guard. Успешный native ext4 на loop-VG/VM и исключение внешних
+writers в production ещё не проверены. C4 целиком не завершён.
 
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся

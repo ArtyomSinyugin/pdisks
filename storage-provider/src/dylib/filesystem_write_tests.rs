@@ -63,7 +63,7 @@ fn native_ext4_mock_uses_retained_fd_and_checks_exact_readback()
 #[test]
 fn native_ext4_failure_matrix_retains_uncertainty_and_frees_results()
 -> Result<(), Box<dyn std::error::Error>> {
-    for scenario in 1..=20 {
+    for scenario in 1..=22 {
         let fixture = mock_ext4::Fixture::new(scenario, true)?;
         let backend = fixture.registry.backends().next().ok_or("backend")?;
         let LoadedBackendAccess::Library { library } = &backend.access else {

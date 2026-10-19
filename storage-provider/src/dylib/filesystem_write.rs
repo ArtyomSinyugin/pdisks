@@ -201,6 +201,13 @@ impl<'library> Api<'library> {
         }
         // SAFETY: successful features lookup returned the documented borrowed FeaturesRaw.
         let features = unsafe { &*features };
+        if features.min_size == 0
+            || (features.max_size != 0 && features.max_size < features.min_size)
+        {
+            return Err(NativeProbeError::InvalidData {
+                operation: "bd_fs_features",
+            });
+        }
         Ok((features.min_size, features.max_size))
     }
 }
@@ -301,6 +308,8 @@ pub(super) fn create(
         }
         .into());
     }
+    // A successful native call must reach the device before readback can justify clearing its checkpoint.
+    device.sync_all()?;
     let fs_type = api
         .read_type(&path)?
         .ok_or(FilesystemWriteError::ContentMismatch)?;

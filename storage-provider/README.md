@@ -398,13 +398,51 @@ filesystem-specific system utility. Its `bd_fs_can_*` API reports that runtime
 dependency. disksgraph exposes the missing utility as an environment capability; it
 does not create a second CLI fallback backend.
 
+## Guarded native ext4 creation
+
+`Ext4CreateRequest` accepts only positive 1024-aligned backing capacity, a canonical
+non-nil UUID and an optional nonempty label of at most 16 UTF-8 bytes. No path,
+force flag or arbitrary mkfs argument is accepted. `RegisteredBackend::create_ext4`
+requires an explicit `Execute` registration and a retained real block `File` with
+exact capacity; regular files cannot reach the public mutator.
+
+The libblockdev-fs adapter checks the complete create/readback ABI, ext4 MKFS/QUERY,
+label/UUID/no-discard support and native capacity constraints. Probe, readiness
+and write sessions share one mutex around plugin init/close. Native signature
+preflight distinguishes NULL-without-error from failed/ambiguous queries. Creation
+uses `bd_fs_mkfs` once with force/dry-run disabled, no-discard enabled, zeroed reserved
+options and no extra arguments. It flushes the retained descriptor before fresh
+signature and ext4-info queries verify type, UUID, label and bounded block geometry.
+GError messages stay private; only numeric error codes cross the boundary.
+
+The ABI follows the installed `blockdev/fs.h`, `fs/generic.h`, `fs/ext.h` and the
+upstream [generic implementation](https://github.com/storaged-project/libblockdev/blob/master/src/plugins/fs/generic.c)
+and [ext implementation](https://github.com/storaged-project/libblockdev/blob/master/src/plugins/fs/ext.c).
+The native path is derived internally as `/proc/<parent-pid>/fd/<fd>` so utility
+children can reopen the held endpoint despite CLOEXEC. Descriptor lifetime fixes
+addressing, not exclusion: the trusted runtime must retain guards against mounts,
+external writers and DM table changes through invocation and verification.
+Failure to access the descriptor path is an error, never a fallback to `/dev`.
+
+`storage-runtime::NativeExt4Adapter` obtains the retained LV descriptor only after
+UUID-qualified resolution, explicit consumer exclusion, destructive confirmation
+and checkpoint publication. `NativeStorageAdapter` fixes separate LVM/FS routes
+before whole-plan readiness and rechecks them for each dispatch. All default
+scope/consumer/final policies remain Unknown. Native mount support is still absent.
+
+Tests compile private C fixtures that never invoke host mkfs. Private unit ABI
+calls use newly owned sparse files to test descriptor addressing and every native
+error window; public APIs continue to reject such files. Successful native ext4 on
+controlled loop-VG/VM devices, power-loss behavior and production external-writer
+exclusion remain unverified.
+
 ## Implemented coverage and TODO
 
 `Probe` below means data is copied into typed Rust observations and, where
-applicable, joined into `CurrentState`. `Execute` remains disabled until the
-project has serializable actions, focused plan-generation tests, precondition
-checks, and rollback semantics. The backend manifest declares only operations
-that exist in the public Rust API today.
+applicable, joined into `CurrentState`. Normal manifests remain probe-only.
+Explicit execute registrations support the narrow linear-LV create/activation
+and guarded ext4 recipes described above; other mutations stay unavailable.
+The backend manifest declares only operations that exist in the public Rust API.
 
 | Provider | Implemented now | Required next work |
 |---|---|---|
@@ -414,7 +452,7 @@ that exist in the public Rust API today.
 | `libmount` | Runtime source, target, filesystem type and options | `fstab` parsing/writing, typed options, identity policy, pass number and ordering |
 | `libdevmapper` | Mapping name/UUID/device number, target names, dependencies and read-only state | Target parameter/status parsing for cache, writecache, integrity, verity and multipath; validated create/remove/resize plans |
 | `libcryptsetup` | LUKS version/UUID, cipher/mode, payload offset, sector/key/header area sizes and public keyslot states; payload capacity is reflected in `CurrentState` | PBKDF and token metadata, active mapping correlation, format/open/close/keyslot/resize/reencrypt plans |
-| `libbd_fs` | Supported filesystem list, static features, resize modes and actual host availability including required utilities | Typed validation requests; mkfs/check/repair/resize/label/UUID actions after the common action safety layer exists |
+| `libbd_fs` | Filesystem features and utility availability; execute-opt-in guarded ext4 creation with native readback | Controlled VM/loop-VG validation, production exclusion policies; check/repair/resize/label/UUID adapters |
 | `libbd_lvm` | PV/VG/LV identity, sizes/free space, missing/exported state, usage/progress, physical segments, origin/pool relations and basic segment type | Complete thin/cache/RAID role graph and all validated mutation plans |
 | `libbd_mdraid` | Active arrays, clean/degraded counts and diagnostics, status/bitmap, member superblock size/time/event freshness, and basic RAID layouts | Full RAID5/6/10 layout, member slot/role/state, resync progress and mutation plans |
 | `libbd_mpath` | Member paths joined to device-mapper multipath mappings | WWID identity, path state/priority, health and early path deduplication before content probing |
@@ -452,7 +490,7 @@ The target contract in `docs/storage-backend-spec.md` contains
 `probe_environment`, `scan`, `capabilities`, alignment/overhead queries,
 `validate`, create/destroy/modify planning, `execute`, and `rollback`.
 
-At present this crate implements native availability checks and read-only probe
-adapters plus the `libbd_fs`/Btrfs capability queries described above. Automatic native planning, execution, and rollback remain TODOs; pure fragment
-composition and simulation live in `storage-engine`. None is implied by loading
-a native library.
+This crate implements native availability/probe/capability queries and the explicit
+linear-LV create/activation and guarded ext4 recipes above. General native mutation
+coverage and rollback remain incomplete; pure fragment composition and simulation
+live in `storage-engine`. Loading a native library never authorizes execution.
