@@ -576,3 +576,27 @@ fn checked_owner_preserves_recorded_coordinator_crash_checkpoint() -> Result<(),
     }
     Ok(())
 }
+
+/// The separately loaded production ABI never echoes arbitrary method/configuration text in errors.
+#[test]
+fn checked_errors_redact_request_and_loader_context() -> Result<(), Error> {
+    let scratch = Scratch::new()?;
+    let api = Api::load(&library()?, "disksgraph")?;
+    let bad = api.open(
+        &json!({"abi_version":1,"protocol_version":1,"root":scratch.0,"SECRET-private-field":true}),
+    )?;
+    assert_eq!(bad["error"]["code"], "invalid_config");
+    assert_eq!(bad["error"]["detail"], disksgraph::diagnostics::REDACTED);
+    assert!(!bad.to_string().contains("SECRET"));
+    let failed = api.open(&json!({"abi_version":1,"protocol_version":1,"root":scratch.0,"manifest":scratch.0.join("SECRET-missing-manifest")}))?;
+    assert_eq!(failed["error"]["code"], "open_failed");
+    assert_eq!(failed["error"]["detail"], disksgraph::diagnostics::REDACTED);
+    let opened = api.open(&scratch.config())?;
+    let context = opened["result"]["context"].as_u64().ok_or("context")?;
+    let value = api.method(context, "SECRET-private-method", json!({}))?;
+    assert_eq!(value["error"]["code"], "invalid_request");
+    assert_eq!(value["error"]["detail"], disksgraph::diagnostics::REDACTED);
+    assert!(!value.to_string().contains("SECRET"));
+    api.close(context)?;
+    Ok(())
+}

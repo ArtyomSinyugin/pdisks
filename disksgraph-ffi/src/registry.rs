@@ -34,7 +34,7 @@ static CONTEXTS: OnceLock<Mutex<HashMap<u64, Arc<Mutex<Context>>>>> = OnceLock::
 #[serde(tag = "code", content = "detail", rename_all = "snake_case")]
 pub enum Error {
     /// Invalid or unknown configuration fields.
-    InvalidConfig(String),
+    InvalidConfig(#[serde(serialize_with = "disksgraph::diagnostics::serialize_message")] String),
     /// The checked signature version does not match the caller's intended API contract.
     UnsupportedAbiVersion(u64),
     /// Future JSON versions cannot silently become old method calls.
@@ -50,7 +50,7 @@ pub enum Error {
     /// A concurrent call owns this context; there is no unbounded request queue.
     Busy,
     /// Provider/root configuration or thread startup failed.
-    OpenFailed(String),
+    OpenFailed(#[serde(serialize_with = "disksgraph::diagnostics::serialize_message")] String),
     /// The owner stopped and cannot safely continue processing requests.
     Stopped,
     /// Panic contained inside this library; the failed owner is never resumed automatically.
@@ -455,6 +455,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Transport-owned parse/loader diagnostics are opaque even before the facade exists.
+    #[test]
+    fn transport_error_json_omits_raw_configuration_context() -> Result<(), serde_json::Error> {
+        for error in [
+            Error::InvalidConfig("SECRET-request-echo".into()),
+            Error::OpenFailed("SECRET-native-path".into()),
+        ] {
+            let value = serde_json::to_value(&error)?;
+            assert_eq!(value["detail"], disksgraph::diagnostics::REDACTED);
+            assert!(!value.to_string().contains("SECRET"));
+        }
+        Ok(())
     }
 
     /// Failed opens release capacity; close joins even while another caller still owns the entry's Arc.

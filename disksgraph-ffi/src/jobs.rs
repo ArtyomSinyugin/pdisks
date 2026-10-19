@@ -100,6 +100,44 @@ mod tests {
     use super::*;
     use disksgraph::RunEventKind;
 
+    /// Polling serializes protected event text while retaining the original provider message in Rust.
+    #[test]
+    fn mailbox_poll_redacts_progress_without_changing_cursors(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let job = Job::new().map_err(|error| format!("{error:?}"))?;
+        let run_id = serde_json::from_value(json!("00000000-0000-7000-8000-000000000001"))?;
+        let mut state = job.progress.lock().map_err(|error| error.to_string())?;
+        state.events = EventsPage {
+            events: vec![disksgraph::RunEvent {
+                run_id,
+                sequence: 1,
+                kind: RunEventKind::Progress {
+                    action: disksgraph::ActionId::new(0),
+                    detail: "SECRET-native-progress".into(),
+                },
+            }],
+            next_sequence: 1,
+            gap: false,
+        };
+        drop(state);
+        let value = job.poll(0).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(value["events"]["next_sequence"], 1);
+        assert_eq!(
+            value["events"]["events"][0]["kind"]["progress"]["detail"],
+            disksgraph::diagnostics::REDACTED
+        );
+        assert!(!value.to_string().contains("SECRET"));
+        assert_eq!(
+            job.poll(1).map_err(|error| format!("{error:?}"))?["events"]["events"],
+            json!([])
+        );
+        let state = job.progress.lock().map_err(|error| error.to_string())?;
+        assert!(
+            matches!(&state.events.events[0].kind, RunEventKind::Progress { detail, .. } if detail == "SECRET-native-progress")
+        );
+        Ok(())
+    }
+
     /// Polling never fabricates pre-run evidence and preserves engine eviction/cursor rules on finish.
     #[test]
     fn mailbox_is_bounded_and_rejects_future_cursors() -> Result<(), String> {
