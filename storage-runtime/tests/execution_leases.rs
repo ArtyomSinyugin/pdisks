@@ -350,3 +350,32 @@ fn root_retains_the_opened_directory() -> Result<(), Box<dyn Error>> {
     drop(guard);
     Ok(())
 }
+
+/// Private but unusable or special-mode directories cannot satisfy the shared execution policy.
+#[test]
+fn root_requires_exact_0700_and_rechecks_retained_descriptors() -> Result<(), Box<dyn Error>> {
+    let _process = PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let scratch = Scratch::new()?;
+    let path = scratch.0.join("root");
+    fs::DirBuilder::new().mode(0o700).create(&path)?;
+    let root = ExecutionRoot::open(&path)?;
+    for mode in [0o000, 0o500, 0o600, 0o710, 0o1700, 0o2700, 0o4700] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+        assert!(ExecutionRoot::open(&path).is_err(), "open mode {mode:o}");
+        assert!(
+            matches!(root.try_lock_host(), Err(LeaseError::InsecureDirectory)),
+            "retained mode {mode:o}"
+        );
+        assert!(!path.join("execution.lock").exists());
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    fs::remove_dir(&path)?;
+    assert!(matches!(
+        root.try_lock_host(),
+        Err(LeaseError::InsecureDirectory)
+    ));
+    assert_eq!(fs::read_dir(&scratch.0)?.count(), 0);
+    Ok(())
+}

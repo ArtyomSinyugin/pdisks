@@ -23,8 +23,8 @@ pub enum LeaseError {
     /// Opening, inspecting, or locking the file failed.
     #[error(transparent)]
     Io(#[from] io::Error),
-    /// Only an existing private directory owned by the effective user is supported.
-    #[error("lease directory must be private and owned by the effective user")]
+    /// Only a linked mode-0700 directory owned by the effective user is supported.
+    #[error("lease directory must have mode 0700 and be owned by the effective user")]
     InsecureDirectory,
     /// Existing lock files must be regular, private, singly linked, and owned by this user.
     #[error("invalid execution lock file")]
@@ -56,7 +56,7 @@ impl ExecutionRoot {
         })
     }
 
-    /// Opens a caller-configured directory and rejects public or foreign-owned roots.
+    /// Opens a caller-configured mode-0700 directory and rejects unlinked or foreign-owned roots.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LeaseError> {
         let directory = openat(
             CWD,
@@ -65,19 +65,13 @@ impl ExecutionRoot {
             Mode::empty(),
         )
         .map_err(io::Error::from)?;
-        let info = fstat(&directory).map_err(io::Error::from)?;
-        if info.st_uid != geteuid().as_raw() || info.st_mode & 0o077 != 0 {
-            return Err(LeaseError::InsecureDirectory);
-        }
+        validate_directory(&directory)?;
         Ok(Self { directory })
     }
 
     /// Acquires the shared nonblocking lock without reconstructing any execution run.
     pub fn try_lock_host(&self) -> Result<HostExecutionLock, LeaseError> {
-        let info = fstat(&self.directory).map_err(io::Error::from)?;
-        if info.st_uid != geteuid().as_raw() || info.st_mode & 0o077 != 0 {
-            return Err(LeaseError::InsecureDirectory);
-        }
+        validate_directory(&self.directory)?;
         let lock = openat(
             &self.directory,
             LOCK_FILE,
@@ -97,12 +91,18 @@ impl ExecutionRoot {
             directory: self.directory.try_clone()?,
             _lock: lock,
         };
-        let info = fstat(host_lock.directory()).map_err(io::Error::from)?;
-        if info.st_uid != geteuid().as_raw() || info.st_mode & 0o077 != 0 {
-            return Err(LeaseError::InsecureDirectory);
-        }
+        validate_directory(host_lock.directory())?;
         Ok(host_lock)
     }
+}
+
+/// Enforces the documented directory policy again on retained descriptors before use.
+fn validate_directory(directory: &OwnedFd) -> Result<(), LeaseError> {
+    let info = fstat(directory).map_err(io::Error::from)?;
+    if info.st_uid != geteuid().as_raw() || info.st_mode & 0o7777 != 0o700 || info.st_nlink == 0 {
+        return Err(LeaseError::InsecureDirectory);
+    }
+    Ok(())
 }
 
 /// Ensures the held descriptor still names the private permanent lock in this root.
