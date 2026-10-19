@@ -548,6 +548,7 @@ mod coordination {
                 return Ok(ExecutionReceipt {
                     outcome: BackendOutcome::Succeeded,
                     created_lv_uuid: None,
+                    created_filesystem_uuid: None,
                 });
             }
             if self.break_probe {
@@ -656,6 +657,7 @@ mod coordination {
                 Ok(ExecutionReceipt {
                     outcome: self.outcome.clone(),
                     created_lv_uuid: self.created_uuid.clone(),
+                    created_filesystem_uuid: None,
                 })
             }
         }

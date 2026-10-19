@@ -255,6 +255,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
                     reason: error.to_string(),
                 },
                 created_lv_uuid: None,
+                created_filesystem_uuid: None,
             });
         let post = match self.host.probe() {
             Ok(post) => post,

@@ -91,6 +91,7 @@ impl BackendDispatcher for NativeLvmAdapter<'_> {
                 Ok(ExecutionReceipt {
                     outcome: BackendOutcome::Succeeded,
                     created_lv_uuid: Some(uuid),
+                    created_filesystem_uuid: None,
                 })
             }
             ProviderAction::Lvm(LvmAction::SetActivation { active: true, .. }) => {
@@ -111,6 +112,7 @@ impl BackendDispatcher for NativeLvmAdapter<'_> {
                 Ok(ExecutionReceipt {
                     outcome: BackendOutcome::Succeeded,
                     created_lv_uuid: None,
+                    created_filesystem_uuid: None,
                 })
             }
             _ => Err(DispatchError::Adapter(
