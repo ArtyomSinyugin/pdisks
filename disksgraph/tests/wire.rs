@@ -142,3 +142,47 @@ fn owned_native_configuration_preserves_explicit_missing_evidence() -> Result<()
     );
     Ok(())
 }
+
+/// Job vocabulary is strict; a synchronous adapter cannot silently execute an asynchronous request.
+#[test]
+fn job_requests_require_an_owner_and_observed_apply_preserves_final_evidence()
+-> Result<(), Box<dyn Error>> {
+    let (_scratch, mut app, probes, writes) = support::application()?;
+    let session = app.create_session()?;
+    let frozen = app.freeze(session, app.revision(session)?)?;
+    let plan = app.import_plan(frozen.document().clone())?;
+    let mut protocol = Protocol::new(app, true);
+    let before = probes.get();
+    for (method, params) in [
+        ("apply_start", json!({"plan":plan})),
+        ("job_poll", json!({"job":1,"since":0})),
+        ("job_close", json!({"job":1})),
+        ("job_cancel", json!({"job":1})),
+    ] {
+        assert_eq!(
+            call(&mut protocol, method, params)?["error"]["code"],
+            "unsupported_operation"
+        );
+    }
+    assert_eq!(probes.get(), before);
+    assert_eq!(
+        call(
+            &mut protocol,
+            "job_poll",
+            json!({"job":1,"since":0,"extra":true})
+        )?["error"]["code"],
+        "invalid_request"
+    );
+    let mut updates = Vec::new();
+    let terminal =
+        protocol.apply_plan_with_updates(plan, &mut |snapshot, _| updates.push(snapshot))?;
+    assert!(updates.iter().any(|snapshot| !snapshot.execution.finished));
+    assert_eq!(serde_json::to_value(updates.last())?, terminal);
+    let run = terminal["run_id"].clone();
+    assert_eq!(
+        call(&mut protocol, "run_snapshot", json!({"run":run}))?["result"],
+        terminal
+    );
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}

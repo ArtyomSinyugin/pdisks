@@ -7,7 +7,7 @@ use storage_runtime::{
     authorization::AuthorizationContext, capability::BackendCapabilityCheck, host::LinuxLiveHost,
 };
 
-/// Initial synchronous protocol; asynchronous jobs are deliberately not advertised by this version.
+/// Application protocol version; owner transports may implement the job lifecycle methods.
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Bound checked before parsing an entire application request, including nested documents.
 pub const MAX_REQUEST_BYTES: usize = MAX_PLAN_JSON_BYTES;
@@ -66,6 +66,14 @@ pub enum Request {
     },
     /// Execute synchronously through the existing coordinator and retain failed attempts.
     ApplyBlocking { plan: PlanId },
+    /// Queue one application attempt on a transport that owns a background worker.
+    ApplyStart { plan: PlanId },
+    /// Read a passive job snapshot and bounded events without waiting for the worker.
+    JobPoll { job: u64, since: u64 },
+    /// Release a terminal job mailbox, independently of its retained facade run.
+    JobClose { job: u64 },
+    /// Explicit cancellation request; transports must reject unsupported interruption.
+    JobCancel { job: u64 },
     /// Obtain complete retained evidence, independently of event eviction.
     RunSnapshot { run: RunId },
     /// Replay using the last-consumed exclusive cursor.
@@ -85,6 +93,7 @@ impl Request {
                 | Self::SessionCreate {}
                 | Self::Capabilities { .. }
                 | Self::ApplyBlocking { .. }
+                | Self::ApplyStart { .. }
                 | Self::IncidentInspect {}
         )
     }
@@ -116,6 +125,9 @@ pub enum ProtocolError {
     /// The context explicitly supports saved inputs only.
     #[error("native provider configuration is required for this method")]
     LiveUnavailable,
+    /// The synchronous adapter has no background owner, or the requested interruption is unsupported.
+    #[error("operation requires an owner transport or is unsupported: {0}")]
+    UnsupportedOperation(String),
     /// The sole facade supplies detailed stable codes and instance ownership checks.
     #[error(transparent)]
     Application(#[from] DisksGraphError),
@@ -179,6 +191,23 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>
     pub fn call_json(&mut self, input: &str) -> String {
         encode_reply(parse_request(input).and_then(|request| self.call(request)))
     }
+    /// Executes the same application path with passive updates for a transport-owned background job.
+    /// The transport must serialize facade access and retain its owner until this returns.
+    pub fn apply_plan_with_updates(
+        &mut self,
+        plan: PlanId,
+        observer: &mut dyn FnMut(RunSnapshot, EventsPage),
+    ) -> Result<Value, ProtocolError> {
+        if !self.live_host {
+            return Err(ProtocolError::LiveUnavailable);
+        }
+        let run = match self.app.apply_plan_with_updates(plan, observer) {
+            Ok(run) => run,
+            Err(error) => error.run_id.ok_or(error)?,
+        };
+        serde_json::to_value(self.app.run_snapshot(run)?)
+            .map_err(|error| ProtocolError::Serialization(error.to_string()))
+    }
     /// Delegates every implemented method to the instance-owned facade.
     pub fn call(&mut self, request: Request) -> Result<Value, ProtocolError> {
         if request.needs_live_host() && !self.live_host {
@@ -231,6 +260,14 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>
                     Err(error) => error.run_id.ok_or(error)?,
                 };
                 serde_json::to_value(self.app.run_snapshot(run)?)
+            }
+            Request::ApplyStart { .. }
+            | Request::JobPoll { .. }
+            | Request::JobClose { .. }
+            | Request::JobCancel { .. } => {
+                return Err(ProtocolError::UnsupportedOperation(
+                    "job lifecycle requires an owning transport".into(),
+                ));
             }
             Request::RunSnapshot { run } => serde_json::to_value(self.app.run_snapshot(run)?),
             Request::RunEvents { run, since } => serde_json::to_value(self.app.events(run, since)?),
