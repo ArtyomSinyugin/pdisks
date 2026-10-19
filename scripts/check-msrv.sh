@@ -22,3 +22,6 @@ cd "$repo_dir"
 # Isolate compiler artifacts; tests still load the actual newly built cdylib beside their executable.
 RUSTC="$msrv_bin/rustc" CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$repo_dir/target/msrv-1.88.0" \
     "$msrv_bin/cargo" test --workspace --all-targets --locked --offline
+# The shipped client is a separate Cargo workspace with no path dependency on the application.
+RUSTC="$msrv_bin/rustc" CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$repo_dir/target/msrv-1.88.0" \
+    "$msrv_bin/cargo" build --manifest-path packaging/consumer/Cargo.toml --locked --offline

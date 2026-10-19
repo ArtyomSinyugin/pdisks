@@ -24,6 +24,9 @@ install -Dm644 LICENSE "$bundle_dir/share/doc/disksgraph/LICENSE"
 install -Dm644 Cargo.lock "$bundle_dir/share/doc/disksgraph/Cargo.lock"
 install -Dm644 disksgraph-ffi/README.md "$bundle_dir/share/doc/disksgraph/ABI.md"
 install -Dm644 packaging/README.md "$bundle_dir/README.md"
+for source in Cargo.toml Cargo.lock src/main.rs src/api.rs; do
+    install -Dm644 "packaging/consumer/$source" "$bundle_dir/consumer/$source"
+done
 {
     "${RUSTC:-rustc}" --version --verbose
     "${CARGO:-cargo}" --version

@@ -1,7 +1,7 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 //! Checked-import consumer for the separately built guarded VM library, with historical Rust parity.
 
-#[path = "../tests/support/dylib.rs"]
+#[path = "../../packaging/consumer/src/api.rs"]
 mod dylib;
 #[path = "../../dg-cli/examples/support/guest.rs"]
 pub mod guest;

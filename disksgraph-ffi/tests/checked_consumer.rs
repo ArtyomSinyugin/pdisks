@@ -2,7 +2,7 @@
 
 //! Separately linked consumer executable, loading the real cdylib exclusively through Stabby reports.
 
-#[path = "support/dylib.rs"]
+#[path = "../../packaging/consumer/src/api.rs"]
 mod dylib;
 
 use dylib::{Api, Error};
