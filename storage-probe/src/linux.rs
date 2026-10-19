@@ -423,11 +423,6 @@ impl StateProvider for NativeSystemProvider<'_> {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        state.mounts = mount_entries
-            .into_iter()
-            .map(|entry| observed_mount(entry, Some(&state.graph)))
-            .collect();
-
         let btrfs = match self.btrfs_subvolumes.probe_btrfs(&btrfs_mountpoints) {
             Ok(entries) => entries,
             Err(error) => {
@@ -450,11 +445,34 @@ impl StateProvider for NativeSystemProvider<'_> {
             }
         };
         enrich_btrfs_filesystems(&mut state.graph, &btrfs_filesystems);
+        collect_system_mounts(&mut state, mount_entries);
         enrich_btrfs(&mut state.graph, &state.mounts, &btrfs);
         state.diagnostics.extend(enrich_zfs(&mut state.graph, &zfs));
         enrich_nvme(&mut state.graph, &nvme);
         Ok(state)
     }
+}
+
+/// Keeps unresolved native mount paths as evidence, without inventing graph nodes or coverage.
+fn collect_system_mounts(state: &mut ProviderState, entries: Vec<storage_provider::LibmountEntry>) {
+    state.mounts = entries.into_iter().map(|entry| {
+        let source = entry.source.to_string_lossy().into_owned();
+        let mut mount = observed_mount(entry, Some(&state.graph));
+        if let MountSource::Filesystem(id) = mount.source
+            && state.graph.node(&id).is_none()
+        {
+            state.diagnostics.push(Diagnostic {
+                code: "mount.unresolved_source".into(),
+                severity: DiagnosticSeverity::Error,
+                subjects: vec![DiagnosticSubject::Environment],
+                message: "native mount source is absent from the observed storage graph".into(),
+                evidence: Some(format!("source={source}; target={}", mount.target.display())),
+                suggested_remedy: Some("inspect device visibility and filesystem probe diagnostics in this namespace".into()),
+            });
+            mount.source = MountSource::Other(source);
+        }
+        mount
+    }).collect();
 }
 
 impl NativeBlockProvider<'_> {
@@ -2600,6 +2618,29 @@ mod tests {
         );
 
         assert_eq!(mount.source, MountSource::Filesystem(content_id));
+    }
+
+    /// Namespace-hidden sources stay visible without dangling IDs; uncertainty remains blocking.
+    #[test]
+    fn unresolved_native_mount_has_blocking_diagnostic_and_raw_source() {
+        let mut state = ProviderState::default();
+        super::collect_system_mounts(
+            &mut state,
+            vec![storage_provider::LibmountEntry {
+                source: "/dev/hidden-root".into(),
+                target: "/".into(),
+                filesystem_type: "ext4".into(),
+                options: vec!["ro".into()],
+            }],
+        );
+        assert_eq!(
+            state.mounts[0].source,
+            MountSource::Other("/dev/hidden-root".into())
+        );
+        assert_eq!(state.mounts[0].options, vec!["ro"]);
+        assert_eq!(state.diagnostics[0].code, "mount.unresolved_source");
+        assert_eq!(state.diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(state.graph.nodes().count(), 0);
     }
 
     /// Ensures native partial observations become one connected canonical graph.
