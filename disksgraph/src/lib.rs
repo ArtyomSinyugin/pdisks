@@ -5,9 +5,11 @@
 
 mod error;
 mod handles;
+mod plans;
 mod sessions;
 pub use error::{DisksGraphError, ErrorCode};
 pub use handles::{PlanId, RunId, SessionId};
+pub use plans::MAX_PLAN_JSON_BYTES;
 pub use storage_core::model;
 pub use storage_engine::editing::{
     DraftDocument, DraftRevision, EditReceipt, FrozenPlan, OperationId, PlanEdit, PlanRequest,
@@ -77,6 +79,8 @@ pub struct DisksGraph<H, D> {
     dispatcher: D,
     /// Opaque facade handles never reuse imported session identities.
     sessions: HashMap<SessionId, PlanSession>,
+    /// Imported documents remain historical data, independently of editing sessions and live runs.
+    plans: HashMap<PlanId, PlanDocument>,
 }
 impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
     /// Validates an existing private execution directory; never installs a permissive default policy.
@@ -86,6 +90,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
             host,
             dispatcher,
             sessions: HashMap::new(),
+            plans: HashMap::new(),
         })
     }
     /// Performs an actual provider pass without exposing a forecast as current state.

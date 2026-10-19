@@ -163,3 +163,49 @@ fn facade_bounds_sessions_before_probing() -> Result<(), Box<dyn Error>> {
     assert_eq!(writes.get(), 0);
     Ok(())
 }
+
+/// Imported descriptions are reanalysed and immutable; identical saved UUIDs never share facade handles.
+#[test]
+fn facade_plan_import_revalidates_data_and_owns_immutable_handles() -> Result<(), Box<dyn Error>> {
+    let (_scratch, mut app, _, writes) = support::application()?;
+    let session = app.create_session()?;
+    let frozen = app.freeze(session, app.revision(session)?)?;
+    let json = frozen.document().canonical_json()?;
+    let first = app.import_plan_json(&json)?;
+    let second = app.import_plan(frozen.document().clone())?;
+    assert_ne!(first, second);
+    assert_ne!(first.as_uuid(), frozen.document().plan_id);
+    let mut modified = app.export_plan(first)?;
+    modified.schema_version = u32::MAX;
+    assert_eq!(
+        app.import_plan(modified)
+            .err()
+            .ok_or("version must fail")?
+            .code,
+        ErrorCode::InvalidPlan
+    );
+    assert_eq!(app.export_plan(first)?, *frozen.document());
+    let (_other_root, mut other, _, _) = support::application()?;
+    other.import_plan_json(&json)?;
+    assert_eq!(
+        other.export_plan(first).err().ok_or("foreign plan")?.code,
+        ErrorCode::UnknownPlan
+    );
+    let huge = " ".repeat(disksgraph::MAX_PLAN_JSON_BYTES + 1);
+    assert_eq!(
+        app.import_plan_json(&huge)
+            .err()
+            .ok_or("bounded parse")?
+            .code,
+        ErrorCode::ResourceLimit
+    );
+    for _ in 2..disksgraph::MAX_APPLICATION_OBJECTS {
+        app.import_plan_json(&json)?;
+    }
+    assert_eq!(
+        app.import_plan_json(&json).err().ok_or("plan limit")?.code,
+        ErrorCode::ResourceLimit
+    );
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
