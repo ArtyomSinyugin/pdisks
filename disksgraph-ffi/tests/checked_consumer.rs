@@ -67,6 +67,8 @@ fn checked_import_preserves_editing_parity_and_rejects_foreign_handles() -> Resu
     let api = Api::load(&library()?, "disksgraph")?;
     assert_eq!(api.version()?, 1);
     assert!(api.rejects_wrong_signature());
+    // Guest-only host exports belong exclusively to the separately built acceptance artifact.
+    assert!(Api::load(&library()?, "disksgraph_vm")?.version().is_err());
     assert_eq!(
         api.open(&json!({"abi_version":99}))?["error"]["code"],
         "unsupported_abi_version"

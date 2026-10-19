@@ -172,7 +172,8 @@ source map и отказ после arm. CLI C6 описан ниже.
 imports и versioned JSON, включая один bounded apply job на context и passive
 snapshot/events polling. Reviewed rebase и incident confirmation используют
 context-owned handles; default incident safety policy остаётся Unknown.
-Положительная native write приёмка через ABI ещё не выполнена.
+Положительная и отказная native VM приёмка через отдельно загружаемую тестовую
+`.so` прошли с явным guarded guest host; production constructor остаётся read-only.
 Disks preview остаётся отключённым.
 
 ## CLI C6 — сохранённые черновики и foreground apply

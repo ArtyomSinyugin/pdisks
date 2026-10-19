@@ -1,9 +1,10 @@
-# Native recipe through the Rust facade and C6 CLI command adapter
+# Native recipe through Rust, CLI and checked Stabby imports
 
 The experiment runs `CreateLv → SetActivation → CreateFilesystem(ext4) → Mount(Host)`
 through `disksgraph::DisksGraph` and the real `ExecutionCoordinator`.
-The shared guest example now lives in `dg-cli/examples/c6_vm.rs`; it imports neither
-`storage-engine` nor `storage-provider` directly. Probe, session creation, editing,
+The Rust/CLI workflow lives in `dg-cli/examples/c6_vm.rs`; native registrations,
+probe, policies and dispatcher are shared in `dg-cli/examples/support/guest.rs`.
+They import neither `storage-engine` nor `storage-provider` directly. Probe, session creation, editing,
 preview, freeze, apply, events, snapshots and incident inspection use the facade. Each action requires a durable checkpoint
 and held lock before entering the actual installed native adapter. Actual LVM,
 blkid, libmount and sysfs observations supply verification; the separate final probe
@@ -29,6 +30,8 @@ python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso
 python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --case mount-target-change
 python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --interface cli
 python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --interface cli --case mount-target-change
+python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --interface ffi
+python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --interface ffi --case mount-target-change
 ```
 
 `--interface rust` (default) exercises the direct facade route. `--interface cli`
@@ -47,6 +50,41 @@ policy; the test does not weaken comparison or claim backend quiescence.
 
 This tests the command adapter with trusted guest configuration; the ordinary
 `dg-cli` executable still has no permissive production write policy or VM bypass flag.
+
+`--interface ffi` builds the separate `c7_vm` checked-import consumer and
+`libc7_vm_library.so` acceptance artifact. The library's `disksgraph_vm_*` symbols
+have the same owned-string signatures and Stabby reports as production exports.
+Its fixed guarded host factory calls the ordinary `transport::Worker::serve`; it
+adds no execution, polling, checkpoint or retry loop. Production `disksgraph_open`
+still constructs a read-only host and has no VM/write-policy flag. A host-side
+ignored integration test proves the VM factory refuses an unguarded machine.
+The portable consumer also checks VM symbols are absent from the production cdylib.
+
+The ABI workflow creates/edits/previews/freezes through the loaded library, then
+checks saved-input preview and canonical plan parity against direct Rust, ignoring
+only the newly allocated plan ID. The guest consumer explicitly supplies the
+reviewed digest and destructive LV scope through fixed private `/run/c7-review.json`
+after freezing; this trusted guest configuration is outside application requests.
+It is read once by the same guest approval policy and bound to the first actual
+run UUID. This file is not an available production approval channel.
+
+ABI start/poll must expose an unfinished snapshot during real native execution.
+Every exclusive event page is accumulated and compared with retained run events;
+final snapshot must equal ordinary `run_snapshot`. Success checks four Verified,
+fresh independent final evidence and a proof-file round trip on real ext4. Closing
+the context leaves only `execution.lock` in its execution root.
+
+ABI failure checks the same three Verified and Mount OutcomeUnknown as Rust/CLI.
+Another apply fails on the marker before a fifth native entry. Inspection matches
+its exact three-fingerprint checkpoint and exact-token acknowledgment is refused.
+As with CLI, transient NodeIds may trigger Changed before default Unknown safety;
+backend quiescence is not claimed. Close preserves the checkpoint. Reopening the
+context loses historical run handles, retains the exact marker and refuses apply
+without any native dispatch. The runner requires `C7_ABI_VERIFIED` and
+`C7_LIVE_POLL_VERIFIED`, plus failure-specific `C7_INCIDENT_REFUSAL_VERIFIED` and
+`C7_CLOSE_PRESERVATION_VERIFIED`. Four observed native adapter entries are required
+in the original context, zero in the reopened one. Default production writes and
+native incident acknowledgment remain unavailable.
 
 Each command creates its own directory under Python's temporary directory and
 prints its location. The image, serial log and generated initramfs are retained

@@ -2,14 +2,13 @@
 //! Rust and CLI routes share one facade and explicit guest-only host policies.
 //! This isolated guest policy is deliberately not a production authorization policy.
 
+// Shared by edition-2024 CLI and edition-2021 ABI examples, whose rustfmt import ordering differs.
+#[rustfmt::skip]
 use disksgraph::host::{
     BACKEND_MANIFEST_VERSION, BackendCapability, BackendId, BackendLibrary, BackendManifest,
     BackendManifests, BackendRegistry, LvmVgObservation, ProviderAction, ProviderConnectionKind,
-    RegisteredBackend,
-};
-use disksgraph::host::{ExecutionContext, ExecutionRunError};
-use disksgraph::host::{LinuxProbe, ProviderProbeError, ProviderState, StateProvider};
-use disksgraph::host::{
+    RegisteredBackend, ExecutionContext, ExecutionRunError,
+    LinuxProbe, ProviderProbeError, ProviderState, StateProvider,
     authorization::{ApprovalRequest, AuthorizationContext},
     capability::{BackendCapabilityCheck, OperationAvailability},
     checkpoint::ActiveAttempt,

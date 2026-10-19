@@ -184,7 +184,7 @@ Consumer обязан закрыть все contexts и освободить в�
 ```sh
 cargo test -p disksgraph-ffi --offline
 DISKSGRAPH_NATIVE_MANIFEST="$PWD/storage-probe/tests/providers.live.example.json" \
-  cargo test -p disksgraph-ffi --test checked_consumer --offline -- --ignored --test-threads=1
+  cargo test -p disksgraph-ffi --test checked_consumer --offline native_ -- --ignored --test-threads=1
 ```
 
 Вторая проверка требует установленных native libraries; она проверяет повторные
@@ -199,7 +199,49 @@ Busy, отказ cancellation и join-before-close-return; искусствен�
 включена в production config. Недоступные host subsystems
 могут давать diagnostics: тест не доказывает completeness наблюдения.
 
+Rust embedding может вызвать `transport::open_with(config, factory)`: factory
+создаёт host на его worker thread, сохраняет native registrations в своей области
+жизни и передаёт facade в `Worker::serve`. Это тот же protocol/job loop и coordinator.
+Close join-ит всю factory, включая drop borrowed registrations после serve; factory
+failure/panic и выход без serve освобождают slot. Config size/version проверяются
+до вызова factory. Эта Rust API не передаётся через ABI, JSON не выбирает factory.
+Обычный `disksgraph_open` по-прежнему создаёт только ReadOnlyPolicy/DisabledDispatcher.
+
+Для положительной native write приёмки используется **отдельная тестовая библиотека**
+`target/debug/examples/libc7_vm_library.so` и checked-import consumer `c7_vm`.
+Она экспортирует `disksgraph_vm_*` с теми же Stabby signatures, используя общий
+transport и [guarded guest host](../dg-cli/examples/support/guest.rs) Rust/CLI routes.
+Эти symbols отсутствуют в production `.so`. VM factory дополнительно проверяет
+специальный kernel argument, единственный private 512 MiB SCSI disk с exact WWN,
+отсутствие других физических devices/network и fixed guest root/manifest.
+Никакого флага для включения записи в production config нет.
+
+```sh
+python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --interface ffi
+python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --interface ffi --case mount-target-change
+cargo build -p disksgraph-ffi --example c7_vm_library --offline
+cargo test -p disksgraph-ffi --test checked_consumer --offline vm_library_refuses -- --ignored
+```
+
+Guest consumer создаёт/edit/preview/freeze session через actual checked `.so`
+imports, сравнивает forecast/frozen inputs с прямым offline Rust API, затем отдельно
+пишет reviewed digest/LV scope в фиксированный private guest-owned host config
+`/run/c7-review.json`. Приложение не получает approval из plan JSON. Первый admission
+привязывает review к одному run; тот же host проверяет exact routes и destructive LV.
+Этот механизм относится только к disposable guest, не production policy.
+
+Success требует live snapshots во время job, полного exclusive event replay,
+exact final snapshot/events parity с retained facade run, четырёх Verified,
+независимого final probe и записи/чтения proof-файла на ext4. После close root
+содержит только `execution.lock`. Imported historical plan не присваивает source map.
+Failure изменяет Mount target после arm: три Verified, Mount OutcomeUnknown и
+checkpoint с тремя fingerprints. Повторный apply отклоняется до пятого native call,
+exact incident confirmation не очищает marker, original run остаётся inspectable.
+После close/reopen старый run не восстанавливается; marker блокирует новый apply,
+в новом context ни одного native dispatch. Bytes checkpoint остаются прежними.
+Подробности и ограничения — в [VM runner docs](../storage-runtime/tests/vm/README.md).
+
 C7 остаётся открыт: отдельный credential channel не реализован, cancellation явно
-отклоняется. Положительный native write workflow через динамический consumer,
-сборка на MSRV и финальное packaging требуют отдельной приёмки. Production write
-и incident safety policies относятся к C8. Disks preview остаётся отключённым.
+отклоняется. Native VM acceptance выполнена для этого scoped test host. Actual MSRV
+и финальное packaging требуют отдельной приёмки. Production write и incident safety
+policies относятся к C8. Disks preview остаётся отключённым.
