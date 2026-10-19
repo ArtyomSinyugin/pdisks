@@ -104,5 +104,5 @@ pub(super) fn run(invocation: &Invocation) -> Result<serde_json::Value, Error> {
             .ok_or_else(|| Error::Configuration("invalid CLI backend identity".into()))?,
     );
     let mut app = DisksGraph::new(&invocation.root, host, dispatcher)?;
-    dg_cli::execute(&mut app, &invocation.command)
+    dg_cli::execute(&mut app, &invocation.command, &mut std::io::stderr().lock())
 }

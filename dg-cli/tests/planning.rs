@@ -3,12 +3,20 @@
 #[path = "../../disksgraph/tests/support/mod.rs"]
 mod support;
 
-use dg_cli::{Command, execute, files};
+use dg_cli::{Command, files};
 use disksgraph::{
     DraftDocument, PlanDocument, PlanRequest,
     model::{Bytes, LvmLvKind, NodeKind},
 };
 use std::error::Error;
+
+/// Discards the unused event stream for commands that only inspect or edit saved inputs.
+fn execute(
+    app: &mut support::Application,
+    command: &Command,
+) -> Result<serde_json::Value, dg_cli::Error> {
+    dg_cli::execute(app, command, &mut std::io::sink())
+}
 
 /// Real executable invocations can edit and freeze a saved baseline without native registrations.
 #[test]
@@ -214,6 +222,139 @@ fn invalid_draft_is_saved_but_cannot_overwrite_plan() -> Result<(), Box<dyn Erro
     ));
     assert_eq!(files::read_document(&plan)?, "previous");
     assert_eq!(probes.get(), 1);
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
+
+/// A command reports the same denied states as direct Rust and never invokes the fixture dispatcher.
+#[test]
+fn apply_preserves_failed_snapshot_and_separate_events() -> Result<(), Box<dyn Error>> {
+    let (scratch, mut app, _, writes) = support::application()?;
+    let session = app.create_session()?;
+    let baseline = app.export_draft(session)?;
+    let vg = *baseline
+        .baseline
+        .snapshot
+        .graph
+        .nodes()
+        .next()
+        .ok_or("VG")?
+        .0;
+    app.edit(
+        session,
+        app.revision(session)?,
+        disksgraph::PlanEdit::Add(PlanRequest::CreateLv {
+            vg,
+            name: "denied".into(),
+            size: Bytes::new(16 * 1024 * 1024),
+            layout: LvmLvKind::Linear,
+            activate: true,
+        }),
+    )?;
+    let document = app
+        .freeze(session, app.revision(session)?)?
+        .document()
+        .clone();
+    let plan = scratch.0.join("plan.json");
+    files::save_document(&plan, &document.canonical_json()?)?;
+    let mut events = Vec::new();
+    let result = dg_cli::execute(
+        &mut app,
+        &Command::Apply {
+            file: plan.clone(),
+            events: true,
+        },
+        &mut events,
+    )?;
+    let (direct_root, mut direct, _, direct_writes) = support::application()?;
+    let error = direct
+        .apply_blocking(document)
+        .err()
+        .ok_or("readiness must deny")?;
+    let direct_snapshot = direct.run_snapshot(error.run_id.ok_or("retained attempt")?)?;
+    assert_eq!(result["run"]["verified"], false);
+    assert_eq!(result["run"]["finished"], true);
+    assert_eq!(
+        result["run"]["error"]["code"],
+        serde_json::to_value(error.code)?
+    );
+    assert_eq!(
+        result["run"]["actions"],
+        serde_json::to_value(direct_snapshot.execution.actions)?
+    );
+    assert_eq!(
+        result["run"]["plan_id"],
+        direct_snapshot.execution.plan_id.to_string()
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(events)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(lines[0]["type"], "replay");
+    assert_eq!(lines[0]["gap"], false);
+    assert!(result.get("events").is_none());
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    assert!(!direct_root.0.join("active-attempt.json").exists());
+    assert_eq!(writes.get() + direct_writes.get(), 0);
+
+    // Corruption remains blocking; the CLI returns the retained error without clearing the marker.
+    std::fs::write(scratch.0.join("active-attempt.json"), "corrupt")?;
+    let result = execute(
+        &mut app,
+        &Command::Apply {
+            file: plan,
+            events: false,
+        },
+    )?;
+    assert_eq!(result["run"]["error"]["code"], "checkpoint_blocked");
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join("active-attempt.json"))?,
+        "corrupt"
+    );
+    assert!(execute(&mut app, &Command::Incident).is_err());
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
+
+/// Independent success is preserved even if the event consumer disconnects after the blocking run.
+#[test]
+fn completed_outcome_survives_event_writer_failure() -> Result<(), Box<dyn Error>> {
+    let (scratch, mut app, _, writes) = support::application()?;
+    let session = app.create_session()?;
+    let document = app
+        .freeze(session, app.revision(session)?)?
+        .document()
+        .clone();
+    let plan = scratch.0.join("empty-plan.json");
+    files::save_document(&plan, &document.canonical_json()?)?;
+    let mut events = Vec::new();
+    let result = dg_cli::execute(
+        &mut app,
+        &Command::Apply {
+            file: plan.clone(),
+            events: true,
+        },
+        &mut events,
+    )?;
+    assert_eq!(result["run"]["verified"], true);
+    assert!(result["event_output_error"].is_null());
+    assert!(String::from_utf8(events)?.lines().count() > 1);
+    // A read-only file provides a real writer failure without a custom mock implementation.
+    let mut failed_writer = std::fs::File::open(&plan)?;
+    let result = dg_cli::execute(
+        &mut app,
+        &Command::Apply {
+            file: plan,
+            events: true,
+        },
+        &mut failed_writer,
+    )?;
+    assert_eq!(result["run"]["verified"], true);
+    assert!(result["event_output_error"].is_string());
+    assert_eq!(
+        execute(&mut app, &Command::Incident)?,
+        serde_json::json!({"incident": null})
+    );
     assert_eq!(writes.get(), 0);
     Ok(())
 }

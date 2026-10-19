@@ -167,8 +167,65 @@ challenge и независимую safety policy runtime. Никакого но
 Пример [`c4_vm.rs`](disksgraph/examples/c4_vm.rs) импортирует только `disksgraph` для
 публичного workflow и явной host-конфигурации. Существующий [VM runner](storage-runtime/tests/vm/README.md)
 проверяет через фасад реальную четырёхшаговую цепочку, fresh final probe, events,
-source map и отказ после arm. CLI (C6), асинхронные ABI jobs и Stabby (C7) пока не
-реализованы. Disks preview остаётся отключённым.
+source map и отказ после arm. Начальный CLI C6 описан ниже; асинхронные ABI jobs и
+Stabby (C7) пока не реализованы. Disks preview остаётся отключённым.
+
+## CLI C6 — сохранённые черновики и foreground apply
+
+`cargo build -p dg-cli --offline` собирает `target/debug/dg-cli`. Исполняемый файл
+использует только `disksgraph`, включая явную host-конфигурацию из его exports.
+Нативные reads требуют полного набора registrations из
+[`providers.live.example.json`](storage-probe/tests/providers.live.example.json),
+доступных библиотек и соответствующих прав. Root — заранее созданный owner-only
+каталог, общий с другими cooperating callers; программа не создаёт его молча.
+
+```sh
+mkdir -m 700 /tmp/dg-session
+dg-cli probe --manifest providers.json --root /tmp/dg-session
+dg-cli plan new --manifest providers.json --root /tmp/dg-session --output draft.json
+dg-cli plan add --root /tmp/dg-session --draft draft.json --request request.json --output draft.json
+dg-cli plan preview --root /tmp/dg-session --draft draft.json
+dg-cli plan freeze --root /tmp/dg-session --draft draft.json --output plan.json
+dg-cli plan apply --manifest providers.json --root /tmp/dg-session --file plan.json --events jsonl
+dg-cli incident show --manifest providers.json --root /tmp/dg-session
+```
+
+`request.json` — существующий serde-формат `PlanRequest`, например:
+
+```json
+{"create_lv":{"vg":"00000000-0000-7000-8000-000000000002","name":"data","size":16777216,"layout":"Linear","activate":true}}
+```
+
+VG ID выбирается из **baseline конкретного draft**, пример UUID не относится к
+вашей системе. `plan add` возвращает revision, operation, created_node и status.
+Семантически invalid draft сохраняется для исправления, но не может быть frozen.
+`add/preview/freeze` не загружают native libraries и не обновляют historical baseline.
+Файлы сохраняются заменой через соседний private tempfile, file sync, rename и
+directory sync. Ошибка directory sync после rename означает, что файл уже виден,
+но его crash durability не подтверждена. Вход ограничен 16 MiB; validator draft
+дополнительно ограничивает его 1 MiB. Повторный freeze создаёт новый `plan_id`.
+
+Все результаты, кроме `--help`, — один JSON на stdout. Apply возвращает `run` со
+snapshot даже при ошибке coordinator после создания попытки. Exit codes: `0` —
+команда завершена (для apply обязательно `verified=true`), `1` — IO/config/application
+error или ошибка event writer, `2` — аргументы/JSON, `3` — завершённая, но не
+верифицированная попытка. `event_output_error` не стирает фактический outcome.
+Preview со status invalid — успешный запрос прогноза, а не успешное исполнение.
+
+`--events jsonl` пишет **retained replay после blocking apply** в stderr:
+первая строка содержит `type=replay`, `gap` и exclusive `next_sequence`, затем
+идут отдельные `RunEvent`. Это не live progress; ring ограничен 1024 событиями,
+snapshot на stdout содержит полное итоговое состояние даже после eviction.
+Истории run/events между процессами и daemon нет; checkpoint инцидента сохраняется.
+
+**C6 пока не завершён.** Production scope/authorization остаются Unknown, native
+dispatcher в executable отключён. Даже manifest с Execute не включает запись.
+Тесты проверяют parity preview/plan (кроме нового plan_id), одинаковый отказ
+readiness, retained failures, independent empty-plan verification в synthetic host
+и отдельные процессы редактирования. Реального write через CLI в VM ещё не было;
+live events, REPL undo/redo, explicit rebase и incident acknowledgment впереди.
+При smoke-probe в текущем host namespace получен typed `probe_failed`: mount source
+отсутствует в observation graph; CLI не превращает неполную публикацию в baseline.
 
 ## Редактирование плана без доступа к дискам
 

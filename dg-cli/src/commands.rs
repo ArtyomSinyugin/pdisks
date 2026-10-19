@@ -3,7 +3,10 @@
 use crate::{Error, files};
 use disksgraph::{
     DisksGraph, DraftDocument, PlanEdit, PlanRequest,
-    host::{dispatcher::BackendDispatcher, host::RuntimeHost},
+    host::{
+        authorization::AuthorizationContext, capability::BackendCapabilityCheck,
+        dispatcher::BackendDispatcher, host::LinuxLiveHost,
+    },
 };
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
@@ -38,12 +41,24 @@ pub enum Command {
         /// Atomic destination for canonical PlanDocument JSON.
         output: PathBuf,
     },
+    /// Attempt a saved plan through the ordinary blocking facade coordinator.
+    Apply {
+        /// Historical immutable input, reanalysed before use.
+        file: PathBuf,
+        /// Replay retained events as JSONL on the separate event writer after completion.
+        events: bool,
+    },
+    /// Inspect a persistent unresolved attempt without acknowledging or retrying it.
+    Incident,
 }
 
 impl Command {
     /// Only commands explicitly requesting actual state need native read registrations.
     pub fn needs_probe(&self) -> bool {
-        matches!(self, Self::Probe | Self::New { .. })
+        matches!(
+            self,
+            Self::Probe | Self::New { .. } | Self::Apply { .. } | Self::Incident
+        )
     }
 }
 
@@ -110,6 +125,18 @@ impl Invocation {
                 draft: take(&mut flags, "--draft")?,
                 output: take(&mut flags, "--output")?,
             },
+            ["plan", "apply"] => {
+                let events = match flags.remove("--events") {
+                    None => false,
+                    Some(format) if format == "jsonl" => true,
+                    Some(_) => return Err(Error::Usage("--events supports only jsonl".into())),
+                };
+                Command::Apply {
+                    file: take(&mut flags, "--file")?,
+                    events,
+                }
+            }
+            ["incident", "show"] => Command::Incident,
             _ => return Err(Error::Usage("unknown command; use --help".into())),
         };
         if command.needs_probe()
@@ -140,9 +167,10 @@ fn take(flags: &mut BTreeMap<String, OsString>, key: &str) -> Result<PathBuf, Er
 }
 
 /// Runs commands only through the supplied facade; test hosts use this exact command path.
-pub fn execute<H: RuntimeHost, D: BackendDispatcher>(
-    app: &mut DisksGraph<H, D>,
+pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>(
+    app: &mut DisksGraph<LinuxLiveHost<'_, C, A>, D>,
     command: &Command,
+    events: &mut dyn std::io::Write,
 ) -> Result<serde_json::Value, Error> {
     match command {
         Command::Probe => Ok(serde_json::to_value(app.probe()?)?),
@@ -195,7 +223,53 @@ pub fn execute<H: RuntimeHost, D: BackendDispatcher>(
                 Ok(serde_json::to_value(app.preview_document(session)?)?)
             }
         }
+        Command::Apply {
+            file,
+            events: replay,
+        } => {
+            let plan = app.import_plan_json(&files::read_document(file)?)?;
+            let run = match app.apply_plan(plan) {
+                Ok(run) => run,
+                Err(error) => match error.run_id {
+                    Some(run) => run,
+                    None => return Err(error.into()),
+                },
+            };
+            let snapshot = app.run_snapshot(run)?;
+            // shortcut: blocking facade exposes retained events after return; add a shared runtime
+            // subscription before promising live progress or complete delivery beyond the ring bound.
+            let output_error = if *replay {
+                replay_events(events, app.events(run, 0)?)
+                    .err()
+                    .map(|error| error.to_string())
+            } else {
+                None
+            };
+            // Output failures cannot erase the actual run outcome or imply that effects were undone.
+            Ok(serde_json::json!({"run": snapshot, "event_output_error": output_error}))
+        }
+        Command::Incident => Ok(serde_json::json!({"incident": app.incident()?})),
     }
+}
+
+/// Writes bounded replay metadata and one event per line, separate from the final result document.
+fn replay_events(
+    output: &mut dyn std::io::Write,
+    page: disksgraph::EventsPage,
+) -> Result<(), Error> {
+    serde_json::to_writer(
+        &mut *output,
+        &serde_json::json!({
+            "type": "replay", "gap": page.gap, "next_sequence": page.next_sequence,
+        }),
+    )?;
+    writeln!(output)?;
+    for event in page.events {
+        serde_json::to_writer(&mut *output, &event)?;
+        writeln!(output)?;
+    }
+    output.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
