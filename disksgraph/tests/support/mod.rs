@@ -12,7 +12,14 @@ use disksgraph::{
         targets::ResolvedAction,
     },
 };
-use std::{cell::Cell, error::Error, fs, os::unix::fs::DirBuilderExt, path::PathBuf, rc::Rc};
+use std::{
+    cell::Cell,
+    error::Error,
+    fs,
+    os::unix::fs::DirBuilderExt,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 /// Private execution directory removed after the application releases its descriptor.
 pub struct Scratch(pub PathBuf);
@@ -124,6 +131,15 @@ pub type Fixture = (Scratch, Application, Rc<Cell<usize>>, Rc<Cell<usize>>);
 /// Creates independent host state and an existing private execution root.
 pub fn application() -> Result<Fixture, Box<dyn Error>> {
     let scratch = Scratch::new()?;
+    let (app, probes, writes) = open(&scratch.0)?;
+    Ok((scratch, app, probes, writes))
+}
+
+/// A reopened application and its independent provider/dispatcher counters.
+pub type OpenFixture = (Application, Rc<Cell<usize>>, Rc<Cell<usize>>);
+
+/// Reopens an existing fixture root without manufacturing a new execution/lock domain.
+pub fn open(root: &Path) -> Result<OpenFixture, Box<dyn Error>> {
     let probes = Rc::new(Cell::new(0));
     let writes = Rc::new(Cell::new(0));
     let snapshot = serde_json::from_str(include_str!(
@@ -138,6 +154,6 @@ pub fn application() -> Result<Fixture, Box<dyn Error>> {
         backend: BackendId::new("application-no-writes").ok_or("backend ID")?,
         calls: writes.clone(),
     };
-    let app = DisksGraph::new(&scratch.0, host, dispatcher)?;
-    Ok((scratch, app, probes, writes))
+    let app = DisksGraph::new(root, host, dispatcher)?;
+    Ok((app, probes, writes))
 }
