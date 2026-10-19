@@ -164,7 +164,7 @@ admission или OutcomeUnknown не являются успехом. Ошибк
 
 `incident/review_incident/acknowledge_incident` используют тех же providers, lock,
 challenge и независимую safety policy runtime. Никакого нового пути clear/retry нет.
-Пример [`c4_vm.rs`](disksgraph/examples/c4_vm.rs) импортирует только `disksgraph` для
+Пример [`c6_vm.rs`](dg-cli/examples/c6_vm.rs) импортирует только `disksgraph` для
 публичного workflow и явной host-конфигурации. Существующий [VM runner](storage-runtime/tests/vm/README.md)
 проверяет через фасад реальную четырёхшаговую цепочку, fresh final probe, events,
 source map и отказ после arm. Начальный CLI C6 описан ниже; асинхронные ABI jobs и

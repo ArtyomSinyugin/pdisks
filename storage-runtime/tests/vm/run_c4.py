@@ -59,10 +59,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rescue-iso", required=True, type=pathlib.Path)
     parser.add_argument("--case", choices=["success", "mount-target-change"], default="success")
+    parser.add_argument("--interface", choices=["rust", "cli"], default="rust", help="shared guest policies, direct facade or CLI command adapter")
     args = parser.parse_args()
     iso = args.rescue_iso.resolve(strict=True)
     repo = pathlib.Path(__file__).resolve().parents[3]
-    run("cargo", "build", "-p", "disksgraph", "--example", "c4_vm", "--offline", cwd=repo)
+    run("cargo", "build", "-p", "dg-cli", "--example", "c6_vm", "--offline", cwd=repo)
     base = pathlib.Path(tempfile.mkdtemp(prefix="disksgraph-c4-"))
     print(f"Artifacts: {base}", flush=True)
     root = base / "root"
@@ -100,12 +101,12 @@ def main():
         source = pathlib.Path("/usr/lib64") / library
         copy_with_libraries(source, root)
         shutil.copy2(source, root / "usr/lib64" / library)
-    binary = copy_with_libraries(repo / "target/debug/examples/c4_vm", root)
+    binary = copy_with_libraries(repo / "target/debug/examples/c6_vm", root)
     shutil.move(binary, root / "usr/bin/c4_vm")
     run("strip", str(root / "usr/bin/c4_vm"))
     shutil.copy2("/etc/mke2fs.conf", root / "etc/mke2fs.conf")
     (root / "etc/lvm/lvm.conf").write_text("devices { use_devicesfile=0 }\nactivation { udev_sync=0 udev_rules=0 }\n")
-    (root / "init").write_text("#!/bin/sh\nexport PATH=/usr/sbin:/usr/bin:/bin\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs devtmpfs /dev\n" + "".join(f"insmod /lib/modules/{name}.ko || poweroff -f\n" for name in names) + f"sleep 1\n/usr/bin/c4_vm {'' if args.case == 'success' else args.case}\nstatus=$?\necho C4_EXIT=$status\ncat /run/c4-execution/active-attempt.json\nsync\npoweroff -f\n")
+    (root / "init").write_text("#!/bin/sh\nexport PATH=/usr/sbin:/usr/bin:/bin\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs devtmpfs /dev\n" + "".join(f"insmod /lib/modules/{name}.ko || poweroff -f\n" for name in names) + f"sleep 1\n/usr/bin/c4_vm {args.case} {args.interface}\nstatus=$?\necho C4_EXIT=$status\ncat /run/c4-execution/active-attempt.json\nsync\npoweroff -f\n")
     (root / "init").chmod(0o755)
     pack(root, base / "guest.cpio.gz")
     disk = base / "data.raw"
@@ -117,6 +118,8 @@ def main():
     result = log.read_text()
     print(result)
     sentinel = "C4_VERTICAL_VERIFIED" if args.case == "success" else "C4_EXPECTED_FAILURE_VERIFIED"
+    if args.interface == "cli" and "C6_CLI_VERIFIED\n" not in result:
+        raise SystemExit(f"CLI command experiment failed; retained {log} and {disk}")
     if f"{sentinel}\n" not in result or "C4_EXIT=0\n" not in result or "C5_FACADE_VERIFIED\n" not in result:
         raise SystemExit(f"C4 experiment failed; retained {log} and {disk}")
 

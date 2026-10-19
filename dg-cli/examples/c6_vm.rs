@@ -1,5 +1,5 @@
 //! Destructive integration experiment, restricted to the disposable disk supplied by storage-runtime/tests/vm/run_c4.py.
-//! The application workflow imports only disksgraph; host configuration stays explicit.
+//! Rust and CLI routes share one facade and explicit guest-only host policies.
 //! This isolated guest policy is deliberately not a production authorization policy.
 
 use disksgraph::host::{
@@ -556,11 +556,20 @@ impl BackendDispatcher for GuestDispatch<'_> {
 /// Runs exactly CreateLv, activation, ext4 and Host Mount through the normal coordinator.
 fn main() -> Result<(), Box<dyn Error>> {
     guard()?;
-    let fail_mount = match std::env::args().nth(1).as_deref() {
-        None => false,
+    let mut args = std::env::args().skip(1);
+    let fail_mount = match args.next().as_deref() {
+        None | Some("success") => false,
         Some("mount-target-change") => true,
         _ => return Err("unknown guest experiment".into()),
     };
+    let cli = match args.next().as_deref() {
+        None | Some("rust") => false,
+        Some("cli") => true,
+        _ => return Err("unknown guest interface".into()),
+    };
+    if args.next().is_some() {
+        return Err("unexpected guest arguments".into());
+    }
     println!("C4_STAGE=setup");
     setup("pvcreate", &["/dev/sda"])?;
     setup("vgcreate", &["dg_c4", "/dev/sda"])?;
@@ -663,18 +672,51 @@ fn main() -> Result<(), Box<dyn Error>> {
         disksgraph::PreviewStatus::Conditional | disksgraph::PreviewStatus::Complete
     ));
     let frozen = app.freeze(session, app.revision(session)?)?;
-    fs::write(
-        "/run/c4-plan.json",
-        serde_json::to_vec_pretty(frozen.document())?,
-    )?;
+    let plan_path = Path::new("/run/c4-plan.json");
+    let document = if cli {
+        let draft_path = Path::new("/run/c6-draft.json");
+        dg_cli::files::save_document(draft_path, &app.export_draft(session)?.to_json()?)?;
+        let mut preview = dg_cli::execute(
+            &mut app,
+            &dg_cli::Command::Preview {
+                draft: draft_path.into(),
+            },
+            &mut Vec::new(),
+        )?;
+        let mut expected = serde_json::to_value(app.preview_document(session)?)?;
+        // Graph sets may serialize in a different order after import; compare their typed content.
+        assert_eq!(
+            serde_json::from_value::<Option<DesiredState>>(preview["desired"].take())?,
+            serde_json::from_value::<Option<DesiredState>>(expected["desired"].take())?,
+        );
+        assert_eq!(preview, expected);
+        dg_cli::execute(
+            &mut app,
+            &dg_cli::Command::Freeze {
+                draft: draft_path.into(),
+                output: plan_path.into(),
+            },
+            &mut Vec::new(),
+        )?;
+        let document =
+            disksgraph::PlanDocument::from_json(&dg_cli::files::read_document(plan_path)?)?;
+        // Freeze allocates a new document identity; all executable inputs must otherwise be identical.
+        let mut expected = frozen.document().clone();
+        expected.plan_id = document.plan_id;
+        assert_eq!(expected.canonical_json()?, document.canonical_json()?);
+        document
+    } else {
+        let document = frozen.document().clone();
+        dg_cli::files::save_document(plan_path, &document.canonical_json()?)?;
+        document
+    };
     // This explicit VM-only review is supplied through host-owned state, never imported approval JSON.
     *reviewed.borrow_mut() = Some(ReviewedPlan {
         run: None,
-        digest: plan_digest(frozen.document())?,
+        digest: plan_digest(&document)?,
         lv,
     });
-    let operations: Vec<_> = frozen
-        .document()
+    let operations: Vec<_> = document
         .actions
         .iter()
         .map(|action| action.operation.clone())
@@ -687,14 +729,57 @@ fn main() -> Result<(), Box<dyn Error>> {
             .all(|entry| matches!(entry.availability, OperationAvailability::Available(_)))
     );
     println!("C4_STAGE=facade_apply");
-    let run = app.apply_frozen(&frozen)?;
+    let run = if cli {
+        let mut stream = Vec::new();
+        let result = dg_cli::execute(
+            &mut app,
+            &dg_cli::Invocation::parse(
+                [
+                    "plan",
+                    "apply",
+                    "--file",
+                    "/run/c4-plan.json",
+                    "--root",
+                    "/run/c4-execution",
+                    "--manifest",
+                    "/run/providers.json",
+                    "--events",
+                    "jsonl",
+                ]
+                .map(std::ffi::OsString::from),
+            )?
+            .command,
+            &mut stream,
+        )?;
+        assert_eq!(
+            dg_cli::result_exit_code(&result),
+            if fail_mount { 3 } else { 0 }
+        );
+        assert!(result["event_output_error"].is_null());
+        let run = serde_json::from_value(result["run"]["run_id"].clone())?;
+        assert_eq!(result["run"], serde_json::to_value(app.run_snapshot(run)?)?);
+        let mut lines = std::str::from_utf8(&stream)?.lines();
+        let header: serde_json::Value = serde_json::from_str(lines.next().ok_or("live header")?)?;
+        assert_eq!(header["type"], "stream");
+        let delivered: Vec<disksgraph::RunEvent> =
+            lines.map(serde_json::from_str).collect::<Result<_, _>>()?;
+        assert_eq!(delivered, app.events(run, 0)?.events);
+        println!("C6_CLI_EVENTS={}", delivered.len());
+        run
+    } else {
+        app.apply_frozen(&frozen)?
+    };
     let status = app.run_snapshot(run)?;
     assert!(status.execution.finished);
     assert!(status.error.is_none());
-    assert_eq!(status.source_map, frozen.source_map());
+    if cli {
+        assert!(status.source_map.is_empty());
+    } else {
+        assert_eq!(status.source_map, frozen.source_map());
+    }
     assert_eq!(
-        status
-            .source_map
+        frozen
+            .source_map()
             .iter()
             .map(|entry| entry.actions.len())
             .sum::<usize>(),
@@ -734,12 +819,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         assert_eq!(marker.targets.len(), 3);
         // A new facade attempt is also blocked by the retained marker, before another native call.
         let rejected = app
-            .apply_frozen(&frozen)
+            .apply_blocking(document.clone())
             .err()
             .ok_or("incident must block another attempt")?;
         assert_eq!(rejected.code, disksgraph::ErrorCode::CheckpointBlocked);
         assert_eq!(calls.get(), 4);
         assert!(app.incident()?.is_some());
+        if cli {
+            println!("C6_CLI_VERIFIED");
+        }
         println!("C5_FACADE_VERIFIED");
         println!("C4_EXPECTED_FAILURE_VERIFIED");
         return Ok(());
@@ -765,6 +853,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     fs::write("/mnt/c4/proof", b"C5 facade real mounted ext4")?;
     assert_eq!(fs::read("/mnt/c4/proof")?, b"C5 facade real mounted ext4");
+    if cli {
+        println!("C6_CLI_VERIFIED");
+    }
     println!("C5_FACADE_VERIFIED");
     println!("C4_VERTICAL_VERIFIED");
     Ok(())

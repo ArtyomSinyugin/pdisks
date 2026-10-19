@@ -1,8 +1,8 @@
-# C4 recipe through the C5 public Rust facade
+# Native recipe through the Rust facade and C6 CLI command adapter
 
 The experiment runs `CreateLv → SetActivation → CreateFilesystem(ext4) → Mount(Host)`
 through `disksgraph::DisksGraph` and the real `ExecutionCoordinator`.
-The guest example now lives in `disksgraph/examples/c4_vm.rs`; it imports neither
+The shared guest example now lives in `dg-cli/examples/c6_vm.rs`; it imports neither
 `storage-engine` nor `storage-provider` directly. Probe, session creation, editing,
 preview, freeze, apply, events, snapshots and incident inspection use the facade. Each action requires a durable checkpoint
 and held lock before entering the actual installed native adapter. Actual LVM,
@@ -27,7 +27,19 @@ The script fails when these requirements are missing; it does not download them.
 ```sh
 python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso
 python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --case mount-target-change
+python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --interface cli
+python3 storage-runtime/tests/vm/run_c4.py --rescue-iso /path/to/rescue.iso --interface cli --case mount-target-change
 ```
+
+`--interface rust` (default) exercises the direct facade route. `--interface cli`
+uses the real CLI argument parser and command adapter for preview/freeze/apply.
+Both routes retain the same explicitly bounded guest probe, approval and exclusion
+policies. CLI preview and executable plan inputs match the direct API; separate
+freeze calls allocate distinct plan IDs. The JSON result matches the facade's
+retained snapshot, events match its sequence, and imported plans have no fabricated
+trusted source map. CLI success requires `C6_CLI_VERIFIED` and verified exit status.
+This tests the command adapter with trusted guest configuration; the ordinary
+`dg-cli` executable still has no permissive production write policy or VM bypass flag.
 
 Each command creates its own directory under Python's temporary directory and
 prints its location. The image, serial log and generated initramfs are retained
