@@ -15,7 +15,7 @@ fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "--help" {
         println!(
-            "dg-cli probe --manifest FILE --root PRIVATE_DIR\ndg-cli plan new --manifest FILE --root PRIVATE_DIR --output DRAFT\nAll results are JSON. The execution root must already exist with mode 0700."
+            "dg-cli probe --manifest FILE --root PRIVATE_DIR\ndg-cli plan new --manifest FILE --root PRIVATE_DIR --output DRAFT\ndg-cli plan add --root PRIVATE_DIR --draft DRAFT --request REQUEST --output DRAFT\ndg-cli plan preview --root PRIVATE_DIR --draft DRAFT\ndg-cli plan freeze --root PRIVATE_DIR --draft DRAFT --output PLAN\nAll results are JSON. The execution root must already exist with mode 0700.\nSaved-draft commands do not probe or refresh the baseline."
         );
         return ExitCode::SUCCESS;
     }

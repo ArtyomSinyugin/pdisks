@@ -55,6 +55,7 @@ dependencies = [
  "disksgraph",
  "serde",
  "serde_json",
+ "storage-provider",
  "thiserror",
  "uuid",
 ]

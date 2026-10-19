@@ -2,7 +2,7 @@
 
 use crate::{Error, files};
 use disksgraph::{
-    DisksGraph,
+    DisksGraph, DraftDocument, PlanEdit, PlanRequest,
     host::{dispatcher::BackendDispatcher, host::RuntimeHost},
 };
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
@@ -13,14 +13,45 @@ pub enum Command {
     /// Collect one fresh native publication.
     Probe,
     /// Start a draft from one fresh same-pass baseline.
-    New { output: PathBuf },
+    New {
+        /// Atomic destination for the editable document.
+        output: PathBuf,
+    },
+    /// Append one existing typed recipe from a JSON request file.
+    Add {
+        /// Saved inputs, including the historical baseline.
+        draft: PathBuf,
+        /// One serialized PlanRequest, not backend actions or permission.
+        request: PathBuf,
+        /// Atomic destination, which may equal the input draft.
+        output: PathBuf,
+    },
+    /// Recompute the current forecast without any new native observation.
+    Preview {
+        /// Editable inputs to recompute.
+        draft: PathBuf,
+    },
+    /// Export one immutable, historically reanalysed execution description.
+    Freeze {
+        /// Editable revision to freeze.
+        draft: PathBuf,
+        /// Atomic destination for canonical PlanDocument JSON.
+        output: PathBuf,
+    },
+}
+
+impl Command {
+    /// Only commands explicitly requesting actual state need native read registrations.
+    pub fn needs_probe(&self) -> bool {
+        matches!(self, Self::Probe | Self::New { .. })
+    }
 }
 
 /// Explicit trusted host configuration kept separate from saved draft/plan contents.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
     /// Native provider registrations chosen by the invoking host.
-    pub manifest: PathBuf,
+    pub manifest: Option<PathBuf>,
     /// Existing owner-only execution directory, shared by all cooperating callers.
     pub root: PathBuf,
     /// Validated operation and file paths.
@@ -56,7 +87,7 @@ impl Invocation {
                 return Err(Error::Usage(format!("duplicate flag {key}")));
             }
         }
-        let manifest = take(&mut flags, "--manifest")?;
+        let manifest = flags.remove("--manifest").map(PathBuf::from);
         let root = take(&mut flags, "--root")?;
         let words: Vec<_> = words
             .iter()
@@ -67,8 +98,27 @@ impl Invocation {
             ["plan", "new"] => Command::New {
                 output: take(&mut flags, "--output")?,
             },
+            ["plan", "add"] => Command::Add {
+                draft: take(&mut flags, "--draft")?,
+                request: take(&mut flags, "--request")?,
+                output: take(&mut flags, "--output")?,
+            },
+            ["plan", "preview"] => Command::Preview {
+                draft: take(&mut flags, "--draft")?,
+            },
+            ["plan", "freeze"] => Command::Freeze {
+                draft: take(&mut flags, "--draft")?,
+                output: take(&mut flags, "--output")?,
+            },
             _ => return Err(Error::Usage("unknown command; use --help".into())),
         };
+        if command.needs_probe()
+            && manifest
+                .as_ref()
+                .is_none_or(|path| path.as_os_str().is_empty())
+        {
+            return Err(Error::Usage("required flag --manifest".into()));
+        }
         if let Some(flag) = flags.keys().next() {
             return Err(Error::Usage(format!("unknown flag {flag}")));
         }
@@ -104,6 +154,46 @@ pub fn execute<H: RuntimeHost, D: BackendDispatcher>(
                 .map_err(disksgraph::DisksGraphError::from)?;
             files::save_document(output, &json)?;
             Ok(serde_json::json!({"revision": app.revision(session)?}))
+        }
+        Command::Add {
+            draft,
+            request,
+            output,
+        } => {
+            let document = DraftDocument::from_json(&files::read_document(draft)?)
+                .map_err(disksgraph::DisksGraphError::from)?;
+            let request: PlanRequest = serde_json::from_str(&files::read_document(request)?)?;
+            let session = app.import_draft(document)?;
+            let receipt = app.edit(session, app.revision(session)?, PlanEdit::Add(request))?;
+            let document = app.export_draft(session)?;
+            files::save_document(
+                output,
+                &document
+                    .to_json()
+                    .map_err(disksgraph::DisksGraphError::from)?,
+            )?;
+            Ok(serde_json::json!({
+                "revision": receipt.revision, "operation": receipt.added_operation,
+                "created_node": receipt.created_node, "status": app.preview(session)?.status(),
+            }))
+        }
+        Command::Preview { draft } | Command::Freeze { draft, .. } => {
+            let document = DraftDocument::from_json(&files::read_document(draft)?)
+                .map_err(disksgraph::DisksGraphError::from)?;
+            let session = app.import_draft(document)?;
+            if let Command::Freeze { output, .. } = command {
+                let frozen = app.freeze(session, app.revision(session)?)?;
+                let json = frozen
+                    .document()
+                    .canonical_json()
+                    .map_err(disksgraph::DisksGraphError::from)?;
+                files::save_document(output, &json)?;
+                Ok(
+                    serde_json::json!({"plan_id": frozen.document().plan_id, "revision": frozen.revision()}),
+                )
+            } else {
+                Ok(serde_json::to_value(app.preview_document(session)?)?)
+            }
         }
     }
 }

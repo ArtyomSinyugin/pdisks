@@ -59,29 +59,45 @@ fn backend<'a>(registry: &'a BackendRegistry, id: &str) -> Result<&'a Registered
 
 /// Keeps registrations alive for the entire facade invocation, including every fresh provider pass.
 pub(super) fn run(invocation: &Invocation) -> Result<serde_json::Value, Error> {
-    let registry = BackendRegistry::load_from(&invocation.manifest)
-        .map_err(|error| Error::Configuration(error.to_string()))?;
-    let local = NativeLocalProvider::new(
-        backend(&registry, "udev-block")?,
-        backend(&registry, "fdisk-partitions")?,
-        backend(&registry, "blkid-signatures")?,
-        backend(&registry, "devmapper-topology")?,
-        backend(&registry, "cryptsetup-luks")?,
-        backend(&registry, "loop")?,
-        backend(&registry, "swap")?,
-        backend(&registry, "multipath")?,
-        backend(&registry, "lvm")?,
-        backend(&registry, "mdraid")?,
-    );
-    let system = NativeSystemProvider::new(
-        local,
-        backend(&registry, "libmount-mounts")?,
-        backend(&registry, "btrfs-subvolumes")?,
-        backend(&registry, "btrfs")?,
-        backend(&registry, "zfs")?,
-        backend(&registry, "nvme")?,
-    );
-    let probe = LinuxProbe::from_providers(vec![Box::new(system)]);
+    let registry = if invocation.command.needs_probe() {
+        let manifest = invocation
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Usage("required flag --manifest".into()))?;
+        Some(
+            BackendRegistry::load_from(manifest)
+                .map_err(|error| Error::Configuration(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let providers: Vec<Box<dyn disksgraph::host::StateProvider>> = if let Some(registry) = &registry
+    {
+        let local = NativeLocalProvider::new(
+            backend(registry, "udev-block")?,
+            backend(registry, "fdisk-partitions")?,
+            backend(registry, "blkid-signatures")?,
+            backend(registry, "devmapper-topology")?,
+            backend(registry, "cryptsetup-luks")?,
+            backend(registry, "loop")?,
+            backend(registry, "swap")?,
+            backend(registry, "multipath")?,
+            backend(registry, "lvm")?,
+            backend(registry, "mdraid")?,
+        );
+        let system = NativeSystemProvider::new(
+            local,
+            backend(registry, "libmount-mounts")?,
+            backend(registry, "btrfs-subvolumes")?,
+            backend(registry, "btrfs")?,
+            backend(registry, "zfs")?,
+            backend(registry, "nvme")?,
+        );
+        vec![Box::new(system)]
+    } else {
+        vec![]
+    };
+    let probe = LinuxProbe::from_providers(providers);
     let host = LinuxLiveHost::new(probe, UnconfiguredPolicy, UnconfiguredPolicy);
     let dispatcher = DisabledDispatcher(
         BackendId::new("cli-unconfigured")
