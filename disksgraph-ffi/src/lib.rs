@@ -9,3 +9,9 @@ mod registry;
 
 /// Version of the four exported signatures, independently checked from the JSON protocol.
 pub const ABI_VERSION: u32 = 1;
+
+/// Trusted Rust embedding of the same bounded owner transport; no host object crosses the ABI.
+pub mod transport {
+    pub use crate::abi::boundary;
+    pub use crate::registry::{call, close, open_with, reply, Error, Worker};
+}

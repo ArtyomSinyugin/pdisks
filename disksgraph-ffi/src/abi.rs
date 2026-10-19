@@ -7,7 +7,7 @@
 use stabby::string::String as StableString;
 
 /// Contains all ordinary Rust unwinding before returning an ABI-owned allocation.
-fn boundary(action: impl FnOnce() -> String) -> StableString {
+pub fn boundary(action: impl FnOnce() -> String) -> StableString {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         StableString::from(action().as_str())
     })) {

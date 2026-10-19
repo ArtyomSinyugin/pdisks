@@ -32,7 +32,7 @@ static CONTEXTS: OnceLock<Mutex<HashMap<u64, Arc<Mutex<Context>>>>> = OnceLock::
 /// Stable transport errors, separate from the application's own diagnostic codes.
 #[derive(Debug, Serialize)]
 #[serde(tag = "code", content = "detail", rename_all = "snake_case")]
-pub(crate) enum Error {
+pub enum Error {
     /// Invalid or unknown configuration fields.
     InvalidConfig(String),
     /// The checked signature version does not match the caller's intended API contract.
@@ -139,7 +139,7 @@ impl Drop for Context {
 }
 
 /// Wraps transport results with the same protocol version as ordinary application responses.
-pub(crate) fn reply(result: Result<Value, Error>) -> String {
+pub fn reply(result: Result<Value, Error>) -> String {
     let value = match result {
         Ok(result) => json!({"protocol_version":PROTOCOL_VERSION,"result":result}),
         Err(error) => json!({"protocol_version":PROTOCOL_VERSION,"error":error}),
@@ -179,55 +179,89 @@ fn config(input: &str) -> Result<Config, Error> {
     Ok(config)
 }
 
-/// Creates and owns the facade entirely on one thread, avoiding Send assertions and self-referential data.
-fn worker(config: Config, requests: mpsc::Receiver<Message>, ready: SyncSender<Result<(), Error>>) {
-    let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let live = config.manifest.is_some();
-        disksgraph::native::open(&config.root, config.manifest.as_deref())
-            .map(|app| Protocol::new(app, live))
-            .map_err(|error| Error::OpenFailed(error.to_string()))
-    }));
-    let mut protocol = match initialized {
-        Ok(Ok(protocol)) => protocol,
-        Ok(Err(error)) => {
-            let _ = ready.send(Err(error));
+/// Owns the bounded transport endpoints; a host factory serves its non-Send facade on this thread.
+/// This Rust object never crosses the ABI; the factory must keep registrations alive through serve.
+pub struct Worker {
+    /// Exactly one pending command, independent of passive job polling.
+    requests: mpsc::Receiver<Message>,
+    /// Handshake succeeds only once the host facade is constructed.
+    ready: SyncSender<Result<(), Error>>,
+    /// Explicit configuration, never proof of native readiness or authorization.
+    live: bool,
+}
+impl Worker {
+    /// Runs the shared protocol/job loop with a trusted configured host, borrowing its native owners.
+    /// All facade objects drop before this returns; close additionally joins the enclosing factory.
+    pub fn serve<C, A, D>(
+        self,
+        app: disksgraph::DisksGraph<disksgraph::host::host::LinuxLiveHost<'_, C, A>, D>,
+    ) where
+        C: disksgraph::host::capability::BackendCapabilityCheck,
+        A: disksgraph::host::authorization::AuthorizationContext,
+        D: disksgraph::host::dispatcher::BackendDispatcher,
+    {
+        let mut protocol = Protocol::new(app, self.live);
+        if self.ready.send(Ok(())).is_err() {
             return;
         }
-        Err(payload) => {
-            std::mem::forget(payload);
-            let _ = ready.send(Err(Error::Panicked));
-            return;
-        }
-    };
-    if ready.send(Ok(())).is_err() {
-        return;
-    }
-    while let Ok(message) = requests.recv() {
-        match message {
-            Message::Stop => break,
-            Message::Call(input, response) => {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    encode_reply(protocol.call(*input))
-                })) {
-                    Ok(result) => {
-                        let _ = response.send(result);
+        while let Ok(message) = self.requests.recv() {
+            match message {
+                Message::Stop => break,
+                Message::Call(input, response) => {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        encode_reply(protocol.call(*input))
+                    })) {
+                        Ok(result) => {
+                            let _ = response.send(result);
+                        }
+                        Err(payload) => {
+                            std::mem::forget(payload);
+                            let _ = response.send(reply(Err(Error::Panicked)));
+                            break;
+                        }
                     }
-                    Err(payload) => {
-                        std::mem::forget(payload);
-                        let _ = response.send(reply(Err(Error::Panicked)));
+                }
+                Message::Apply(plan, job) => {
+                    if !execute_job(&job, || {
+                        protocol.apply_plan_with_updates(plan, &mut |snapshot, events| {
+                            job.update(snapshot, events)
+                        })
+                    }) {
                         break;
                     }
                 }
             }
-            Message::Apply(plan, job) => {
-                if !execute_job(&job, || {
-                    protocol.apply_plan_with_updates(plan, &mut |snapshot, events| {
-                        job.update(snapshot, events)
-                    })
-                }) {
-                    break;
-                }
-            }
+        }
+    }
+}
+
+/// Contains host initialization failures on the owner thread, including before the ready handshake.
+fn worker(
+    config: Config,
+    requests: mpsc::Receiver<Message>,
+    ready: SyncSender<Result<(), Error>>,
+    initialize: impl FnOnce(PathBuf, Option<PathBuf>, Worker) -> Result<(), Error>,
+) {
+    let live = config.manifest.is_some();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        initialize(
+            config.root,
+            config.manifest,
+            Worker {
+                requests,
+                ready: ready.clone(),
+                live,
+            },
+        )
+    }));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = ready.send(Err(error));
+        }
+        Err(payload) => {
+            std::mem::forget(payload);
+            let _ = ready.send(Err(Error::Panicked));
         }
     }
 }
@@ -249,6 +283,21 @@ fn execute_job(job: &Job, action: impl FnOnce() -> Result<Value, ProtocolError>)
 
 /// Opens at most MAX_CONTEXTS owners, with no global lock held during native loading or probing.
 pub(crate) fn open(input: &str) -> Result<Value, Error> {
+    open_with(input, |root, manifest, worker| {
+        let app = disksgraph::native::open(&root, manifest.as_deref())
+            .map_err(|error| Error::OpenFailed(error.to_string()))?;
+        worker.serve(app);
+        Ok(())
+    })
+}
+
+/// Opens a context using an explicit trusted Rust host factory, never selected from request JSON.
+/// The factory runs on its worker; it must call serve before returning and keep its host owners scoped.
+/// Dropped factories, failed initialization and panics release the reservation after joining.
+pub fn open_with(
+    input: &str,
+    initialize: impl FnOnce(PathBuf, Option<PathBuf>, Worker) -> Result<(), Error> + Send + 'static,
+) -> Result<Value, Error> {
     let config = config(input)?;
     let live = config.manifest.is_some();
     let slot = Slot::acquire()?;
@@ -259,7 +308,7 @@ pub(crate) fn open(input: &str) -> Result<Value, Error> {
     let (ready, initialized) = mpsc::sync_channel(1);
     let worker = thread::Builder::new()
         .name(format!("disksgraph-{id}"))
-        .spawn(move || worker(config, requests, ready))
+        .spawn(move || worker(config, requests, ready, initialize))
         .map_err(|error| Error::OpenFailed(error.to_string()))?;
     let context = Context {
         sender,
@@ -280,7 +329,7 @@ pub(crate) fn open(input: &str) -> Result<Value, Error> {
 }
 
 /// Forwards to the sole owner; try_lock bounds concurrent demand without blocking unrelated contexts.
-pub(crate) fn call(id: u64, input: &str) -> Result<String, Error> {
+pub fn call(id: u64, input: &str) -> Result<String, Error> {
     if input.len() > MAX_REQUEST_BYTES {
         return Err(Error::ResourceLimit);
     }
@@ -354,7 +403,7 @@ pub(crate) fn call(id: u64, input: &str) -> Result<String, Error> {
 }
 
 /// Removes the handle before joining; stale or racing calls can never acquire a replacement owner.
-pub(crate) fn close(id: u64) -> Result<Value, Error> {
+pub fn close(id: u64) -> Result<Value, Error> {
     let context = {
         let mut contexts = CONTEXTS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -599,6 +648,46 @@ mod tests {
         assert_eq!(result["finished"], true);
         assert_eq!(result["snapshot"], Value::Null);
         assert_eq!(result["error"]["code"], "live_unavailable");
+        Ok(())
+    }
+    /// Factories cannot bypass negotiation; close joins their scoped owners and all failure paths release slots.
+    #[test]
+    fn trusted_factory_lifetime_is_scoped_to_the_joined_owner() -> Result<(), Box<dyn StdError>> {
+        use std::sync::atomic::AtomicBool;
+        let _serial = TESTS.lock().unwrap_or_else(|error| error.into_inner());
+        let scratch = Scratch::new()?;
+        assert!(matches!(
+            open_with("{\"abi_version\":99}", |_, _, _| panic!(
+                "must not initialize"
+            )),
+            Err(Error::UnsupportedAbiVersion(99))
+        ));
+        assert!(matches!(
+            open_with(&scratch.config(), |_, _, _| Ok(())),
+            Err(Error::Stopped)
+        ));
+        assert!(matches!(
+            open_with(&scratch.config(), |_, _, _| panic!(
+                "controlled factory failure"
+            )),
+            Err(Error::Panicked)
+        ));
+        assert_eq!(SLOTS.load(Ordering::Acquire), 0);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let after = dropped.clone();
+        let opened = open_with(&scratch.config(), move |root, manifest, worker| {
+            let app = disksgraph::native::open(&root, manifest.as_deref())
+                .map_err(|error| Error::OpenFailed(error.to_string()))?;
+            worker.serve(app);
+            after.store(true, Ordering::Release);
+            Ok(())
+        })
+        .map_err(|error| format!("{error:?}"))?;
+        let id = opened["context"].as_u64().ok_or("context")?;
+        assert!(!dropped.load(Ordering::Acquire));
+        close(id).map_err(|error| format!("{error:?}"))?;
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(SLOTS.load(Ordering::Acquire), 0);
         Ok(())
     }
 }
