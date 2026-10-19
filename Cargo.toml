@@ -8,6 +8,7 @@ members = [
     "storage-runtime",
     "disksgraph",
     "dg-cli",
+    "disksgraph-ffi",
 ]
 
 [workspace.package]
@@ -38,3 +39,4 @@ serde_json = { version = "1.0.91", features = ["preserve_order"] }
 thiserror = "2.0.18"
 libloading = "0.9.0"
 uuid = { version = "1.26.0", features = ["v7", "serde"] }
+stabby = { version = "=72.1.16", features = ["libloading"] }
