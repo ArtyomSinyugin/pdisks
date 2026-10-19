@@ -165,3 +165,50 @@ fn coordinator_restart_blocks_before_probe_and_dispatch() -> Result<(), Box<dyn 
     }
     Ok(())
 }
+
+/// Observer unwinding cannot clear an armed marker or make the same coordinator retry an effect.
+#[test]
+fn observer_panic_retains_stop_latch_and_checkpoint() -> Result<(), Box<dyn Error>> {
+    use storage_runtime::coordinator::CoordinatorError;
+    let _process = isolate_processes();
+    for phase in [ActionRunState::Admitted, ActionRunState::Verified] {
+        let scratch = admission::Scratch::new()?;
+        let (state, frozen) = fixture()?;
+        let state = Rc::new(RefCell::new(state));
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let mut fake = coordination::dispatcher(&scratch, state.clone());
+        fake.created_uuid = Some("created-lv".into());
+        let calls = fake.calls.clone();
+        let mut coordinator = ExecutionCoordinator::new(
+            ExecutionRoot::open(&scratch.0)?,
+            coordination::host(state, &run)?,
+            fake,
+            &run,
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            coordinator.execute_run_with_updates(&mut run, &mut |run| {
+                if run.state(ActionId::new(0)).ok() == Some(phase)
+                    && scratch.0.join("active-attempt.json").exists()
+                {
+                    panic!("controlled observer failure at {phase:?}");
+                }
+            })
+        }));
+        assert!(result.is_err());
+        let active = scratch.0.join("active-attempt.json");
+        let bytes = fs::read(&active)?;
+        assert_eq!(ActiveAttempt::from_bytes(&bytes)?.run_id, run.run_id());
+        assert_eq!(run.state(ActionId::new(0))?, phase);
+        assert!(!run.is_verified());
+        let expected_calls = usize::from(phase == ActionRunState::Verified);
+        assert_eq!(calls.get(), expected_calls);
+        assert!(matches!(
+            coordinator.execute_run(&mut run),
+            Err(CoordinatorError::Stopped)
+        ));
+        assert_eq!(calls.get(), expected_calls);
+        assert_eq!(fs::read(active)?, bytes);
+        assert!(ExecutionRoot::open(&scratch.0)?.try_lock_host().is_ok());
+    }
+    Ok(())
+}
