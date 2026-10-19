@@ -153,6 +153,14 @@ fn checked_import_preserves_editing_parity_and_rejects_foreign_handles() -> Resu
         "live_unavailable"
     );
     assert_eq!(
+        api.method(first, "apply_start", json!({"plan":plan}))?["error"]["code"],
+        "live_unavailable"
+    );
+    assert_eq!(
+        api.method(first, "job_poll", json!({"job":1,"since":0}))?["error"]["code"],
+        "unknown_job"
+    );
+    assert_eq!(
         api.method(first, "probe", json!({}))?["error"]["code"],
         "live_unavailable"
     );
@@ -219,6 +227,93 @@ fn native_provider_calls_retain_one_owner_and_failed_run_evidence() -> Result<()
             .is_array()
     );
     assert!(!scratch.0.join("active-attempt.json").exists());
+    let job = api.method(context, "apply_start", json!({"plan":plan}))?["result"]["job"].clone();
+    assert!(job.is_u64());
+    let other = api.open(&scratch.config())?["result"]["context"]
+        .as_u64()
+        .ok_or("other context")?;
+    assert_eq!(
+        api.method(other, "job_poll", json!({"job":job,"since":0}))?["error"]["code"],
+        "unknown_job"
+    );
+    let terminal = poll_job(&api, context, &job)?;
+    assert_eq!(terminal["error"], Value::Null, "{terminal}");
+    assert_eq!(terminal["snapshot"]["finished"], true);
+    assert_eq!(terminal["snapshot"]["verified"], false);
+    let async_run = terminal["snapshot"]["run_id"].clone();
+    assert!(async_run.is_string());
+    assert_ne!(async_run, run);
+    assert_eq!(
+        api.method(context, "run_snapshot", json!({"run":async_run}))?["result"],
+        terminal["snapshot"]
+    );
+    assert_eq!(
+        api.method(context, "run_events", json!({"run":async_run,"since":0}))?["result"],
+        terminal["events"]
+    );
+    assert_eq!(
+        api.method(context, "apply_start", json!({"plan":plan}))?["error"]["code"],
+        "resource_limit"
+    );
+    let future = terminal["events"]["next_sequence"]
+        .as_u64()
+        .ok_or("event cursor")?
+        + 1;
+    assert_eq!(
+        api.method(context, "job_poll", json!({"job":job,"since":future}))?["error"]["code"],
+        "invalid_event_cursor"
+    );
+    assert_eq!(
+        api.method(context, "job_cancel", json!({"job":job}))?["error"]["code"],
+        "unsupported_operation"
+    );
+    assert!(api
+        .method(context, "job_close", json!({"job":job}))?
+        .get("error")
+        .is_none());
+    assert_eq!(
+        api.method(context, "job_poll", json!({"job":job,"since":0}))?["error"]["code"],
+        "unknown_job"
+    );
+    assert_eq!(
+        api.method(context, "run_snapshot", json!({"run":async_run}))?["result"],
+        terminal["snapshot"]
+    );
+    let invalid = json!("00000000-0000-7000-8000-000000000099");
+    let next =
+        api.method(context, "apply_start", json!({"plan":invalid}))?["result"]["job"].clone();
+    assert_ne!(next, job);
+    let rejected = poll_job(&api, context, &next)?;
+    assert_eq!(rejected["snapshot"], Value::Null);
+    assert_eq!(rejected["error"]["code"], "application");
+    assert_eq!(rejected["error"]["detail"]["code"], "unknown_plan");
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    api.close(other)?;
     api.close(context)?;
     Ok(())
+}
+
+/// Polls a real imported job with a deadline; queued/in-flight snapshots are never mistaken for success.
+fn poll_job(api: &Api, context: u64, job: &Value) -> Result<Value, Error> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut since = 0;
+    loop {
+        let response = api.method(context, "job_poll", json!({"job":job,"since":since}))?;
+        assert!(response.get("error").is_none(), "{response}");
+        let result = response["result"].clone();
+        if result["finished"] == true {
+            // Fetch a complete retained page to compare with the ordinary run_events method.
+            return Ok(
+                api.method(context, "job_poll", json!({"job":job,"since":0}))?["result"].clone(),
+            );
+        }
+        since = result["events"]["next_sequence"]
+            .as_u64()
+            .ok_or("job cursor")?;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job did not finish: {result}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }

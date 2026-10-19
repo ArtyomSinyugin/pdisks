@@ -167,9 +167,10 @@ challenge и независимую safety policy runtime. Никакого но
 Пример [`c6_vm.rs`](dg-cli/examples/c6_vm.rs) импортирует только `disksgraph` для
 публичного workflow и явной host-конфигурации. Существующий [VM runner](storage-runtime/tests/vm/README.md)
 проверяет через фасад реальную четырёхшаговую цепочку, fresh final probe, events,
-source map и отказ после arm. CLI C6 описан ниже. Начальный синхронный
+source map и отказ после arm. CLI C6 описан ниже.
 [Stabby API C7](disksgraph-ffi/README.md) экспортирует тот же фасад через checked
-imports и versioned JSON; асинхронные ABI jobs ещё не реализованы.
+imports и versioned JSON, включая один bounded apply job на context и passive
+snapshot/events polling. Полный reviewed workflow через ABI ещё не завершён.
 Disks preview остаётся отключённым.
 
 ## CLI C6 — сохранённые черновики и foreground apply
