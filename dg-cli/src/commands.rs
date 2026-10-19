@@ -271,7 +271,7 @@ pub fn execute_with_io<C: BackendCapabilityCheck, A: AuthorizationContext, D: Ba
             let mut output_error = if *stream {
                 write_event(events, &serde_json::json!({"type":"stream", "since":0}))
                     .err()
-                    .map(|error| error.to_string())
+                    .map(|_| disksgraph::diagnostics::REDACTED.to_owned())
             } else {
                 None
             };
@@ -279,7 +279,7 @@ pub fn execute_with_io<C: BackendCapabilityCheck, A: AuthorizationContext, D: Ba
                 if *stream && output_error.is_none() {
                     output_error = write_event(events, event)
                         .err()
-                        .map(|error| error.to_string());
+                        .map(|_| disksgraph::diagnostics::REDACTED.to_owned());
                 }
             };
             let run = match app.apply_plan_with_events(plan, &mut observer) {

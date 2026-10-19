@@ -26,19 +26,19 @@ pub fn result_exit_code(value: &serde_json::Value) -> u8 {
 pub enum Error {
     /// Invalid command or unsupported option, rejected before configuring native providers.
     #[error("{0}")]
-    Usage(String),
+    Usage(#[serde(serialize_with = "disksgraph::diagnostics::serialize_message")] String),
     /// A document could not be read, published or synchronized.
     #[error("{0}")]
-    Io(String),
+    Io(#[serde(serialize_with = "disksgraph::diagnostics::serialize_message")] String),
     /// Input exceeded the bounded file contract or failed JSON validation.
     #[error("{0}")]
-    Document(String),
+    Document(#[serde(serialize_with = "disksgraph::diagnostics::serialize_message")] String),
     /// The shared application rejected the operation.
     #[error(transparent)]
     Application(#[from] disksgraph::DisksGraphError),
     /// Explicit native host configuration could not be loaded.
     #[error("{0}")]
-    Configuration(String),
+    Configuration(#[serde(serialize_with = "disksgraph::diagnostics::serialize_message")] String),
 }
 
 impl Error {
