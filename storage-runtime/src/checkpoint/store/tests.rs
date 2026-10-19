@@ -29,6 +29,8 @@ fn serialize_process_tests() -> MutexGuard<'static, ()> {
 /// Boundaries where a failed acknowledgment or process death must prevent ordinary continuation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Boundary {
+    /// Reading the active name fails before absence or contents can be established.
+    Read,
     /// A staging file contains only the first half of its serialized attempt.
     Write,
     /// Contents have been written, but file fsync has not yet succeeded.
@@ -380,5 +382,31 @@ fn unlink_failure_retains_checkpoint_and_blocks_successor() -> Result<(), Box<dy
         CheckpointStore::new(&lock).arm(&fixture()),
         Err(CheckpointError::AlreadyActive)
     ));
+    Ok(())
+}
+
+/// Read errors never mean no incident, and neither arm nor clear may alter the unknown file.
+#[test]
+fn read_failure_blocks_inspect_arm_and_clear() -> Result<(), Box<dyn Error>> {
+    let _serial = serialize_process_tests();
+    let scratch = Scratch::new()?;
+    let root = ExecutionRoot::open(&scratch.0)?;
+    let lock = root.try_lock_host()?;
+    let store = CheckpointStore::new(&lock);
+    let attempt = fixture();
+    store.arm(&attempt)?;
+    let bytes = fs::read(scratch.0.join(ACTIVE_FILE))?;
+    FAULT.set(Some((Boundary::Read, false)));
+    assert!(matches!(store.inspect(), Err(CheckpointError::Io(_))));
+    FAULT.set(Some((Boundary::Read, false)));
+    assert!(matches!(store.arm(&fixture()), Err(CheckpointError::Io(_))));
+    FAULT.set(Some((Boundary::Read, false)));
+    assert!(matches!(
+        store.clear(attempt.run_id, attempt.action_id),
+        Err(CheckpointError::Io(_))
+    ));
+    assert_eq!(fs::read(scratch.0.join(ACTIVE_FILE))?, bytes);
+    assert_eq!(store.inspect()?, Some(attempt));
+    assert_eq!(fs::read_dir(&scratch.0)?.count(), 2);
     Ok(())
 }

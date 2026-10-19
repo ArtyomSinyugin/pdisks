@@ -144,6 +144,8 @@ impl<'lock> CheckpointStore<'lock> {
 
     /// Retains the opened file identity for the final no-follow check before removal.
     fn read_current(&self) -> Result<Option<(ActiveAttempt, Stat)>, CheckpointError> {
+        #[cfg(test)]
+        tests::boundary(tests::Boundary::Read)?;
         let fd = match openat(
             self.lock.directory(),
             ACTIVE_FILE,
