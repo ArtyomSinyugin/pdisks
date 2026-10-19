@@ -12,7 +12,7 @@ use storage_engine::{
     editing::NodeCorrelation,
     live::{ObservationError, check_observed_postconditions_with_bindings},
 };
-use storage_provider::{ActionOutput, LvmAction, ProviderAction};
+use storage_provider::{ActionOutput, FilesystemAction, LvmAction, ProviderAction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -58,6 +58,25 @@ pub(crate) struct PendingLvBinding {
     spec: NodeSpec,
 }
 
+/// A filesystem candidate is private until its actual completion passes all frozen postconditions.
+#[derive(Debug)]
+pub(crate) struct PendingFilesystemBinding {
+    /// Attempt and action that dispatched this filesystem creation.
+    run_id: Uuid,
+    /// Frozen action that owns this output.
+    action: ActionId,
+    /// Exact retained post-dispatch publication.
+    observation: ObservationReference,
+    /// Stable planned filesystem identity.
+    planned: NodeId,
+    /// New ext4 UUID independently seen in the completion.
+    uuid: String,
+    /// Verified LV output from the same attempt.
+    backing: NodeId,
+    /// Requested properties; observed filesystem capacity is not a managed create property.
+    spec: NodeSpec,
+}
+
 /// Confirmed new outputs scoped to one attempt; no deserialization or manual insertion exists.
 #[derive(Debug)]
 pub struct OutputBindings {
@@ -65,6 +84,8 @@ pub struct OutputBindings {
     run_id: Uuid,
     /// Only candidates that passed the engine's full verification are inserted here.
     entries: HashMap<NodeId, PendingLvBinding>,
+    /// Ext4 outputs whose UUID, owner, scope and postconditions were independently verified.
+    filesystems: HashMap<NodeId, PendingFilesystemBinding>,
 }
 
 impl OutputBindings {
@@ -73,15 +94,16 @@ impl OutputBindings {
         Self {
             run_id: run.run_id(),
             entries: HashMap::new(),
+            filesystems: HashMap::new(),
         }
     }
     /// Reports the number of independently verified created outputs.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.filesystems.len()
     }
     /// Reports whether this attempt has any verified created outputs.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.filesystems.is_empty()
     }
 
     /// Resolves a verified output again by UUID and owning VG in a fresh observation.
@@ -94,6 +116,20 @@ impl OutputBindings {
     ) -> Result<NodeId, BindingError> {
         if self.run_id != run.run_id() {
             return Err(BindingError::NotVerified);
+        }
+        if let Some(binding) = self.filesystems.get(&planned) {
+            observed.validate()?;
+            if observed.reference.probe_instance != binding.observation.probe_instance
+                || observed.reference.epoch < binding.observation.epoch
+            {
+                return Err(BindingError::Identity);
+            }
+            let backing = self.resolve(run, binding.backing, observed)?;
+            let NodeKind::Filesystem { label, .. } = &binding.spec.kind else {
+                return Err(BindingError::Identity);
+            };
+            return crate::filesystem::observe_ext4(observed, backing, &binding.uuid, label)
+                .map_err(|_| BindingError::Identity);
         }
         let binding = self
             .entries
@@ -122,12 +158,25 @@ impl OutputBindings {
             return Err(BindingError::NotVerified);
         }
         self.entries
-            .iter()
-            .map(|(planned, binding)| {
+            .keys()
+            .chain(self.filesystems.keys())
+            .map(|planned| {
+                let identity = if let Some(binding) = self.entries.get(planned) {
+                    ExternalId::LvmLvUuid(binding.uuid.clone())
+                } else {
+                    let binding = self
+                        .filesystems
+                        .get(planned)
+                        .ok_or(BindingError::Identity)?;
+                    ExternalId::Filesystem {
+                        fs_type: "ext4".into(),
+                        value: binding.uuid.clone(),
+                    }
+                };
                 Ok(NodeCorrelation {
                     source: *planned,
                     target: self.resolve(run, *planned, observed)?,
-                    identity: ExternalId::LvmLvUuid(binding.uuid.clone()),
+                    identity,
                 })
             })
             .collect()
@@ -175,7 +224,58 @@ impl OutputBindings {
                 kind: DependencyKind::Provides,
             });
         }
+        for (planned, binding) in &self.filesystems {
+            expected
+                .graph
+                .insert_new(
+                    *planned,
+                    Node {
+                        kind: binding.spec.clone(),
+                        size: NodeFacts {
+                            presence: Presence::Present,
+                            identities: vec![ExternalId::Filesystem {
+                                fs_type: "ext4".into(),
+                                value: binding.uuid.clone(),
+                            }],
+                            ..NodeFacts::default()
+                        },
+                    },
+                )
+                .map_err(|_| BindingError::Identity)?;
+            expected.graph.insert_dependency(Dependency {
+                from: binding.backing,
+                to: *planned,
+                kind: DependencyKind::Backs,
+            });
+        }
         Ok(expected)
+    }
+
+    /// Publishes a filesystem only after this exact completion is accepted as Verified.
+    pub(crate) fn record_verified_filesystem(
+        &mut self,
+        run: &ExecutionRun,
+        binding: PendingFilesystemBinding,
+    ) -> Result<(), BindingError> {
+        if self.run_id != run.run_id()
+            || binding.run_id != run.run_id()
+            || run.state(binding.action)? != ActionRunState::Verified
+            || run
+                .completion(binding.action)?
+                .map(|completion| completion.observation.reference)
+                != Some(binding.observation)
+            || !self.entries.contains_key(&binding.backing)
+            || self.entries.contains_key(&binding.planned)
+            || self.filesystems.contains_key(&binding.planned)
+            || self
+                .filesystems
+                .values()
+                .any(|other| other.uuid == binding.uuid)
+        {
+            return Err(BindingError::NotVerified);
+        }
+        self.filesystems.insert(binding.planned, binding);
+        Ok(())
     }
 
     /// Publishes only a candidate bound to the exact completion just accepted as Verified.
@@ -192,6 +292,7 @@ impl OutputBindings {
                 .map(|completion| completion.observation.reference)
                 != Some(binding.observation)
             || self.entries.contains_key(&binding.planned)
+            || self.filesystems.contains_key(&binding.planned)
             || self
                 .entries
                 .values()
@@ -419,4 +520,92 @@ fn find_lv(observed: &LiveObservation, uuid: &str, vg_uuid: &str) -> Result<Node
         return Err(BindingError::Identity);
     }
     Ok(*id)
+}
+
+/// Checks actual ext4 output identity, admitted LV ownership and all remaining reviewed scope.
+/// A missing UUID cannot produce a pending binding or a successful NodeMatches postcondition.
+pub(crate) fn verify_created_filesystem(
+    run: &ExecutionRun,
+    action: ActionId,
+    resolved: &ResolvedAction,
+    bindings: &OutputBindings,
+    before: &LiveObservation,
+    created_uuid: Option<&str>,
+) -> Result<(VerificationReport, Option<PendingFilesystemBinding>), BindingError> {
+    let completion = run.completion(action)?.ok_or(BindingError::NotVerified)?;
+    let context = run.context();
+    let contract = &context.plan.actions()[action.get() as usize].informational_contract;
+    let ProviderAction::Filesystem(FilesystemAction::Create {
+        backing,
+        planned_node_id,
+        filesystem: storage_core::model::FilesystemKind::Ext4,
+        label,
+    }) = resolved.operation()
+    else {
+        return Err(BindingError::Identity);
+    };
+    let actual = &completion.observation;
+    let mut correlations = bindings.correlations(run, actual)?;
+    let mut pending = None;
+    if let Some(uuid) = created_uuid {
+        let before_backing = bindings.resolve(run, *backing, before)?;
+        let binding = crate::filesystem::correlate_created_ext4(
+            before,
+            actual,
+            *planned_node_id,
+            before_backing,
+            uuid,
+            label,
+        )
+        .map_err(|_| BindingError::Identity)?;
+        let mut remaining = actual.snapshot.clone();
+        let edges: Vec<_> = remaining
+            .graph
+            .dependencies()
+            .filter(|edge| edge.to == binding.target)
+            .cloned()
+            .collect();
+        for edge in edges {
+            remaining.graph.remove_dependency(&edge);
+        }
+        remaining.graph.remove_node(&binding.target);
+        check_scope(
+            &bindings.reviewed_scope(run, before)?,
+            &remaining,
+            resolved.target().planned_id,
+        )?;
+        let spec = contract
+            .provided_outputs
+            .iter()
+            .find_map(|output| match output {
+                ActionOutput::Node { id, spec } if id == planned_node_id => Some(spec.clone()),
+                _ => None,
+            })
+            .ok_or(BindingError::Identity)?;
+        correlations.push(binding);
+        pending = Some(PendingFilesystemBinding {
+            run_id: run.run_id(),
+            action,
+            observation: actual.reference,
+            planned: *planned_node_id,
+            uuid: uuid.into(),
+            backing: *backing,
+            spec,
+        });
+    }
+    let report = check_observed_postconditions_with_bindings(
+        context.historical_baseline,
+        actual,
+        &contract.postconditions,
+        &correlations,
+    )?;
+    Ok((
+        VerificationReport {
+            run_id: run.run_id(),
+            action,
+            observation: report.observation,
+            checks: report.checks,
+        },
+        pending,
+    ))
 }

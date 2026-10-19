@@ -1,9 +1,12 @@
 //! Sequential DAG execution sharing one admission/checkpoint/dispatch path and independent final verification.
 
 use crate::{
-    bindings::{BindingError, OutputBindings, verify_activation, verify_created_lv},
+    bindings::{
+        BindingError, OutputBindings, verify_activation, verify_created_filesystem,
+        verify_created_lv,
+    },
     checkpoint::{ActiveAttempt, CheckpointError, CheckpointStore},
-    dispatcher::{BackendDispatcher, ExecutionReceipt},
+    dispatcher::{BackendDispatcher, DispatchError, ExecutionReceipt},
     host::{HostError, RuntimeHost, check_reviewed_plan},
     lease::{ExecutionLease, ExecutionRoot, HostExecutionLock, LeaseError},
 };
@@ -31,6 +34,9 @@ pub enum CoordinatorError {
     /// The coordinator and output bindings belong to a different execution attempt.
     #[error("coordinator belongs to another run")]
     RunMismatch,
+    /// An adapter returned identity evidence for a different operation.
+    #[error(transparent)]
+    Receipt(#[from] DispatchError),
     /// Created output identity or actual result could not be established.
     #[error(transparent)]
     Binding(#[from] BindingError),
@@ -264,6 +270,10 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
                 return Err(error.into());
             }
         };
+        if let Err(error) = receipt.validate_for(resolved.operation()) {
+            run.mark_outcome_unknown(action, error.to_string())?;
+            return Err(error.into());
+        }
         if let Err(error) = run.record_completion(BackendCompletion {
             run_id: run.run_id(),
             action,
@@ -274,8 +284,25 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             return Err(error.into());
         }
         let mut pending = None;
+        let mut pending_filesystem = None;
         if run.state(action)? == ActionRunState::Verifying {
-            let verification = if resolved.lv_target().is_some() {
+            let verification = if matches!(
+                resolved.operation(),
+                storage_provider::ProviderAction::Filesystem(_)
+            ) {
+                verify_created_filesystem(
+                    run,
+                    action,
+                    &resolved,
+                    &self.bindings,
+                    observed.observation(),
+                    receipt.created_filesystem_uuid.as_deref(),
+                )
+                .map(|(report, candidate)| {
+                    pending_filesystem = candidate;
+                    (report, None)
+                })
+            } else if resolved.lv_target().is_some() {
                 verify_activation(
                     run,
                     action,
@@ -309,6 +336,9 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         if state == ActionRunState::Verified {
             if let Some(binding) = pending {
                 self.bindings.record_verified(run, binding)?;
+            }
+            if let Some(binding) = pending_filesystem {
+                self.bindings.record_verified_filesystem(run, binding)?;
             }
             store.clear(run.run_id(), action)?;
             self.halted = false;
