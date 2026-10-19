@@ -1,6 +1,7 @@
 //! Execution lifecycle and trusted live-check contracts; no backend dispatch is implemented.
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use storage_core::model::{CurrentState, DesiredState, ProbeEpoch};
 use storage_provider::{ActionPrerequisite, Postcondition, ResourceAccess, ResourceAccessMode};
 use thiserror::Error;
@@ -10,6 +11,11 @@ use crate::{
     ActionId, ExecutionPlan, GoalAspect, HistoricalBaseline, PlanDocument, PlanDocumentError,
     PlannedAction, ProtectedScope,
 };
+
+/// Maximum number of retained events per live run; older events are evicted, never persisted.
+pub const MAX_RUN_EVENTS: usize = 1024;
+/// Byte bound on one provider progress message, limiting the retained event payload as well as count.
+pub const MAX_PROGRESS_BYTES: usize = 4096;
 
 /// One action's runtime lifecycle, never stored in the immutable plan document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,7 +287,9 @@ pub struct ExecutionRun {
     /// Most recent complete final verification report.
     goal_verification: Option<GoalVerificationReport>,
     /// Ordered events retained for reconnecting clients.
-    events: Vec<RunEvent>,
+    events: VecDeque<RunEvent>,
+    /// Next event identity, independent of the number of retained entries.
+    next_event_sequence: u64,
 }
 
 /// Rejected runtime transition or evidence report; no backend is invoked on errors.
@@ -333,6 +341,12 @@ pub enum ExecutionRunError {
     /// The final goal cannot be verified before all actions have verified results.
     #[error("final verification requires every action to be Verified")]
     ActionsNotVerified,
+    /// No transition may wrap the event cursor or partially publish a multi-event admission.
+    #[error("run event sequence exhausted")]
+    EventSequenceExhausted,
+    /// Provider progress cannot grow the bounded event buffer without a byte limit.
+    #[error("progress exceeds {MAX_PROGRESS_BYTES} bytes")]
+    ProgressTooLarge,
 }
 
 impl ExecutionRun {
@@ -365,7 +379,8 @@ impl ExecutionRun {
                 .map(|check| check.aspect)
                 .collect(),
             goal_verification: None,
-            events: Vec::new(),
+            events: VecDeque::new(),
+            next_event_sequence: 1,
         })
     }
 
@@ -480,7 +495,7 @@ impl ExecutionRun {
         }) {
             return Err(ExecutionRunError::ActiveAction);
         }
-        self.set_state(action, ActionRunState::Checking);
+        self.set_state(action, ActionRunState::Checking)?;
         Ok(())
     }
 
@@ -508,11 +523,16 @@ impl ExecutionRun {
             .chain(report.checks.iter().map(|check| &check.status));
         let state = evidence_state(statuses, ActionRunState::Admitted, ActionRunState::Checking);
         let admitted = state == ActionRunState::Admitted;
+        self.ensure_event_capacity(if state == ActionRunState::Checking {
+            1
+        } else {
+            2
+        })?;
         self.latest_observation = Some(report.observation.clone());
         self.actions[action.get() as usize].admission = Some(report);
-        self.push_event(RunEventKind::Admission { action, admitted });
+        self.push_event(RunEventKind::Admission { action, admitted })?;
         if state != ActionRunState::Checking {
-            self.set_state(action, state);
+            self.set_state(action, state)?;
         }
         Ok(admitted)
     }
@@ -521,7 +541,7 @@ impl ExecutionRun {
     /// This transition neither creates a checkpoint nor proves that a backend was actually called.
     pub fn mark_dispatch_started(&mut self, action: ActionId) -> Result<(), ExecutionRunError> {
         self.require_state(action, ActionRunState::Admitted)?;
-        self.set_state(action, ActionRunState::Running);
+        self.set_state(action, ActionRunState::Running)?;
         Ok(())
     }
 
@@ -532,8 +552,9 @@ impl ExecutionRun {
         reason: String,
     ) -> Result<(), ExecutionRunError> {
         self.require_state(action, ActionRunState::Admitted)?;
+        self.ensure_event_capacity(1)?;
         self.actions[action.get() as usize].pre_dispatch_failure = Some(reason);
-        self.set_state(action, ActionRunState::Failed);
+        self.set_state(action, ActionRunState::Failed)?;
         Ok(())
     }
 
@@ -552,9 +573,10 @@ impl ExecutionRun {
             BackendOutcome::Failed { .. } => ActionRunState::Failed,
             BackendOutcome::OutcomeUnknown { .. } => ActionRunState::OutcomeUnknown,
         };
+        self.ensure_event_capacity(1)?;
         self.latest_observation = Some(completion.observation.clone());
         self.actions[action.get() as usize].completion = Some(completion);
-        self.set_state(action, state);
+        self.set_state(action, state)?;
         Ok(())
     }
 
@@ -584,8 +606,9 @@ impl ExecutionRun {
             ActionRunState::Verified,
             ActionRunState::OutcomeUnknown,
         );
+        self.ensure_event_capacity(1)?;
         self.actions[action.get() as usize].verification = Some(report);
-        self.set_state(action, state);
+        self.set_state(action, state)?;
         Ok(state == ActionRunState::Verified)
     }
 
@@ -600,8 +623,9 @@ impl ExecutionRun {
         if !matches!(state, ActionRunState::Running | ActionRunState::Verifying) {
             return Err(ExecutionRunError::InvalidTransition { action, state });
         }
+        self.ensure_event_capacity(1)?;
         self.actions[action.get() as usize].unknown_reason = Some(reason);
-        self.set_state(action, ActionRunState::OutcomeUnknown);
+        self.set_state(action, ActionRunState::OutcomeUnknown)?;
         Ok(())
     }
 
@@ -612,7 +636,10 @@ impl ExecutionRun {
         detail: String,
     ) -> Result<(), ExecutionRunError> {
         self.require_state(action, ActionRunState::Running)?;
-        self.push_event(RunEventKind::Progress { action, detail });
+        if detail.len() > MAX_PROGRESS_BYTES {
+            return Err(ExecutionRunError::ProgressTooLarge);
+        }
+        self.push_event(RunEventKind::Progress { action, detail })?;
         Ok(())
     }
 
@@ -638,9 +665,10 @@ impl ExecutionRun {
                 .checks
                 .iter()
                 .all(|check| check.status == LiveCheckStatus::Satisfied);
+        self.ensure_event_capacity(1)?;
         self.latest_observation = Some(report.observation.clone());
         self.goal_verification = Some(report);
-        self.push_event(RunEventKind::GoalVerification { verified });
+        self.push_event(RunEventKind::GoalVerification { verified })?;
         Ok(verified)
     }
 
@@ -706,19 +734,38 @@ impl ExecutionRun {
         Ok(())
     }
 
-    /// Publishes one validated state change with a monotonically ordered event.
-    fn set_state(&mut self, action: ActionId, state: ActionRunState) {
-        self.actions[action.get() as usize].state = state;
-        self.push_event(RunEventKind::ActionState { action, state });
+    /// Rejects exhaustion before mutating evidence or publishing any part of a transition.
+    fn ensure_event_capacity(&self, count: u64) -> Result<(), ExecutionRunError> {
+        self.next_event_sequence
+            .checked_add(count)
+            .ok_or(ExecutionRunError::EventSequenceExhausted)?;
+        Ok(())
     }
 
-    /// Appends a reconnectable event; Vec allocation bounds keep its sequence below u64::MAX.
-    fn push_event(&mut self, kind: RunEventKind) {
-        self.events.push(RunEvent {
+    /// Publishes one validated state change with a monotonically ordered event.
+    fn set_state(
+        &mut self,
+        action: ActionId,
+        state: ActionRunState,
+    ) -> Result<(), ExecutionRunError> {
+        self.ensure_event_capacity(1)?;
+        self.actions[action.get() as usize].state = state;
+        self.push_event(RunEventKind::ActionState { action, state })
+    }
+
+    /// Appends one bounded event without deriving its identity from the truncated buffer.
+    fn push_event(&mut self, kind: RunEventKind) -> Result<(), ExecutionRunError> {
+        self.ensure_event_capacity(1)?;
+        if self.events.len() == MAX_RUN_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(RunEvent {
             run_id: self.run_id,
-            sequence: self.events.len() as u64 + 1,
+            sequence: self.next_event_sequence,
             kind,
         });
+        self.next_event_sequence += 1;
+        Ok(())
     }
 }
 
@@ -871,6 +918,56 @@ mod tests {
             run.record_verification(report)
                 .unwrap_or_else(|error| panic!("record verification: {error}"))
         );
+    }
+
+    /// Event identities survive eviction, oversized progress is rejected, and exhaustion is atomic.
+    #[test]
+    fn bounded_events_keep_monotonic_sequences_and_reject_exhaustion()
+    -> Result<(), ExecutionRunError> {
+        let mut run = ExecutionRun::new(&crate::wire::tests::document_fixture())?;
+        let action = ActionId::new(0);
+        let instance = Uuid::now_v7();
+        run.begin_check(action)?;
+        let report = admission(&run, action, instance, 1);
+        run.record_admission(report)?;
+        run.mark_dispatch_started(action)?;
+        for _ in 0..MAX_RUN_EVENTS + 5 {
+            run.record_progress(action, "actual progress".into())?;
+        }
+        assert_eq!(run.events.len(), MAX_RUN_EVENTS);
+        assert!(run.events[0].sequence > 1);
+        assert!(
+            run.events
+                .iter()
+                .zip(run.events.iter().skip(1))
+                .all(|(a, b)| b.sequence == a.sequence + 1)
+        );
+        let before = run.events.clone();
+        assert!(matches!(
+            run.record_progress(action, "я".repeat(MAX_PROGRESS_BYTES)),
+            Err(ExecutionRunError::ProgressTooLarge)
+        ));
+        assert_eq!(run.events, before);
+        run.next_event_sequence = u64::MAX;
+        assert!(matches!(
+            run.mark_outcome_unknown(action, "late callback".into()),
+            Err(ExecutionRunError::EventSequenceExhausted)
+        ));
+        assert_eq!(run.state(action)?, ActionRunState::Running);
+        assert!(run.unknown_reason(action)?.is_none());
+        assert_eq!(run.events, before);
+        let mut run = ExecutionRun::new(&crate::wire::tests::document_fixture())?;
+        run.begin_check(action)?;
+        run.next_event_sequence = u64::MAX - 1;
+        let report = admission(&run, action, instance, 1);
+        assert!(matches!(
+            run.record_admission(report),
+            Err(ExecutionRunError::EventSequenceExhausted)
+        ));
+        assert!(run.admission(action)?.is_none());
+        assert!(run.latest_observation().is_none());
+        assert_eq!(run.state(action)?, ActionRunState::Checking);
+        Ok(())
     }
 
     /// Dependencies require verified postconditions; backend success and progress are insufficient.
