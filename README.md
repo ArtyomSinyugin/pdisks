@@ -212,20 +212,56 @@ error или ошибка event writer, `2` — аргументы/JSON, `3` —
 верифицированная попытка. `event_output_error` не стирает фактический outcome.
 Preview со status invalid — успешный запрос прогноза, а не успешное исполнение.
 
-`--events jsonl` пишет **retained replay после blocking apply** в stderr:
-первая строка содержит `type=replay`, `gap` и exclusive `next_sequence`, затем
-идут отдельные `RunEvent`. Это не live progress; ring ограничен 1024 событиями,
-snapshot на stdout содержит полное итоговое состояние даже после eviction.
-Истории run/events между процессами и daemon нет; checkpoint инцидента сохраняется.
+`--events jsonl` пишет **живые события во время blocking apply** в stderr:
+первая строка содержит `type=stream`, `since=0`, затем идут отдельные `RunEvent`,
+каждая строка flush-ится до продолжения выполнения. Фасадный
+`apply_plan_with_events(plan, &mut observer)` использует тот же coordinator:
+notifications поступают между фазами и на каждом progress update, без второй
+реализации execution loop. Callback заимствуется только на время blocking call;
+медленный callback задерживает исполнение и не должен паниковать. Ошибка event
+writer запоминается, не меняет admission и не стирает итоговый snapshot.
+Retained ring по-прежнему ограничен 1024 событиями, его replay API сохраняет gap
+semantics; живой consumer может получить больше 1024 событий без потерь. Snapshot
+на stdout содержит полное итоговое состояние. Истории run/events между процессами
+и daemon нет; checkpoint инцидента сохраняется.
+
+`dg-cli plan edit --root PRIVATE_DIR --draft draft.json` открывает одну живую
+сессию: команды JSONL читаются из stdin, ответы JSONL идут в stderr, итоговый
+`{revision,saved}` — в stdout. Поддержаны все существующие PlanEdit, включая
+replace/remove/move/protection, а также undo/redo/preview/save/quit:
+
+```json
+{"command":"edit","edit":{"add":{"create_lv":{"vg":"00000000-0000-7000-8000-000000000002","name":"data","size":16777216,"layout":"Linear","activate":true}}}}
+{"command":"undo"}
+{"command":"redo"}
+{"command":"preview"}
+{"command":"save"}
+{"command":"quit"}
+```
+
+VG ID берётся из вашего draft. EOF и quit **не сохраняют** несохранённые изменения;
+save атомарно заменяет открытый файл. Ошибка команды оставляет сессию доступной,
+ответ содержит `error`; неизвестные поля отклоняются. Одна строка ограничена 16 MiB,
+история undo/redo — существующими bounds engine, между процессами не сохраняется.
+
+Для rebase запускайте `plan edit` с дополнительным `--manifest providers.json`:
+`{"command":"prepare_rebase"}` получает свежий baseline/correlations/translated
+draft/status/diagnostics и token, не изменяя черновик. После изучения ответа
+`{"command":"accept_rebase","token":"<token из ответа>"}` принимает только этот
+кандидат и его всё ещё актуальную исходную revision; чужой token или изменения
+после prepare отклоняются. Затем требуется явный save. Candidate/token живут только
+в текущем процессе; offline edit не подменяет native probe пустым наблюдением.
 
 **C6 пока не завершён.** Production scope/authorization остаются Unknown, native
 dispatcher в executable отключён. Даже manifest с Execute не включает запись.
 Тесты проверяют parity preview/plan (кроме нового plan_id), одинаковый отказ
 readiness, retained failures, independent empty-plan verification в synthetic host
 и отдельные процессы редактирования. Реального write через CLI в VM ещё не было;
-live events, REPL undo/redo, explicit rebase и incident acknowledgment впереди.
-При smoke-probe в текущем host namespace получен typed `probe_failed`: mount source
-отсутствует в observation graph; CLI не превращает неполную публикацию в baseline.
+incident acknowledgment и положительный write parity CLI/API остаются впереди.
+Native smoke-probe в текущем host namespace теперь возвращает структурную
+публикацию (30 nodes, 59 mounts). Пять скрытых/неразрешённых `/dev` sources
+сохраняются как Other с исходным path и блокирующей `mount.unresolved_source`
+diagnostic; graph nodes и положительная coverage при этом не выдумываются.
 
 ## Редактирование плана без доступа к дискам
 

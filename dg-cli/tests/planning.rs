@@ -10,6 +10,48 @@ use disksgraph::{
 };
 use std::error::Error;
 
+/// The executable keeps interactive JSONL replies out of its final stdout document.
+#[test]
+fn binary_edit_uses_stdin_and_separate_reply_stream() -> Result<(), Box<dyn Error>> {
+    use std::{io::Write, process::Stdio};
+    let (scratch, mut app, _, writes) = support::application()?;
+    let draft = scratch.0.join("interactive.json");
+    execute(
+        &mut app,
+        &Command::New {
+            output: draft.clone(),
+        },
+    )?;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_dg-cli"))
+        .args(["plan", "edit", "--root"])
+        .arg(&scratch.0)
+        .arg("--draft")
+        .arg(&draft)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().ok_or("child stdin")?.write_all(b"{\"command\":\"edit\",\"edit\":\"clear\"}\n{\"command\":\"save\"}\n{\"command\":\"quit\"}\n")?;
+    let result = child.wait_with_output()?;
+    assert!(result.status.success());
+    let final_result: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(final_result["saved"], true);
+    let replies: Vec<serde_json::Value> = std::str::from_utf8(&result.stderr)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[1]["result"]["saved"], true);
+    assert_eq!(
+        DraftDocument::from_json(&files::read_document(&draft)?)?
+            .revision
+            .get(),
+        1
+    );
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
+
 /// Review, challenge and revision are checked within one process; only explicit save persists rebase.
 #[test]
 fn repl_rebase_requires_current_review_and_live_configuration() -> Result<(), Box<dyn Error>> {
@@ -451,8 +493,8 @@ fn apply_preserves_failed_snapshot_and_separate_events() -> Result<(), Box<dyn E
         .lines()
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
-    assert_eq!(lines[0]["type"], "replay");
-    assert_eq!(lines[0]["gap"], false);
+    assert_eq!(lines[0]["type"], "stream");
+    assert_eq!(lines[0]["since"], 0);
     assert!(result.get("events").is_none());
     assert!(!scratch.0.join("active-attempt.json").exists());
     assert!(!direct_root.0.join("active-attempt.json").exists());
@@ -477,7 +519,7 @@ fn apply_preserves_failed_snapshot_and_separate_events() -> Result<(), Box<dyn E
     Ok(())
 }
 
-/// Independent success is preserved even if the event consumer disconnects after the blocking run.
+/// Event consumer failure cannot replace the independently verified outcome.
 #[test]
 fn completed_outcome_survives_event_writer_failure() -> Result<(), Box<dyn Error>> {
     let (scratch, mut app, _, writes) = support::application()?;

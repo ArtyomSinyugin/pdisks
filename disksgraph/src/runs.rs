@@ -40,6 +40,15 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
     pub fn apply_plan(&mut self, plan: PlanId) -> Result<RunId, DisksGraphError> {
         self.apply_blocking(self.export_plan(plan)?)
     }
+    /// Applies historical input with borrowed synchronous events; observer failure grants no permission.
+    /// Notifications finish before this call returns, and retained snapshots/events remain available.
+    pub fn apply_plan_with_events(
+        &mut self,
+        plan: PlanId,
+        observer: &mut dyn FnMut(&RunEvent),
+    ) -> Result<RunId, DisksGraphError> {
+        self.apply_document_with_events(self.export_plan(plan)?, vec![], observer)
+    }
     /// Returns the complete current evidence even after event eviction or a failure before the first event.
     pub fn run_snapshot(&self, id: RunId) -> Result<RunSnapshot, DisksGraphError> {
         let record = self.run(id)?;
@@ -68,6 +77,15 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
         document: PlanDocument,
         source_map: Vec<OperationActions>,
     ) -> Result<RunId, DisksGraphError> {
+        self.apply_document_with_events(document, source_map, &mut |_| {})
+    }
+    /// Event delivery shares the exact reservation, coordinator and failure-retention path.
+    fn apply_document_with_events(
+        &mut self,
+        document: PlanDocument,
+        source_map: Vec<OperationActions>,
+        observer: &mut dyn FnMut(&RunEvent),
+    ) -> Result<RunId, DisksGraphError> {
         if self.runs.len() >= MAX_APPLICATION_OBJECTS {
             return Err(DisksGraphError::new(
                 ErrorCode::ResourceLimit,
@@ -87,7 +105,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
                 let mut coordinator =
                     ExecutionCoordinator::new(root, &mut self.host, &mut self.dispatcher, &run);
                 coordinator
-                    .execute_run(&mut run)
+                    .execute_run_with_events(&mut run, observer)
                     .map_err(DisksGraphError::from)
             });
         let error = result.err().map(|mut error| {

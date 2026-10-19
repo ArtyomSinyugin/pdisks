@@ -45,7 +45,7 @@ pub enum Command {
     Apply {
         /// Historical immutable input, reanalysed before use.
         file: PathBuf,
-        /// Replay retained events as JSONL on the separate event writer after completion.
+        /// Deliver synchronous live JSONL events on the separate event writer.
         events: bool,
     },
     /// Inspect a persistent unresolved attempt without acknowledging or retrying it.
@@ -243,10 +243,24 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
         }
         Command::Apply {
             file,
-            events: replay,
+            events: stream,
         } => {
             let plan = app.import_plan_json(&files::read_document(file)?)?;
-            let run = match app.apply_plan(plan) {
+            let mut output_error = if *stream {
+                write_event(events, &serde_json::json!({"type":"stream", "since":0}))
+                    .err()
+                    .map(|error| error.to_string())
+            } else {
+                None
+            };
+            let mut observer = |event: &disksgraph::RunEvent| {
+                if *stream && output_error.is_none() {
+                    output_error = write_event(events, event)
+                        .err()
+                        .map(|error| error.to_string());
+                }
+            };
+            let run = match app.apply_plan_with_events(plan, &mut observer) {
                 Ok(run) => run,
                 Err(error) => match error.run_id {
                     Some(run) => run,
@@ -254,15 +268,6 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
                 },
             };
             let snapshot = app.run_snapshot(run)?;
-            // shortcut: blocking facade exposes retained events after return; add a shared runtime
-            // subscription before promising live progress or complete delivery beyond the ring bound.
-            let output_error = if *replay {
-                replay_events(events, app.events(run, 0)?)
-                    .err()
-                    .map(|error| error.to_string())
-            } else {
-                None
-            };
             // Output failures cannot erase the actual run outcome or imply that effects were undone.
             Ok(serde_json::json!({"run": snapshot, "event_output_error": output_error}))
         }
@@ -277,22 +282,13 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
     }
 }
 
-/// Writes bounded replay metadata and one event per line, separate from the final result document.
-fn replay_events(
+/// Flushes each live record before execution proceeds; writer failures do not authorize or undo effects.
+fn write_event(
     output: &mut dyn std::io::Write,
-    page: disksgraph::EventsPage,
+    event: &impl serde::Serialize,
 ) -> Result<(), Error> {
-    serde_json::to_writer(
-        &mut *output,
-        &serde_json::json!({
-            "type": "replay", "gap": page.gap, "next_sequence": page.next_sequence,
-        }),
-    )?;
+    serde_json::to_writer(&mut *output, event)?;
     writeln!(output)?;
-    for event in page.events {
-        serde_json::to_writer(&mut *output, &event)?;
-        writeln!(output)?;
-    }
     output.flush()?;
     Ok(())
 }

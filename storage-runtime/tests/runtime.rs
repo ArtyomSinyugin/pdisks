@@ -2375,9 +2375,36 @@ mod run_coordinator {
     use storage_runtime::{
         bindings::OutputBindings,
         coordinator::{CoordinatorError, ExecutionCoordinator},
+        dispatcher::{BackendDispatcher, DispatchError, ExecutionReceipt},
         host::{AdmissionDecision, HostError, RuntimeHost},
         lease::{ExecutionLease, ExecutionRoot, HostExecutionLock},
     };
+
+    /// Forces event eviction while the ordinary synthetic dispatcher/checkpoint path remains active.
+    struct BurstDispatcher {
+        /// Existing mutation fixture, including its checkpoint and identity assertions.
+        inner: coordination::FakeDispatcher,
+        /// Additional events delivered before the backend call returns.
+        progress: usize,
+    }
+    impl BackendDispatcher for BurstDispatcher {
+        /// Keeps the existing concrete backend route.
+        fn backend_id(&self) -> &BackendId {
+            self.inner.backend_id()
+        }
+        /// Emits a bounded burst after the synthetic effect and before completion verification.
+        fn execute(
+            &mut self,
+            action: &storage_runtime::targets::ResolvedAction,
+            progress: &mut dyn FnMut(String) -> Result<(), storage_engine::ExecutionRunError>,
+        ) -> Result<ExecutionReceipt, DispatchError> {
+            let receipt = self.inner.execute(action, progress)?;
+            for _ in 0..self.progress {
+                progress("fixture event burst".into())?;
+            }
+            Ok(receipt)
+        }
+    }
 
     /// Verifies continuous cooperative exclusion on every probe, including between actions and at final verification.
     struct LockedHost<H> {
@@ -2450,9 +2477,40 @@ mod run_coordinator {
                 inner: coordination::host(state, &run)?,
                 root: scratch.0.clone(),
             };
+            let dispatcher = BurstDispatcher {
+                inner: fake,
+                progress: if case == 0 { 1100 } else { 0 },
+            };
             let mut coordinator =
-                ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, fake, &run);
-            let summary = coordinator.execute_run(&mut run)?;
+                ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+            let mut delivered = Vec::new();
+            let summary = coordinator.execute_run_with_events(&mut run, &mut |event| {
+                if matches!(event.kind, storage_engine::RunEventKind::Progress { .. }) {
+                    // A replay after return cannot observe the success case's armed checkpoint.
+                    assert!(scratch.0.join("active-attempt.json").exists());
+                    assert!(
+                        ExecutionRoot::open(&scratch.0)
+                            .unwrap_or_else(|error| panic!("observer root: {error}"))
+                            .try_lock_host()
+                            .is_err()
+                    );
+                    assert!(calls.get() > 0);
+                }
+                delivered.push(event.clone());
+            })?;
+            let retained = run.events_page(0)?;
+            assert_eq!(retained.gap, case == 0);
+            assert_eq!(delivered.len() as u64, run.snapshot().event_sequence);
+            assert_eq!(
+                retained.events,
+                delivered[delivered.len() - retained.events.len()..]
+            );
+            assert!(
+                delivered.iter().any(|event| matches!(
+                    event.kind,
+                    storage_engine::RunEventKind::Progress { .. }
+                ))
+            );
             assert_eq!(summary.verified, case == 0);
             assert_eq!(summary.run_id, run.run_id());
             if case == 0 {

@@ -12,7 +12,7 @@ use crate::{
 };
 use storage_engine::{
     ActionId, ActionRunState, BackendCompletion, BackendOutcome, ExecutionRun, ExecutionRunError,
-    LiveObservation, editing::OperationId,
+    LiveObservation, RunEvent, editing::OperationId,
 };
 use thiserror::Error;
 
@@ -84,6 +84,23 @@ pub struct ExecutionCoordinator<H, D> {
     bindings: OutputBindings,
 }
 
+/// Borrowed synchronous notifications; callbacks cannot grant admission or mutate run evidence.
+struct RunNotifications<'a> {
+    /// Passive caller-owned consumer, retained only for the duration of this blocking call.
+    callback: &'a mut dyn FnMut(&RunEvent),
+    /// Last delivered sequence; draining at each transition boundary prevents ring eviction gaps.
+    cursor: u64,
+}
+impl RunNotifications<'_> {
+    /// Delivers published evidence before the next provider/backend phase and after every progress update.
+    fn publish(&mut self, run: &ExecutionRun) {
+        for event in run.events_since(self.cursor) {
+            (self.callback)(event);
+            self.cursor = event.sequence;
+        }
+    }
+}
+
 impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
     /// Requires explicit host policies and dispatcher; no default write configuration exists.
     pub fn new(root: ExecutionRoot, host: H, dispatcher: D, run: &ExecutionRun) -> Self {
@@ -108,6 +125,32 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
     pub fn execute_run(
         &mut self,
         run: &mut ExecutionRun,
+    ) -> Result<ExecutionSummary, CoordinatorError> {
+        self.execute_run_with_events(run, &mut |_| {})
+    }
+
+    /// Uses the same coordinator path with synchronous passive notifications, including on failure.
+    /// Slow observers delay execution; observer panics follow ordinary caller panic semantics.
+    pub fn execute_run_with_events(
+        &mut self,
+        run: &mut ExecutionRun,
+        callback: &mut dyn FnMut(&RunEvent),
+    ) -> Result<ExecutionSummary, CoordinatorError> {
+        let mut notifications = RunNotifications {
+            callback,
+            cursor: 0,
+        };
+        notifications.publish(run);
+        let result = self.execute_run_inner(run, &mut notifications);
+        notifications.publish(run);
+        result
+    }
+
+    /// Retains the original single-lock execution path independently of the optional observer.
+    fn execute_run_inner(
+        &mut self,
+        run: &mut ExecutionRun,
+        notifications: &mut RunNotifications<'_>,
     ) -> Result<ExecutionSummary, CoordinatorError> {
         if self.run_id != run.run_id() {
             return Err(CoordinatorError::RunMismatch);
@@ -144,7 +187,9 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
                 ActionRunState::Waiting | ActionRunState::Checking => {}
                 _ => return Err(CoordinatorError::Stopped),
             }
-            let state = self.execute_action_locked(run, action, None, Some(&lock))?;
+            let state =
+                self.execute_action_locked(run, action, None, Some(&lock), notifications)?;
+            notifications.publish(run);
             if state != ActionRunState::Verified {
                 return Ok(Self::summary(run, Some(action)));
             }
@@ -182,7 +227,12 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         action: ActionId,
         operation: Option<OperationId>,
     ) -> Result<ActionRunState, CoordinatorError> {
-        self.execute_action_locked(run, action, operation, None)
+        let mut callback = |_: &RunEvent| {};
+        let mut notifications = RunNotifications {
+            callback: &mut callback,
+            cursor: 0,
+        };
+        self.execute_action_locked(run, action, operation, None, &mut notifications)
     }
 
     /// Shares the exact action path between individual execution and a run holding continuous exclusion.
@@ -192,6 +242,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         action: ActionId,
         operation: Option<OperationId>,
         lock: Option<&HostExecutionLock>,
+        notifications: &mut RunNotifications<'_>,
     ) -> Result<ActionRunState, CoordinatorError> {
         if self.run_id != run.run_id() {
             return Err(CoordinatorError::RunMismatch);
@@ -205,6 +256,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             ActionRunState::Checking => {}
             state => return Err(ExecutionRunError::InvalidTransition { action, state }.into()),
         }
+        notifications.publish(run);
         let lease = match lock {
             Some(lock) => ExecutionLease::under_host_lock(lock, run, action)?,
             None => ExecutionLease::try_acquire(&self.root, run, action)?,
@@ -228,7 +280,9 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         {
             return Err(CoordinatorError::InvalidDecision);
         }
-        if !run.record_admission(decision.report)? {
+        let admitted = run.record_admission(decision.report)?;
+        notifications.publish(run);
+        if !admitted {
             return Ok(run.state(action)?);
         }
         let Some(resolved) = decision.resolved else {
@@ -253,9 +307,14 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
         // Every exit after this boundary retains the stop latch unless clear is acknowledged.
         self.halted = true;
         run.mark_dispatch_started(action)?;
+        notifications.publish(run);
         let receipt = self
             .dispatcher
-            .execute(&resolved, &mut |detail| run.record_progress(action, detail))
+            .execute(&resolved, &mut |detail| {
+                run.record_progress(action, detail)?;
+                notifications.publish(run);
+                Ok(())
+            })
             .unwrap_or_else(|error| ExecutionReceipt {
                 outcome: BackendOutcome::OutcomeUnknown {
                     reason: error.to_string(),
@@ -283,6 +342,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> ExecutionCoordinator<H, D> {
             run.mark_outcome_unknown(action, error.to_string())?;
             return Err(error.into());
         }
+        notifications.publish(run);
         let mut pending = None;
         let mut pending_filesystem = None;
         if run.state(action)? == ActionRunState::Verifying {
