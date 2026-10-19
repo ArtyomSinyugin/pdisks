@@ -29,6 +29,8 @@ fn serialize_process_tests() -> MutexGuard<'static, ()> {
 /// Boundaries where a failed acknowledgment or process death must prevent ordinary continuation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Boundary {
+    /// A staging file contains only the first half of its serialized attempt.
+    Write,
     /// Contents have been written, but file fsync has not yet succeeded.
     FileSync,
     /// Contents are synchronized, but the active name has not been published.
@@ -220,6 +222,7 @@ fn malformed_and_untrusted_files_fail_closed() -> Result<(), Box<dyn Error>> {
 fn arm_io_failures_stop_dispatch_and_poison_mutations() -> Result<(), Box<dyn Error>> {
     let _serial = serialize_process_tests();
     for point in [
+        Boundary::Write,
         Boundary::FileSync,
         Boundary::Publish,
         Boundary::DirectorySync,

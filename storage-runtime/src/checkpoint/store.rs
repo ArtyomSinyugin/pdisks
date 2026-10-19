@@ -72,6 +72,14 @@ impl<'lock> CheckpointStore<'lock> {
             // Set exact private permissions even under an unusually restrictive caller umask.
             fchmod(&fd, Mode::RUSR | Mode::WUSR).map_err(io::Error::from)?;
             let mut file = File::from(fd);
+            #[cfg(test)]
+            {
+                // Exercise cleanup after a real short write, before the remaining bytes reach disk.
+                file.write_all(&bytes[..bytes.len() / 2])?;
+                tests::boundary(tests::Boundary::Write)?;
+                file.write_all(&bytes[bytes.len() / 2..])?;
+            }
+            #[cfg(not(test))]
             file.write_all(&bytes)?;
             #[cfg(test)]
             tests::boundary(tests::Boundary::FileSync)?;
