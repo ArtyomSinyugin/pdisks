@@ -128,6 +128,8 @@ impl<'lock> CheckpointStore<'lock> {
             return Err(CheckpointError::InvalidFile);
         }
         let result = (|| {
+            #[cfg(test)]
+            tests::boundary(tests::Boundary::Unlink)?;
             unlinkat(directory, ACTIVE_FILE, AtFlags::empty()).map_err(io::Error::from)?;
             #[cfg(test)]
             tests::boundary(tests::Boundary::ClearSync)?;

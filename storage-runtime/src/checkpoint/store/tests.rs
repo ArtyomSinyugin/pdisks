@@ -37,6 +37,8 @@ pub(super) enum Boundary {
     Publish,
     /// Active name is visible, but directory fsync has not yet succeeded.
     DirectorySync,
+    /// The owned active file has been checked, but unlink has not succeeded.
+    Unlink,
     /// Active name was removed, but removal has not yet been synchronized.
     ClearSync,
 }
@@ -344,5 +346,39 @@ fn sigkill_preserves_conservative_checkpoint_state() -> Result<(), Box<dyn Error
             assert_eq!(fs::read_dir(&scratch.0)?.count(), 2);
         }
     }
+    Ok(())
+}
+
+/// A failed unlink retains exact evidence and poisons the handle even after verified execution.
+#[test]
+fn unlink_failure_retains_checkpoint_and_blocks_successor() -> Result<(), Box<dyn Error>> {
+    let _serial = serialize_process_tests();
+    let scratch = Scratch::new()?;
+    let root = ExecutionRoot::open(&scratch.0)?;
+    let lock = root.try_lock_host()?;
+    let store = CheckpointStore::new(&lock);
+    let attempt = fixture();
+    store.arm(&attempt)?;
+    let bytes = fs::read(scratch.0.join(ACTIVE_FILE))?;
+    FAULT.set(Some((Boundary::Unlink, false)));
+    assert!(matches!(
+        store.clear(attempt.run_id, attempt.action_id),
+        Err(CheckpointError::Io(_))
+    ));
+    assert_eq!(fs::read(scratch.0.join(ACTIVE_FILE))?, bytes);
+    assert_eq!(store.inspect()?, Some(attempt.clone()));
+    assert!(matches!(
+        store.clear(attempt.run_id, attempt.action_id),
+        Err(CheckpointError::Poisoned)
+    ));
+    assert!(matches!(
+        store.arm(&fixture()),
+        Err(CheckpointError::Poisoned)
+    ));
+    // A fresh handle still sees the incident; poisoning is not the persistence mechanism.
+    assert!(matches!(
+        CheckpointStore::new(&lock).arm(&fixture()),
+        Err(CheckpointError::AlreadyActive)
+    ));
     Ok(())
 }
