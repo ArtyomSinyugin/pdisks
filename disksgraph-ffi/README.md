@@ -56,10 +56,11 @@ Context — process-local integer; session/plan/run handles принадлежа
 | `session_import`, `session_export`, `session_close` | Исторические draft inputs и lifetime |
 | `session_edit`, `session_undo`, `session_redo` | Редактирование с expected revision |
 | `session_preview`, `session_freeze` | Forecast и frozen historical document |
+| `session_prepare_rebase`, `session_accept_rebase`, `review_close` | Retained reviewed translation и явное освобождение |
 | `plan_import`, `plan_export`, `plan_close` | Immutable historical plans |
 | `apply_blocking`, `run_snapshot`, `run_events`, `run_close` | Синхронная попытка и retained evidence |
 | `apply_start`, `job_poll`, `job_close`, `job_cancel` | Фоновая попытка, passive polling, явное освобождение и отказ cancellation |
-| `incident_inspect` | Проверка checkpoint через штатный runtime lock |
+| `incident_inspect`, `incident_review`, `incident_acknowledge` | Inspection и confirmed review через штатные runtime gates |
 
 Reply содержит `protocol_version` и ровно одно поле `result` или `error`.
 Ошибка имеет `code` и при необходимости `detail`; application error вложена
@@ -108,6 +109,62 @@ job, затем освобождает registrations. Timeout/прерывани
 close может ждать столько же, сколько этот вызов. Checkpoint не удаляется ни при
 close context, ни при job close.
 
+Pending reviews хранятся только в памяти context; их общий лимит — **64** для
+rebase и incident вместе. Проверка capacity и reserve выполняются до fresh probe.
+`review` — новый opaque UUID handle; он отличается от imported document UUID,
+session handle и runtime confirmation token. Другой context, неверный вид review
+или закрытый handle дают `unknown_review`. Переданные в reply объекты — только
+данные для просмотра: запросы не принимают обратно candidate/inspection/policy.
+
+Для rebase передаются следующие `method` / `params`:
+
+```json
+{"method":"session_prepare_rebase","params":{"session":"<session-handle>","revision":0}}
+```
+
+Result содержит `review`, `source_revision`, полный proposed `baseline`, translated
+`draft`, `correlations`, planning `status` и `diagnostics`. Prepare требует native
+manifest, сохраняет исходный draft/revision и использует `DisksGraph::prepare_rebase`.
+Клиент показывает этот review перед явным accept:
+
+```json
+{"method":"session_accept_rebase","params":{"session":"<same-session-handle>","revision":0,"review":"<review-handle>"}}
+```
+
+Session и revision должны совпасть с retained candidate: иначе `review_mismatch`
+без потребления review. Для совпавшего запроса candidate потребляется и передаётся
+в `DisksGraph::accept_rebase`; engine повторно проверяет source context и текущую
+revision. Изменение session после prepare даёт application `revision_conflict`;
+для нового accept требуется новый review. Success возвращает новую `revision`.
+Это изменение редактируемых inputs, без native writes или сохранения файла.
+Закрытие session освобождает все её rebase candidates, сохраняя incident reviews.
+
+`incident_review` с пустыми params возвращает `review`, полную `incident` inspection
+и runtime challenge `token`. Если marker отсутствует, result равен
+`{"review":null,"incident":null}`: token/slot не создаётся, provider не вызывается.
+Malformed marker остаётся на месте и даёт application error. Подтверждение:
+
+```json
+{"method":"incident_acknowledge","params":{"review":"<review-handle>","run_id":"<shown-run-id>","token":"<shown-challenge>"}}
+```
+
+Exact run ID и challenge проверяются до fresh probe; mismatch даёт
+`review_mismatch`, сохраняя review. Совпавшая попытка потребляет review даже при
+последующем отказе runtime. Прежний runtime заново проверяет root inode, exact marker,
+неизменность observations, независимую safety policy и marker после policy callback.
+Токен подтверждает намерение; authorization, complete coverage и quiescence он
+не устанавливает. **Default ABI policy возвращает Unknown**, так что даже точный
+challenge не разрешает clear checkpoint. Успешный ответ имеет
+`{"incident":{...},"acknowledged":true}`; в этом конструкторе он не включён.
+Trusted Rust embedding может передать отдельную policy в
+`Protocol::call_with_policy`; JSON entrypoint и `.so` такой настройки не принимают.
+
+Отмена review — `review_close` с `{"review":"<review-handle>"}`. Она освобождает
+только память, не принимает rebase и не удаляет marker. Context close аналогично
+отбрасывает reviews после завершения worker. Неверная confirmation/schema и чужие
+handles не потребляют retained review; после реальной accept/ack попытки нет
+автоматического retry. Во время active job reviewed methods получают обычный `busy`.
+
 Одновременно допускаются 32 context owners, включая opening/closing. Open config
 ограничен 64 KiB, application request — 16 MiB до JSON parsing. Каждый context
 имеет один owner thread; параллельный call того же context получает `busy`,
@@ -127,18 +184,22 @@ Consumer обязан закрыть все contexts и освободить в�
 ```sh
 cargo test -p disksgraph-ffi --offline
 DISKSGRAPH_NATIVE_MANIFEST="$PWD/storage-probe/tests/providers.live.example.json" \
-  cargo test -p disksgraph-ffi --test checked_consumer --offline native_provider_calls -- --ignored
+  cargo test -p disksgraph-ffi --test checked_consumer --offline -- --ignored --test-threads=1
 ```
 
 Вторая проверка требует установленных native libraries; она проверяет повторные
 reads, background start/poll, exact final snapshot/events parity, foreign/stale job
-handles, release и pre-run failure без native writes. Детерминированный unit test
+handles, release и pre-run failure без native writes. Второй native test проверяет
+prepare без изменения draft, exact accept, foreign/stale reviews, отказ подделки
+candidate/policy, incident refusal и неизменность checkpoint после discard/close.
+Положительный incident acknowledgment проверен только на recorded synthetic host
+через trusted Rust policy; native safety не подразумевается. Детерминированный unit test
 с channel-blocked synthetic owner отдельно проверяет polling при занятом worker,
 Busy, отказ cancellation и join-before-close-return; искусственная задержка не
 включена в production config. Недоступные host subsystems
 могут давать diagnostics: тест не доказывает completeness наблюдения.
 
-C7 остаётся открыт: wire rebase review/accept, incident review/acknowledgment и
-отдельный credential channel ещё не реализованы. Cancellation явно отклоняется. Положительный native write workflow через
-динамический consumer и сборка на MSRV требуют отдельной приёмки. Production
-write policies относятся к C8. Disks preview остаётся отключённым.
+C7 остаётся открыт: отдельный credential channel не реализован, cancellation явно
+отклоняется. Положительный native write workflow через динамический consumer,
+сборка на MSRV и финальное packaging требуют отдельной приёмки. Production write
+и incident safety policies относятся к C8. Disks preview остаётся отключённым.

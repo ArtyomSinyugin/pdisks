@@ -170,7 +170,9 @@ challenge и независимую safety policy runtime. Никакого но
 source map и отказ после arm. CLI C6 описан ниже.
 [Stabby API C7](disksgraph-ffi/README.md) экспортирует тот же фасад через checked
 imports и versioned JSON, включая один bounded apply job на context и passive
-snapshot/events polling. Полный reviewed workflow через ABI ещё не завершён.
+snapshot/events polling. Reviewed rebase и incident confirmation используют
+context-owned handles; default incident safety policy остаётся Unknown.
+Положительная native write приёмка через ABI ещё не выполнена.
 Disks preview остаётся отключённым.
 
 ## CLI C6 — сохранённые черновики и foreground apply
