@@ -9,7 +9,7 @@ use dylib::{Api, Error};
 use serde_json::{json, Value};
 use std::{
     fs,
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -164,6 +164,26 @@ fn checked_import_preserves_editing_parity_and_rejects_foreign_handles() -> Resu
         api.method(first, "probe", json!({}))?["error"]["code"],
         "live_unavailable"
     );
+    for (method, params) in [
+        (
+            "session_prepare_rebase",
+            json!({"session":session,"revision":3}),
+        ),
+        ("incident_review", json!({})),
+        (
+            "incident_acknowledge",
+            json!({"review":session,"run_id":session,"token":session}),
+        ),
+    ] {
+        assert_eq!(
+            api.method(first, method, params)?["error"]["code"],
+            "live_unavailable"
+        );
+    }
+    assert_eq!(
+        api.method(first, "review_close", json!({"review":session}))?["error"]["code"],
+        "unknown_review"
+    );
     fs::write(scratch.0.join("active-attempt.json"), b"retained incident")?;
     api.close(other)?;
     api.close(first)?;
@@ -316,4 +336,190 @@ fn poll_job(api: &Api, context: u64, job: &Value) -> Result<Value, Error> {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+/// Real native reads prepare a private rebase candidate; incident writes remain independently refused.
+#[test]
+#[ignore = "requires explicitly configured installed native read libraries"]
+fn native_reviews_are_owned_and_acknowledgment_preserves_marker() -> Result<(), Error> {
+    let manifest = std::env::var_os("DISKSGRAPH_NATIVE_MANIFEST")
+        .ok_or("DISKSGRAPH_NATIVE_MANIFEST is required")?;
+    let scratch = Scratch::new()?;
+    let api = Api::load(&library()?)?;
+    let mut config = scratch.config();
+    config["manifest"] = json!(PathBuf::from(manifest));
+    let opened = api.open(&config)?;
+    let context = opened["result"]["context"]
+        .as_u64()
+        .ok_or_else(|| format!("native open failed: {opened}"))?;
+    let other = api.open(&config)?["result"]["context"]
+        .as_u64()
+        .ok_or("other context")?;
+    let session = api.method(context, "session_import", json!({"draft":draft()?}))?["result"]
+        ["session"]
+        .clone();
+    let original =
+        api.method(context, "session_export", json!({"session":session}))?["result"].clone();
+    let prepared = api.method(
+        context,
+        "session_prepare_rebase",
+        json!({"session":session,"revision":0}),
+    )?;
+    let candidate = &prepared["result"];
+    assert!(candidate["review"].is_string(), "{prepared}");
+    assert!(candidate["baseline"]["snapshot"].is_object());
+    assert_eq!(
+        api.method(context, "session_export", json!({"session":session}))?["result"],
+        original
+    );
+    assert_eq!(
+        api.method(
+            other,
+            "session_accept_rebase",
+            json!({"session":session,"revision":0,"review":candidate["review"]})
+        )?["error"]["code"],
+        "unknown_review"
+    );
+    assert_eq!(
+        api.method(
+            context,
+            "session_accept_rebase",
+            json!({"session":session,"revision":1,"review":candidate["review"]})
+        )?["error"]["code"],
+        "review_mismatch"
+    );
+    assert_eq!(api.method(context, "session_accept_rebase", json!({"session":session,"revision":0,"review":candidate["review"],"candidate":candidate}))?["error"]["code"], "invalid_request");
+    let accepted = api.method(
+        context,
+        "session_accept_rebase",
+        json!({"session":session,"revision":0,"review":candidate["review"]}),
+    )?;
+    assert_eq!(accepted["result"]["revision"], 1, "{accepted}");
+    let rebased = api.method(context, "session_export", json!({"session":session}))?;
+    assert_eq!(rebased["result"]["baseline"], candidate["baseline"]);
+    assert_eq!(rebased["result"]["draft"], candidate["draft"]);
+    assert_eq!(
+        api.method(
+            context,
+            "review_close",
+            json!({"review":candidate["review"]})
+        )?["error"]["code"],
+        "unknown_review"
+    );
+    let stale = api.method(
+        context,
+        "session_prepare_rebase",
+        json!({"session":session,"revision":1}),
+    )?["result"]["review"]
+        .clone();
+    assert!(stale.is_string());
+    assert_eq!(
+        api.method(
+            context,
+            "session_edit",
+            json!({"session":session,"revision":1,"edit":disksgraph::PlanEdit::Clear})
+        )?["result"]["revision"],
+        2
+    );
+    assert_eq!(
+        api.method(
+            context,
+            "session_accept_rebase",
+            json!({"session":session,"revision":1,"review":stale})
+        )?["error"]["detail"]["code"],
+        "revision_conflict"
+    );
+    assert_eq!(
+        api.method(context, "review_close", json!({"review":stale}))?["error"]["code"],
+        "unknown_review"
+    );
+    let pending = api.method(
+        context,
+        "session_prepare_rebase",
+        json!({"session":session,"revision":2}),
+    )?["result"]["review"]
+        .clone();
+    api.method(context, "session_close", json!({"session":session}))?;
+    assert_eq!(
+        api.method(context, "review_close", json!({"review":pending}))?["error"]["code"],
+        "unknown_review"
+    );
+    let marker = incident_marker()?;
+    let path = scratch.0.join("active-attempt.json");
+    fs::write(&path, marker.to_bytes()?)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let shown = api.method(context, "incident_review", json!({}))?;
+    let shown = &shown["result"];
+    assert!(shown["review"].is_string(), "{shown}");
+    assert_eq!(shown["incident"]["attempt"], serde_json::to_value(&marker)?);
+    let confirm = json!({"review":shown["review"],"run_id":marker.run_id,"token":shown["token"]});
+    assert_eq!(
+        api.method(other, "incident_acknowledge", confirm.clone())?["error"]["code"],
+        "unknown_review"
+    );
+    let mut wrong = confirm.clone();
+    wrong["token"] = json!(marker.plan_id);
+    assert_eq!(
+        api.method(context, "incident_acknowledge", wrong)?["error"]["code"],
+        "review_mismatch"
+    );
+    let mut forged = confirm.clone();
+    forged["policy"] = json!({"allow":true});
+    assert_eq!(
+        api.method(context, "incident_acknowledge", forged)?["error"]["code"],
+        "invalid_request"
+    );
+    let refused = api.method(context, "incident_acknowledge", confirm)?;
+    assert_eq!(
+        refused["error"]["detail"]["code"], "incident_rejected",
+        "{refused}"
+    );
+    assert_eq!(fs::read(&path)?, marker.to_bytes()?);
+    assert_eq!(
+        api.method(context, "review_close", json!({"review":shown["review"]}))?["error"]["code"],
+        "unknown_review"
+    );
+    let pending = api.method(context, "incident_review", json!({}))?["result"]["review"].clone();
+    assert!(pending.is_string());
+    assert!(api
+        .method(context, "review_close", json!({"review":pending}))?
+        .get("error")
+        .is_none());
+    assert!(api.method(context, "incident_review", json!({}))?["result"]["review"].is_string());
+    api.close(other)?;
+    api.close(context)?;
+    assert_eq!(fs::read(&path)?, marker.to_bytes()?);
+    Ok(())
+}
+
+/// Synthetic historical marker for inspection/refusal only; these identities never select a native write.
+fn incident_marker() -> Result<disksgraph::host::checkpoint::ActiveAttempt, Error> {
+    use disksgraph::{
+        host::{
+            checkpoint::{ActiveAttempt, TargetFingerprint, CHECKPOINT_SCHEMA_VERSION},
+            BackendId, LvmAction, ProviderAction,
+        },
+        model::{Bytes, ExternalId, LvmLvKind, NodeId},
+    };
+    let vg = NodeId::new();
+    Ok(ActiveAttempt {
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        run_id: "00000000-0000-7000-8000-000000000091".parse()?,
+        plan_id: "00000000-0000-7000-8000-000000000092".parse()?,
+        action_id: disksgraph::ActionId::new(0),
+        operation_id: None,
+        action: ProviderAction::Lvm(LvmAction::CreateLv {
+            vg,
+            planned_node_id: NodeId::new(),
+            name: "consumer-data".into(),
+            size: Bytes::new(16 * 1024 * 1024),
+            layout: LvmLvKind::Linear,
+        }),
+        targets: vec![TargetFingerprint {
+            planned_id: vg,
+            external_ids: vec![ExternalId::LvmVgUuid("consumer-historical-vg".into())],
+        }],
+        plan_digest: "a".repeat(64),
+        backend_id: BackendId::new("cli-unconfigured").ok_or("backend")?,
+    })
 }
