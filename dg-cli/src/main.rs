@@ -4,7 +4,7 @@
 
 mod native;
 
-use dg_cli::{Error, Invocation};
+use dg_cli::{Error, Invocation, result_exit_code};
 use std::{
     io::{self, Write},
     process::ExitCode,
@@ -43,17 +43,6 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::from(exit)
-}
-
-/// Completed attempts succeed only after actual final verification; event I/O has its own failure.
-fn result_exit_code(value: &serde_json::Value) -> u8 {
-    if !value["event_output_error"].is_null() {
-        1
-    } else if value.get("run").is_some() && value["run"]["verified"] != true {
-        3
-    } else {
-        0
-    }
 }
 
 #[cfg(test)]

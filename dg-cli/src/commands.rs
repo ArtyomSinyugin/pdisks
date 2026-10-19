@@ -2,7 +2,7 @@
 
 use crate::{Error, files};
 use disksgraph::{
-    DisksGraph, DraftDocument, PlanEdit, PlanRequest,
+    DisksGraph, DraftDocument, IncidentAcknowledgmentPolicy, PlanEdit, PlanRequest,
     host::{
         authorization::AuthorizationContext, capability::BackendCapabilityCheck,
         dispatcher::BackendDispatcher, host::LinuxLiveHost,
@@ -194,6 +194,24 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
     command: &Command,
     events: &mut dyn std::io::Write,
 ) -> Result<serde_json::Value, Error> {
+    execute_with_io(
+        app,
+        command,
+        &mut std::io::stdin().lock(),
+        events,
+        &mut crate::incident::UnconfiguredPolicy,
+    )
+}
+
+/// Runs the same command parser/adapter with explicit streams and a trusted incident policy.
+/// This is host composition, not an approval field or an executable flag supplied by saved JSON.
+pub fn execute_with_io<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>(
+    app: &mut DisksGraph<LinuxLiveHost<'_, C, A>, D>,
+    command: &Command,
+    input: &mut impl std::io::BufRead,
+    events: &mut dyn std::io::Write,
+    incident_policy: &mut impl IncidentAcknowledgmentPolicy,
+) -> Result<serde_json::Value, Error> {
     match command {
         Command::Probe => Ok(serde_json::to_value(app.probe()?)?),
         Command::New { output } => {
@@ -276,19 +294,12 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
             Ok(serde_json::json!({"run": snapshot, "event_output_error": output_error}))
         }
         Command::Incident => Ok(serde_json::json!({"incident": app.incident()?})),
-        Command::AcknowledgeIncident => crate::incident::acknowledge(
-            app,
-            &mut std::io::stdin().lock(),
-            events,
-            &mut crate::incident::UnconfiguredPolicy,
-        ),
-        Command::Edit { draft, live_rebase } => crate::repl::edit(
-            app,
-            draft,
-            *live_rebase,
-            &mut std::io::stdin().lock(),
-            events,
-        ),
+        Command::AcknowledgeIncident => {
+            crate::incident::acknowledge(app, input, events, incident_policy)
+        }
+        Command::Edit { draft, live_rebase } => {
+            crate::repl::edit(app, draft, *live_rebase, input, events)
+        }
     }
 }
 
@@ -316,6 +327,16 @@ mod tests {
             vec!["probe", "--manifest", "m", "--root", "r", "--yes", "true"],
             vec!["plan", "new", "--manifest", "m", "--root", "r", "--output"],
             vec!["probe", "--manifest", "--root", "r"],
+            vec![
+                "incident",
+                "acknowledge",
+                "--manifest",
+                "m",
+                "--root",
+                "r",
+                "--confirm",
+                "saved-token",
+            ],
         ] {
             assert!(Invocation::parse(args.into_iter().map(OsString::from)).is_err());
         }

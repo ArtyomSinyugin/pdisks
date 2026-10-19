@@ -6,7 +6,19 @@ mod commands;
 pub mod files;
 pub mod incident;
 pub mod repl;
-pub use commands::{Command, Invocation, execute};
+pub use commands::{Command, Invocation, execute, execute_with_io};
+
+/// Completed commands succeed only after actual final verification; event I/O has its own failure.
+/// Hosts embedding the command adapter use the exact executable's result/exit convention.
+pub fn result_exit_code(value: &serde_json::Value) -> u8 {
+    if !value["event_output_error"].is_null() {
+        1
+    } else if value.get("run").is_some() && value["run"]["verified"] != true {
+        3
+    } else {
+        0
+    }
+}
 
 /// Structured command failures; application diagnostics retain their original stable code.
 #[derive(Debug, serde::Serialize, thiserror::Error)]

@@ -84,8 +84,9 @@ fn dialog(
         writeln!(std::fs::File::from(peer_out), "{}", reply(&review))?;
         Ok(())
     });
-    let result = dg_cli::incident::acknowledge(
+    let result = dg_cli::execute_with_io(
         app,
+        &dg_cli::Command::AcknowledgeIncident,
         &mut BufReader::new(std::fs::File::from(server_in)),
         &mut std::fs::File::from(server_out),
         policy,
