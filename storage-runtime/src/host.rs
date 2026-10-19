@@ -455,3 +455,41 @@ pub(crate) fn check_reviewed_plan(run: &ExecutionRun) -> Result<(), HostError> {
     }
     Ok(())
 }
+
+impl<H: RuntimeHost + ?Sized> RuntimeHost for &mut H {
+    /// The application keeps its configured host while a coordinator borrows it for one attempt.
+    fn probe(&mut self) -> Result<ProbedObservation, HostError> {
+        (**self).probe()
+    }
+    /// Preserves whole-plan native readiness on the original host.
+    fn check_plan(
+        &mut self,
+        run: &ExecutionRun,
+        observed: &ProbedObservation,
+        dispatcher: &dyn crate::dispatcher::BackendDispatcher,
+        lock: &HostExecutionLock,
+    ) -> Result<LiveCheckStatus, HostError> {
+        (**self).check_plan(run, observed, dispatcher, lock)
+    }
+    /// Reuses the original host's fresh admission and policy boundaries.
+    fn check_admission(
+        &mut self,
+        run: &ExecutionRun,
+        action: ActionId,
+        observed: &ProbedObservation,
+        bindings: &OutputBindings,
+        lease: &ExecutionLease,
+    ) -> Result<AdmissionDecision, HostError> {
+        (**self).check_admission(run, action, observed, bindings, lease)
+    }
+    /// Action success cannot replace the original host's separate final verification.
+    fn verify_goal(
+        &mut self,
+        run: &ExecutionRun,
+        observed: &ProbedObservation,
+        bindings: &OutputBindings,
+        lock: &HostExecutionLock,
+    ) -> Result<GoalVerificationReport, HostError> {
+        (**self).verify_goal(run, observed, bindings, lock)
+    }
+}

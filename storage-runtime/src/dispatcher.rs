@@ -103,3 +103,22 @@ mod tests {
         assert!(receipt.validate_for(&activation).is_ok());
     }
 }
+
+impl<D: BackendDispatcher + ?Sized> BackendDispatcher for &mut D {
+    /// Borrowing preserves the configured primary registration.
+    fn backend_id(&self) -> &BackendId {
+        (**self).backend_id()
+    }
+    /// A borrowed composite dispatcher must retain its exact operation routes.
+    fn backend_for(&self, operation: &storage_provider::ProviderAction) -> &BackendId {
+        (**self).backend_for(operation)
+    }
+    /// Delegates without changing admission, checkpoint or progress semantics.
+    fn execute(
+        &mut self,
+        action: &ResolvedAction,
+        progress: &mut dyn FnMut(String) -> Result<(), ExecutionRunError>,
+    ) -> Result<ExecutionReceipt, DispatchError> {
+        (**self).execute(action, progress)
+    }
+}

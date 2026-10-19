@@ -245,3 +245,27 @@ fn preflight_retains_observations_without_admitting_dispatch() -> Result<(), Box
     assert_eq!(calls.get(), 2);
     Ok(())
 }
+
+/// Editing captures the same measured graph/free space without running the provider a second time.
+#[test]
+fn editing_baseline_retains_exact_publication_and_capacity() -> Result<(), Box<dyn Error>> {
+    let source = fixture()?;
+    let state = RefCell::new(source.clone());
+    let calls = Cell::new(0);
+    let probe = LinuxProbe::from_providers(vec![Box::new(Recorded {
+        state: &state,
+        calls: &calls,
+    })]);
+    let publication = ProbedObservation::collect(&probe)?;
+    let actual = publication.observation().snapshot.clone();
+    let baseline = publication.into_baseline();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(baseline.snapshot, actual);
+    let expected = HistoricalBaseline::from_lvm_observations(source.current, &source.lvm_vgs)?;
+    assert_eq!(baseline.capacity_evidence, expected.capacity_evidence);
+    state.borrow_mut().lvm_vgs[0].vg.free = 0;
+    let next = ProbedObservation::collect(&probe)?.into_baseline();
+    assert_ne!(next.capacity_evidence, baseline.capacity_evidence);
+    assert_eq!(calls.get(), 2);
+    Ok(())
+}

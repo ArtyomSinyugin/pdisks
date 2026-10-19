@@ -483,7 +483,7 @@ fn lv_activation_ext4_run_verifies_and_retains_owned_filesystem() -> Result<(), 
     let mut lvm = coordination::dispatcher(&scratch, state.clone());
     lvm.created_uuid = Some("created-lv".into());
     let calls = lvm.calls.clone();
-    let host = LinuxLiveHost::new(
+    let mut host = LinuxLiveHost::new(
         probe(state),
         FilesystemPolicy,
         FilesystemApproval {
@@ -492,14 +492,18 @@ fn lv_activation_ext4_run_verifies_and_retains_owned_filesystem() -> Result<(), 
             confirmation: storage_engine::LiveCheckStatus::Satisfied,
         },
     );
-    let dispatcher = FilesystemDispatcher {
+    let mut dispatcher = FilesystemDispatcher {
         lvm,
         uuid: uuid::Uuid::now_v7().to_string(),
         fault: FilesystemFault::None,
         filesystem_backend: None,
     };
-    let mut coordinator =
-        ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+    let mut coordinator = ExecutionCoordinator::new(
+        ExecutionRoot::open(&scratch.0)?,
+        &mut host,
+        &mut dispatcher,
+        &run,
+    );
     let summary = coordinator.execute_run(&mut run)?;
     assert!(summary.verified);
     assert_eq!(calls.get(), 3);

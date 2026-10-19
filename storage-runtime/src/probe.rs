@@ -68,6 +68,16 @@ impl ProbedObservation {
         &self.observation
     }
 
+    /// Captures graph and validated allocation measurements from this exact pass as editing history.
+    /// This consumes provenance; the saved baseline grants no future live execution permission.
+    pub fn into_baseline(self) -> HistoricalBaseline {
+        HistoricalBaseline {
+            id: uuid::Uuid::now_v7(),
+            snapshot: self.observation.snapshot,
+            capacity_evidence: self.capacity,
+        }
+    }
+
     /// Transfers actual state to the runtime after all checks have used this same publication.
     pub fn into_observation(self) -> LiveObservation {
         self.observation
