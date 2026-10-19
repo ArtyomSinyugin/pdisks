@@ -430,6 +430,22 @@ impl RegisteredBackend {
         }
     }
 
+    /// Checks ext4 MKFS/QUERY support, required creation options and the complete native readback ABI.
+    /// This is availability evidence only, never authorization or a block endpoint guarantee.
+    pub fn check_ext4_create_support(&self) -> Result<(), FilesystemWriteError> {
+        if !self
+            .manifest
+            .capabilities
+            .contains(&BackendCapability::Execute)
+        {
+            return Err(FilesystemWriteError::ExecutionNotDeclared);
+        }
+        match &self.access {
+            LoadedBackendAccess::Library { library } => Ok(library.check_ext4_create_support()?),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
+        }
+    }
+
     /// Reports ordinary-filesystem operations exposed by libblockdev-fs.
     ///
     /// The result distinguishes support compiled into libblockdev from host

@@ -29,3 +29,29 @@ fn filesystem_plugin_sessions_are_serialized_across_probes()
     })?;
     Ok(())
 }
+
+/// Execute opt-in and every native symbol/capability must be present before checkpoint publication.
+#[test]
+fn ext4_readiness_requires_execute_full_abi_and_native_capabilities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let probe_only = mock_ext4::Fixture::new(0, false)?;
+    assert!(matches!(
+        probe_only
+            .registry
+            .backends()
+            .next()
+            .ok_or("backend")?
+            .check_ext4_create_support(),
+        Err(storage_provider::FilesystemWriteError::ExecutionNotDeclared)
+    ));
+    for scenario in 0..=5 {
+        let fixture = mock_ext4::Fixture::new(scenario, true)?;
+        let backend = fixture.registry.backends().next().ok_or("backend")?;
+        assert_eq!(
+            backend.check_ext4_create_support().is_ok(),
+            scenario == 0,
+            "scenario {scenario}"
+        );
+    }
+    Ok(())
+}

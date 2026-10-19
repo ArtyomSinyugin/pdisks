@@ -30,7 +30,7 @@ const MKFS_NO_PARTITION_TABLE: c_int = 1 << 5;
 
 /// C representation of `BDFSFeatures` consumed by this adapter.
 #[repr(C)]
-struct FeaturesRaw {
+pub(super) struct FeaturesRaw {
     resize: c_int,
     mkfs: c_int,
     fsck: c_int,
@@ -38,8 +38,8 @@ struct FeaturesRaw {
     features: c_int,
     partition_id: *const c_char,
     partition_type: *const c_char,
-    min_size: u64,
-    max_size: u64,
+    pub(super) min_size: u64,
+    pub(super) max_size: u64,
 }
 
 type Init = unsafe extern "C" fn() -> c_int;

@@ -21,6 +21,7 @@ mod cryptsetup;
 mod devmapper;
 mod fdisk;
 mod filesystem;
+mod filesystem_write;
 mod libmount;
 mod loopdev;
 mod lvm;
@@ -203,6 +204,11 @@ impl LoadedLibrary {
     /// Reads the live NVMe subsystem topology.
     pub(super) fn probe_nvme(&self) -> Result<NvmeEntry, NativeProbeError> {
         nvme::probe(&self.handle)
+    }
+
+    /// Resolves and checks the complete ext4 create/readback recipe without invoking a mutator.
+    pub(super) fn check_ext4_create_support(&self) -> Result<(), NativeProbeError> {
+        filesystem_write::check_support(&self.handle)
     }
 
     /// Reports ordinary-filesystem features and host tool availability.
