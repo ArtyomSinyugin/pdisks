@@ -5,12 +5,13 @@
 
 mod error;
 mod handles;
+mod sessions;
 pub use error::{DisksGraphError, ErrorCode};
 pub use handles::{PlanId, RunId, SessionId};
 pub use storage_core::model;
 pub use storage_engine::editing::{
     DraftDocument, DraftRevision, EditReceipt, FrozenPlan, OperationId, PlanEdit, PlanRequest,
-    PreviewState, PreviewStatus, RebasePreview,
+    PreviewDocument, PreviewState, PreviewStatus, RebasePreview,
 };
 pub use storage_engine::{
     ActionId, ActionRunState, ActionStatus, BackendOutcome, EventsPage, LiveCheckStatus,
@@ -34,7 +35,8 @@ pub mod host {
     };
 }
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
+use storage_engine::editing::PlanSession;
 use storage_provider::{BackendId, ProviderAction};
 use storage_runtime::{
     capability::OperationAvailability, checkpoint::CheckpointStore, dispatcher::BackendDispatcher,
@@ -73,6 +75,8 @@ pub struct DisksGraph<H, D> {
     host: H,
     /// Sole configured typed native route, borrowed by the existing coordinator when executing.
     dispatcher: D,
+    /// Opaque facade handles never reuse imported session identities.
+    sessions: HashMap<SessionId, PlanSession>,
 }
 impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
     /// Validates an existing private execution directory; never installs a permissive default policy.
@@ -81,6 +85,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
             root: ExecutionRoot::open(root)?,
             host,
             dispatcher,
+            sessions: HashMap::new(),
         })
     }
     /// Performs an actual provider pass without exposing a forecast as current state.
