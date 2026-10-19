@@ -151,7 +151,7 @@ pub struct VerificationReport {
 }
 
 /// Separate final verification of the actual requested configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GoalVerificationReport {
     /// Run whose complete requested goal was checked.
     pub run_id: Uuid,
@@ -261,6 +261,49 @@ pub struct EventsPage {
     pub next_sequence: u64,
     /// True when at least one event newer than the requested cursor was already evicted.
     pub gap: bool,
+}
+
+/// Current action facts for reconnecting clients, independent of evicted event history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActionStatus {
+    /// Frozen global action identity.
+    pub action: ActionId,
+    /// Actual lifecycle state, never a projected effect.
+    pub state: ActionRunState,
+    /// Latest applicability decision; individual prerequisites remain independently visible.
+    pub applicability: Option<LiveCheckStatus>,
+    /// Complete most recently checked prerequisite set, empty before admission.
+    pub prerequisites: Vec<LiveCheck<ActionPrerequisite>>,
+    /// Classified backend result, absent until an actual completion was recorded.
+    pub outcome: Option<BackendOutcome>,
+    /// Complete postcondition checks, absent before verification.
+    pub postconditions: Option<Vec<LiveCheck<Postcondition>>>,
+    /// Checkpoint preparation or endpoint failure before dispatch.
+    pub pre_dispatch_failure: Option<String>,
+    /// Why a running invocation could not be classified or observed.
+    pub unknown_reason: Option<String>,
+}
+
+/// Complete current execution view used after an event gap; this is not a resumable run document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunSnapshot {
+    /// Live attempt identity, independent of its frozen plan.
+    pub run_id: Uuid,
+    /// Reviewed immutable plan identity.
+    pub plan_id: Uuid,
+    /// Every frozen action in global action order, including actions that have not started.
+    pub actions: Vec<ActionStatus>,
+    /// Terminal action outcome, exhausted event cursor, or a completed final verification report.
+    /// Waiting admission with missing evidence remains unfinished; success is reported separately.
+    pub finished: bool,
+    /// True only after the independent actual-goal and preservation report passes.
+    pub verified: bool,
+    /// Last published event; use as the exclusive cursor after replacing state with this snapshot.
+    pub event_sequence: u64,
+    /// Latest accepted actual provider publication, never a simulation or historical fallback.
+    pub observation: Option<LiveObservation>,
+    /// Independent final evidence; action success alone cannot populate this field.
+    pub goal_verification: Option<GoalVerificationReport>,
 }
 
 /// Retained evidence and state for one action, mutable only through run transitions.
@@ -471,6 +514,55 @@ impl ExecutionRun {
     /// Returns why an invocation was left unclassified when a new probe could not be obtained.
     pub fn unknown_reason(&self, action: ActionId) -> Result<Option<&str>, ExecutionRunError> {
         Ok(self.action(action)?.unknown_reason.as_deref())
+    }
+
+    /// Copies current action/evidence state even if the corresponding events were already evicted.
+    pub fn snapshot(&self) -> RunSnapshot {
+        RunSnapshot {
+            run_id: self.run_id,
+            plan_id: self.document.plan_id,
+            actions: self
+                .plan
+                .actions()
+                .iter()
+                .zip(&self.actions)
+                .map(|(planned, action)| ActionStatus {
+                    action: planned.id,
+                    state: action.state,
+                    applicability: action
+                        .admission
+                        .as_ref()
+                        .map(|report| report.applicability.clone()),
+                    prerequisites: action
+                        .admission
+                        .as_ref()
+                        .map(|report| report.checks.clone())
+                        .unwrap_or_default(),
+                    outcome: action
+                        .completion
+                        .as_ref()
+                        .map(|completion| completion.outcome.clone()),
+                    postconditions: action
+                        .verification
+                        .as_ref()
+                        .map(|report| report.checks.clone()),
+                    pre_dispatch_failure: action.pre_dispatch_failure.clone(),
+                    unknown_reason: action.unknown_reason.clone(),
+                })
+                .collect(),
+            finished: self.goal_verification.is_some()
+                || self.next_event_sequence == u64::MAX
+                || self.actions.iter().any(|action| {
+                    matches!(
+                        action.state,
+                        ActionRunState::Failed | ActionRunState::OutcomeUnknown
+                    )
+                }),
+            verified: self.is_verified(),
+            event_sequence: self.next_event_sequence - 1,
+            observation: self.latest_observation.clone(),
+            goal_verification: self.goal_verification.clone(),
+        }
     }
 
     /// Returns bounded ordered replay and detects events lost since an exclusive cursor.
@@ -958,6 +1050,59 @@ mod tests {
             run.record_verification(report)
                 .unwrap_or_else(|error| panic!("record verification: {error}"))
         );
+    }
+
+    /// A snapshot recovers current evidence after replay gaps without declaring partial actions successful.
+    #[test]
+    fn snapshots_preserve_actual_state_and_unknown_outcomes_after_event_eviction()
+    -> Result<(), ExecutionRunError> {
+        let mut run = ExecutionRun::new(&crate::wire::tests::document_fixture())?;
+        let initial = run.snapshot();
+        assert!(!initial.finished && !initial.verified);
+        assert!(initial.observation.is_none());
+        assert_eq!(initial.event_sequence, 0);
+        let action = ActionId::new(0);
+        let instance = Uuid::now_v7();
+        run.begin_check(action)?;
+        let report = admission(&run, action, instance, 1);
+        run.record_admission(report)?;
+        run.mark_dispatch_started(action)?;
+        for _ in 0..MAX_RUN_EVENTS {
+            run.record_progress(action, "native progress".into())?;
+        }
+        assert!(run.events_page(0)?.gap);
+        let current = run.snapshot();
+        assert!(!current.finished && !current.verified);
+        assert_eq!(current.actions[0].state, ActionRunState::Running);
+        assert_eq!(
+            current.actions[0].applicability,
+            Some(LiveCheckStatus::Satisfied)
+        );
+        assert!(current.actions[0].outcome.is_none());
+        assert!(run.events_page(current.event_sequence)?.events.is_empty());
+        let completion = completion(
+            &run,
+            action,
+            instance,
+            2,
+            BackendOutcome::OutcomeUnknown {
+                reason: "lost native completion".into(),
+            },
+        );
+        run.record_completion(completion)?;
+        let stopped = run.snapshot();
+        assert!(stopped.finished && !stopped.verified);
+        assert_eq!(stopped.actions[0].state, ActionRunState::OutcomeUnknown);
+        assert!(stopped.goal_verification.is_none());
+        assert_eq!(
+            stopped
+                .observation
+                .as_ref()
+                .map(|value| value.reference.epoch.get()),
+            Some(2)
+        );
+        assert!(serde_json::to_string(&stopped).is_ok());
+        Ok(())
     }
 
     /// Exclusive cursors report eviction gaps, reject future acknowledgments and resume without duplicates.
