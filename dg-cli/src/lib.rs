@@ -2,7 +2,9 @@
 
 //! Foreground command adapter over the application facade; saved files grant no authorization.
 
+mod commands;
 pub mod files;
+pub use commands::{Command, Invocation, execute};
 
 /// Structured command failures; application diagnostics retain their original stable code.
 #[derive(Debug, serde::Serialize, thiserror::Error)]

@@ -30,7 +30,8 @@ pub use storage_engine::{
 pub mod host {
     pub use storage_engine::{ExecutionContext, ExecutionRunError};
     pub use storage_probe::{
-        LinuxProbe, ProbeSnapshot, ProviderProbeError, ProviderState, StateProvider,
+        LinuxProbe, NativeLocalProvider, NativeSystemProvider, ProbeSnapshot, ProviderProbeError,
+        ProviderState, StateProvider,
     };
     pub use storage_provider::{
         BACKEND_MANIFEST_VERSION, BackendCapability, BackendId, BackendLibrary, BackendManifest,
