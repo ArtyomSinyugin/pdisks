@@ -62,7 +62,8 @@ pub enum ErrorCode {
 pub struct DisksGraphError {
     /// Stable category for callers; never parse message text to choose behavior.
     pub code: ErrorCode,
-    /// Human-readable context copied from the typed failure.
+    /// Raw trusted-Rust context; JSON omits its contents while retaining the stable error code.
+    #[serde(serialize_with = "crate::diagnostics::serialize_message")]
     pub message: String,
     /// New attempt retained by a failed apply call; other errors carry no newly created run.
     pub run_id: Option<crate::RunId>,

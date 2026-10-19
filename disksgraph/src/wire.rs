@@ -141,7 +141,7 @@ struct Envelope {
 pub enum ProtocolError {
     /// The envelope or method parameters are malformed.
     #[error("invalid application request: {0}")]
-    InvalidRequest(String),
+    InvalidRequest(#[serde(serialize_with = "crate::diagnostics::serialize_message")] String),
     /// A future version cannot silently be interpreted as the current protocol.
     #[error("unsupported protocol version {0}")]
     UnsupportedVersion(u64),
@@ -153,7 +153,7 @@ pub enum ProtocolError {
     LiveUnavailable,
     /// The synchronous adapter has no background owner, or the requested interruption is unsupported.
     #[error("operation requires an owner transport or is unsupported: {0}")]
-    UnsupportedOperation(String),
+    UnsupportedOperation(#[serde(serialize_with = "crate::diagnostics::serialize_message")] String),
     /// Review was closed, has another kind or belongs to another protocol owner.
     #[error("review is not owned by this context")]
     UnknownReview,
@@ -165,7 +165,7 @@ pub enum ProtocolError {
     Application(#[from] DisksGraphError),
     /// A serializable application result could not be encoded.
     #[error("application serialization failed: {0}")]
-    Serialization(String),
+    Serialization(#[serde(serialize_with = "crate::diagnostics::serialize_message")] String),
 }
 
 /// Validates size and protocol version before interpreting potentially unsupported method fields.

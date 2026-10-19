@@ -18,7 +18,7 @@ pub mod wire;
 pub use error::{DisksGraphError, ErrorCode};
 pub use handles::{PlanId, RunId, SessionId};
 pub use plans::MAX_PLAN_JSON_BYTES;
-pub use storage_core::model;
+pub use storage_core::{diagnostics, model};
 pub use storage_engine::editing::{
     DraftDocument, DraftRevision, EditReceipt, FrozenPlan, OperationActions, OperationId, PlanEdit,
     PlanRequest, PreviewDocument, PreviewState, PreviewStatus, RebasePreview,
