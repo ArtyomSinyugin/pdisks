@@ -203,3 +203,210 @@ fn ext4_admission_requires_explicit_consumer_exclusion_and_destructive_confirmat
     check(&scratch, state, run, host)?;
     Ok(())
 }
+
+/// Explicit destructive approval for the sole verified LV of this synthetic plan.
+struct FilesystemApproval {
+    /// Existing exact digest/run/backend policy used for ordinary execution authorization.
+    inner: admission::Authorization,
+    /// Planned LV whose content replacement the fixture explicitly approves.
+    backing: NodeId,
+}
+impl storage_runtime::authorization::AuthorizationContext for FilesystemApproval {
+    /// Retains all normal principal, digest, target and observation checks.
+    fn check(
+        &mut self,
+        request: &storage_runtime::authorization::ApprovalRequest,
+    ) -> storage_engine::LiveCheckStatus {
+        storage_runtime::authorization::AuthorizationContext::check(&mut self.inner, request)
+    }
+    /// Approval is separate and limited to a fingerprinted LV, never a display path.
+    fn check_destructive(
+        &mut self,
+        request: &storage_runtime::authorization::ApprovalRequest,
+        target: NodeId,
+    ) -> storage_engine::LiveCheckStatus {
+        if target == self.backing
+            && request.targets.iter().any(|item| {
+                item.planned_id == target
+                    && matches!(item.external_ids.as_slice(), [ExternalId::LvmLvUuid(_)])
+            })
+        {
+            storage_runtime::authorization::AuthorizationContext::check(&mut self.inner, request)
+        } else {
+            storage_engine::LiveCheckStatus::Violated {
+                reason: "wrong destructive target".into(),
+            }
+        }
+    }
+}
+
+/// Synthetic ext4 adapter layered over the existing private-memory LV dispatcher.
+struct FilesystemDispatcher {
+    /// LV creation and activation retain their existing checkpoint assertions and independent observations.
+    lvm: coordination::FakeDispatcher,
+    /// Canonical new UUID returned only after this fixture publishes the ext4 result.
+    uuid: String,
+}
+impl storage_runtime::dispatcher::BackendDispatcher for FilesystemDispatcher {
+    /// One composite test backend is fixed throughout the plan; no dispatch-time fallback exists.
+    fn backend_id(&self) -> &BackendId {
+        &self.lvm.backend
+    }
+    /// Changes private recorded state only after checking the durable checkpoint and held OS lock.
+    fn execute(
+        &mut self,
+        action: &storage_runtime::targets::ResolvedAction,
+        progress: &mut dyn FnMut(String) -> Result<(), storage_engine::ExecutionRunError>,
+    ) -> Result<
+        storage_runtime::dispatcher::ExecutionReceipt,
+        storage_runtime::dispatcher::DispatchError,
+    > {
+        use storage_core::model::{
+            Dependency, DependencyKind, Node, NodeFacts, NodeSpec, Presence,
+        };
+        use storage_runtime::{
+            checkpoint::ActiveAttempt,
+            dispatcher::{DispatchError, ExecutionReceipt},
+        };
+        let storage_provider::ProviderAction::Filesystem(
+            storage_provider::FilesystemAction::Create { label, .. },
+        ) = action.operation()
+        else {
+            return storage_runtime::dispatcher::BackendDispatcher::execute(
+                &mut self.lvm,
+                action,
+                progress,
+            );
+        };
+        let attempt = std::fs::read(self.lvm.root.join("active-attempt.json"))
+            .map_err(|e| DispatchError::Adapter(e.to_string()))?;
+        let attempt = ActiveAttempt::from_bytes(&attempt)
+            .map_err(|e| DispatchError::Adapter(e.to_string()))?;
+        assert_eq!(attempt.action, *action.operation());
+        assert_eq!(attempt.targets, action.fingerprints());
+        assert!(
+            ExecutionRoot::open(&self.lvm.root)
+                .unwrap_or_else(|e| panic!("root: {e}"))
+                .try_lock_host()
+                .is_err()
+        );
+        self.lvm.calls.set(self.lvm.calls.get() + 1);
+        let backing = action
+            .lv_target()
+            .ok_or_else(|| DispatchError::Adapter("missing backing".into()))?;
+        assert!(backing.block.is_some());
+        let mut state = self.lvm.state.borrow_mut();
+        let id = NodeId::new();
+        state
+            .current
+            .graph
+            .insert_new(
+                id,
+                Node {
+                    kind: NodeSpec {
+                        kind: NodeKind::Filesystem {
+                            kind: FilesystemKind::Ext4,
+                            label: label.clone(),
+                        },
+                        size: Some(Bytes::new(15 * 1024 * 1024)),
+                    },
+                    size: NodeFacts {
+                        presence: Presence::Present,
+                        identities: vec![ExternalId::Filesystem {
+                            fs_type: "ext4".into(),
+                            value: self.uuid.clone(),
+                        }],
+                        ..NodeFacts::default()
+                    },
+                },
+            )
+            .map_err(|e| DispatchError::Adapter(e.to_string()))?;
+        state.current.graph.insert_dependency(Dependency {
+            from: backing.observed_id,
+            to: id,
+            kind: DependencyKind::Backs,
+        });
+        Ok(ExecutionReceipt {
+            outcome: storage_engine::BackendOutcome::Succeeded,
+            created_lv_uuid: None,
+            created_filesystem_uuid: Some(self.uuid.clone()),
+        })
+    }
+}
+
+/// The roadmap's three-action prefix verifies actual ext4 output and rechecks it after transient ID drift.
+#[test]
+fn lv_activation_ext4_run_verifies_and_retains_owned_filesystem() -> Result<(), Box<dyn Error>> {
+    use storage_runtime::host::LinuxLiveHost;
+    let (state, frozen, backing) = filesystem_plan()?;
+    let state = Rc::new(RefCell::new(state));
+    let scratch = admission::Scratch::new()?;
+    let mut run = ExecutionRun::new(frozen.document())?;
+    let mut lvm = coordination::dispatcher(&scratch, state.clone());
+    lvm.created_uuid = Some("created-lv".into());
+    let calls = lvm.calls.clone();
+    let host = LinuxLiveHost::new(
+        probe(state),
+        FilesystemPolicy,
+        FilesystemApproval {
+            inner: admission::authorization(&run)?,
+            backing,
+        },
+    );
+    let dispatcher = FilesystemDispatcher {
+        lvm,
+        uuid: uuid::Uuid::now_v7().to_string(),
+    };
+    let mut coordinator =
+        ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+    let summary = coordinator.execute_run(&mut run)?;
+    assert!(summary.verified);
+    assert_eq!(calls.get(), 3);
+    assert_eq!(coordinator.bindings().len(), 2);
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    let storage_provider::ProviderAction::Filesystem(storage_provider::FilesystemAction::Create {
+        planned_node_id: filesystem,
+        ..
+    }) = run.context().plan.actions()[2].operation
+    else {
+        return Err("FS action".into());
+    };
+    let observed = summary.observation.ok_or("final observation")?;
+    let fs = coordinator
+        .bindings()
+        .resolve(&run, filesystem, &observed)?;
+    let lv = coordinator.bindings().resolve(&run, backing, &observed)?;
+    let new_fs = NodeId::new();
+    let new_lv = NodeId::new();
+    let changed = serde_json::to_string(&observed)?
+        .replace(&fs.as_uuid().to_string(), &new_fs.as_uuid().to_string())
+        .replace(&lv.as_uuid().to_string(), &new_lv.as_uuid().to_string());
+    let changed = serde_json::from_str(&changed)?;
+    assert_eq!(
+        coordinator.bindings().resolve(&run, filesystem, &changed)?,
+        new_fs
+    );
+    for case in 0..3 {
+        let mut wrong: storage_engine::LiveObservation = changed.clone();
+        let mut node = wrong.snapshot.graph.node(&new_fs).ok_or("FS")?.clone();
+        match case {
+            0 => node.kind.size = Some(Bytes::new(4096)),
+            1 => {
+                node.size.identities = vec![ExternalId::Filesystem {
+                    fs_type: "ext4".into(),
+                    value: uuid::Uuid::now_v7().to_string(),
+                }]
+            }
+            _ => node.size.presence = storage_core::model::Presence::Unknown,
+        }
+        wrong.snapshot.graph.replace_existing(new_fs, node)?;
+        assert!(
+            coordinator
+                .bindings()
+                .resolve(&run, filesystem, &wrong)
+                .is_err(),
+            "case {case}"
+        );
+    }
+    Ok(())
+}
