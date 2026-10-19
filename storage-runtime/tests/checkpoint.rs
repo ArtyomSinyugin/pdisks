@@ -305,3 +305,144 @@ fn mount_checkpoint_requires_exact_profile_and_filesystem_identity() -> Result<(
     }
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+mod crash_lifecycle {
+    //! Process death preserves one conservative marker independently of volatile engine phases.
+
+    use super::*;
+    use std::{
+        fs,
+        os::unix::{fs::DirBuilderExt, process::ExitStatusExt},
+        path::PathBuf,
+    };
+    use storage_engine::{BackendCompletion, BackendOutcome, VerificationReport};
+    use storage_runtime::{checkpoint::CheckpointStore, lease::ExecutionRoot};
+
+    /// Owns the execution root and separate parent-readable crash evidence.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        /// Creates only fresh private test directories; no native backend is used.
+        fn new() -> Result<Self, Box<dyn Error>> {
+            let path =
+                std::env::temp_dir().join(format!("disksgraph-lifecycle-{}", Uuid::now_v7()));
+            fs::DirBuilder::new().mode(0o700).create(&path)?;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path.join("root"))?;
+            Ok(Self(path))
+        }
+    }
+    impl Drop for Scratch {
+        /// Removes only this test's own tree after child and lock descriptors are gone.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Uses real checkpoint publication and engine transitions with explicitly synthetic reports.
+    #[test]
+    #[ignore = "subprocess helper invoked by sigkill_keeps_marker_across_engine_phases"]
+    fn lifecycle_crash_child() -> Result<(), Box<dyn Error>> {
+        let path = PathBuf::from(std::env::var_os("DISKSGRAPH_LIFECYCLE_ROOT").ok_or("root")?);
+        let phase = std::env::var("DISKSGRAPH_LIFECYCLE_PHASE")?;
+        let root = ExecutionRoot::open(path.join("root"))?;
+        let lock = root.try_lock_host()?;
+        let store = CheckpointStore::new(&lock);
+        let mut run = admitted_run()?;
+        let attempt = attempt(&run)?;
+        store.arm(&attempt)?;
+        fs::write(path.join("expected.json"), attempt.to_bytes()?)?;
+        let action = ActionId::new(0);
+        if phase != "armed" {
+            run.mark_dispatch_started(action)?;
+        }
+        if matches!(phase.as_str(), "completed" | "verified_before_clear") {
+            let mut observation = run
+                .admission(action)?
+                .ok_or("admission")?
+                .observation
+                .clone();
+            observation.reference.epoch = storage_core::model::ProbeEpoch::new(2);
+            run.record_completion(BackendCompletion {
+                run_id: run.run_id(),
+                action,
+                outcome: BackendOutcome::Succeeded,
+                observation,
+            })?;
+        }
+        if phase == "verified_before_clear" {
+            // Claims test engine/file lifecycle only; they never authorize native writes.
+            let checks = run.context().plan.actions()[0]
+                .informational_contract
+                .postconditions
+                .iter()
+                .cloned()
+                .map(|condition| LiveCheck {
+                    condition,
+                    status: LiveCheckStatus::Satisfied,
+                })
+                .collect();
+            run.record_verification(VerificationReport {
+                run_id: run.run_id(),
+                action,
+                observation: run
+                    .completion(action)?
+                    .ok_or("completion")?
+                    .observation
+                    .reference,
+                checks,
+            })?;
+        }
+        let expected = match phase.as_str() {
+            "armed" => storage_engine::ActionRunState::Admitted,
+            "running" => storage_engine::ActionRunState::Running,
+            "completed" => storage_engine::ActionRunState::Verifying,
+            "verified_before_clear" => storage_engine::ActionRunState::Verified,
+            _ => return Err("unknown crash phase".into()),
+        };
+        assert_eq!(run.state(action)?, expected);
+        assert!(!run.is_verified());
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL)?;
+        Err("SIGKILL did not terminate child".into())
+    }
+
+    /// Every persisted marker blocks a successor even if the dead run had locally verified an action.
+    #[test]
+    fn sigkill_keeps_marker_across_engine_phases() -> Result<(), Box<dyn Error>> {
+        for phase in ["armed", "running", "completed", "verified_before_clear"] {
+            let scratch = Scratch::new()?;
+            let result = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "crash_lifecycle::lifecycle_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("DISKSGRAPH_LIFECYCLE_ROOT", &scratch.0)
+                .env("DISKSGRAPH_LIFECYCLE_PHASE", phase)
+                .output()?;
+            assert_eq!(
+                result.status.signal(),
+                Some(9),
+                "{phase}: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let root_path = scratch.0.join("root");
+            let bytes = fs::read(root_path.join("active-attempt.json"))?;
+            assert_eq!(bytes, fs::read(scratch.0.join("expected.json"))?);
+            let root = ExecutionRoot::open(&root_path)?;
+            let lock = root.try_lock_host()?;
+            let store = CheckpointStore::new(&lock);
+            assert_eq!(store.inspect()?, Some(ActiveAttempt::from_bytes(&bytes)?));
+            assert!(matches!(
+                store.arm(&attempt(&admitted_run()?)?),
+                Err(CheckpointError::AlreadyActive)
+            ));
+            assert_eq!(fs::read(root_path.join("active-attempt.json"))?, bytes);
+            assert_eq!(fs::read_dir(&root_path)?.count(), 2);
+        }
+        Ok(())
+    }
+}
