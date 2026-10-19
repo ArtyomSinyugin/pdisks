@@ -261,7 +261,7 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
         let context = run.context();
         let planned = &context.plan.actions()[action.get() as usize];
         let correlations = bindings.correlations(run, observed.observation())?;
-        let checks = observed
+        let mut checks = observed
             .check_prerequisites_with_bindings(
                 context.historical_baseline,
                 &planned.informational_contract.prerequisites,
@@ -309,11 +309,37 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                 applicability = observed.check_vg_membership(action.target().observed_id);
             }
             if applicability == LiveCheckStatus::Satisfied {
-                if checks
-                    .iter()
-                    .all(|check| check.status == LiveCheckStatus::Satisfied)
-                {
-                    applicability = self.authorization.check(&ApprovalRequest {
+                // Only this narrow recipe has resolved, verified backing semantics for these checks.
+                let backing = match action.operation() {
+                    storage_provider::ProviderAction::Filesystem(
+                        storage_provider::FilesystemAction::Create {
+                            backing,
+                            filesystem: storage_core::model::FilesystemKind::Ext4,
+                            ..
+                        },
+                    ) => Some(*backing),
+                    _ => None,
+                };
+                if let Some(backing) = backing {
+                    for check in &mut checks {
+                        if check.condition
+                            == storage_provider::ActionPrerequisite::NoUnexpectedConsumers(backing)
+                            && matches!(check.status, LiveCheckStatus::Unknown { .. })
+                        {
+                            check.status = self.capability.check_consumer_exclusion(
+                                &context,
+                                action,
+                                observed.observation(),
+                            );
+                        }
+                    }
+                }
+                let facts_ready = checks.iter().all(|check| {
+                    check.status == LiveCheckStatus::Satisfied
+                        || (matches!(check.status, LiveCheckStatus::Unknown { .. }) && matches!((&check.condition, backing), (storage_provider::ActionPrerequisite::DestructiveApproval(node), Some(backing)) if *node == backing))
+                });
+                if facts_ready {
+                    let request = ApprovalRequest {
                         run_id: run.run_id(),
                         plan_id: context.plan_id,
                         action_id: action.action_id(),
@@ -321,7 +347,28 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                         backend: action.backend().clone(),
                         targets: action.fingerprints(),
                         observation: reference,
-                    });
+                    };
+                    applicability = self.authorization.check(&request);
+                    if applicability == LiveCheckStatus::Satisfied {
+                        for check in &mut checks {
+                            if let storage_provider::ActionPrerequisite::DestructiveApproval(node) =
+                                check.condition
+                                && Some(node) == backing
+                                && matches!(check.status, LiveCheckStatus::Unknown { .. })
+                            {
+                                check.status = self.authorization.check_destructive(&request, node);
+                            }
+                        }
+                        if !checks
+                            .iter()
+                            .all(|check| check.status == LiveCheckStatus::Satisfied)
+                        {
+                            applicability = LiveCheckStatus::Unknown {
+                                required_evidence:
+                                    "explicit destructive confirmation is incomplete".into(),
+                            };
+                        }
+                    }
                 } else {
                     applicability = LiveCheckStatus::Unknown {
                         required_evidence: "authorization deferred until all prerequisites pass"

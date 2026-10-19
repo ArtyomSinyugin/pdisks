@@ -38,6 +38,20 @@ pub trait BackendCapabilityCheck {
         }
     }
 
+    /// Independently excludes every graph, kernel and namespace consumer of the resolved backing LV.
+    /// Absence in the graph and general coverage do not establish endpoint exclusivity.
+    fn check_consumer_exclusion(
+        &self,
+        _context: &ExecutionContext<'_>,
+        _action: &ResolvedAction,
+        _observed: &LiveObservation,
+    ) -> LiveCheckStatus {
+        LiveCheckStatus::Unknown {
+            required_evidence: "independent backing endpoint and namespace consumer exclusion"
+                .into(),
+        }
+    }
+
     /// Establishes complete final observation/namespace coverage and exclusion of external writers.
     /// Operation admission coverage cannot silently stand in for this final publication's evidence.
     fn check_final_scope(

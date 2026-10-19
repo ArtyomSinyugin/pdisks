@@ -29,4 +29,17 @@ pub struct ApprovalRequest {
 pub trait AuthorizationContext {
     /// Evaluates the actual invoking principal and confirmation against this exact request.
     fn check(&mut self, request: &ApprovalRequest) -> LiveCheckStatus;
+
+    /// Requires explicit destructive confirmation for this exact plan, action and fingerprinted node.
+    /// General execution authorization cannot silently approve filesystem content replacement.
+    fn check_destructive(
+        &mut self,
+        _request: &ApprovalRequest,
+        _target: storage_core::model::NodeId,
+    ) -> LiveCheckStatus {
+        LiveCheckStatus::Unknown {
+            required_evidence: "explicit destructive confirmation bound to the admitted target"
+                .into(),
+        }
+    }
 }
