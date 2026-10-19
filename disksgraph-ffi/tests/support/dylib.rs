@@ -21,39 +21,40 @@ pub struct Api {
     library: Option<Library>,
     /// Open handles owned by this consumer, including during unwinding after an assertion failure.
     contexts: RefCell<Vec<u64>>,
+    /// Explicit trusted symbol namespace: production or separately built guarded VM artifact.
+    namespace: String,
 }
 
 impl Api {
     /// Loads only the locally built test cdylib selected by the integration harness.
-    pub fn load(path: &Path) -> Result<Self, Error> {
+    pub fn load(path: &Path, namespace: &str) -> Result<Self, Error> {
         // SAFETY: the harness supplies its own trusted build output. This owner keeps the mapping
         // alive through every checked call, response destructor and joined context shutdown.
         let library = unsafe { Library::new(path)? };
         Ok(Self {
             library: Some(library),
             contexts: RefCell::new(Vec::new()),
+            namespace: namespace.into(),
         })
     }
 
     /// Stabby reflection checks every requested signature; returned symbols borrow this mapping.
-    fn symbol<T: IStable>(&self, name: &[u8]) -> Result<Symbol<'_, T>, Error> {
+    fn symbol<T: IStable>(&self, name: &str) -> Result<Symbol<'_, T>, Error> {
         let library = self.library.as_ref().ok_or("library is closed")?;
         // SAFETY: only the fixed signatures below are requested from the trusted test build.
         // get_stabbied rejects incompatible reports before returning a callable symbol.
-        unsafe { library.get_stabbied(name) }
+        unsafe { library.get_stabbied(format!("{}_{}", self.namespace, name).as_bytes()) }
     }
 
     /// Proves reflection rejects a same-name symbol with an incompatible return representation.
     pub fn rejects_wrong_signature(&self) -> bool {
-        self.symbol::<extern "C" fn() -> u64>(b"disksgraph_api_version")
+        self.symbol::<extern "C" fn() -> u64>("api_version")
             .is_err()
     }
 
     /// Reads the independent ABI signature version through the checked import.
     pub fn version(&self) -> Result<u32, Error> {
-        Ok(self.symbol::<extern "C" fn() -> u32>(
-            b"disksgraph_api_version",
-        )?())
+        Ok(self.symbol::<extern "C" fn() -> u32>("api_version")?())
     }
 
     /// Converts and drops every library-allocated response before returning ordinary consumer JSON.
@@ -65,8 +66,7 @@ impl Api {
 
     /// Records successfully opened owners for panic-safe cleanup before unloading.
     pub fn open(&self, config: &Value) -> Result<Value, Error> {
-        let function =
-            self.symbol::<extern "C" fn(StableString) -> StableString>(b"disksgraph_open")?;
+        let function = self.symbol::<extern "C" fn(StableString) -> StableString>("open")?;
         let value = Self::value(function(StableString::from(config.to_string().as_str())))?;
         if let Some(id) = value["result"]["context"].as_u64() {
             self.contexts.borrow_mut().push(id);
@@ -76,8 +76,7 @@ impl Api {
 
     /// Sends bounded application JSON using stable owned strings in both directions.
     pub fn call(&self, context: u64, request: &Value) -> Result<Value, Error> {
-        let function =
-            self.symbol::<extern "C" fn(u64, StableString) -> StableString>(b"disksgraph_call")?;
+        let function = self.symbol::<extern "C" fn(u64, StableString) -> StableString>("call")?;
         Self::value(function(
             context,
             StableString::from(request.to_string().as_str()),
@@ -95,7 +94,7 @@ impl Api {
     /// Joins the owner and removes only successfully closed handles from this consumer's cleanup list.
     pub fn close(&self, context: u64) -> Result<Value, Error> {
         let value = Self::value(self
-            .symbol::<extern "C" fn(u64) -> StableString>(b"disksgraph_close")?(
+            .symbol::<extern "C" fn(u64) -> StableString>("close")?(
             context
         ))?;
         if value.get("error").is_none() {

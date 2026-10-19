@@ -27,3 +27,11 @@ stabby.workspace = true
 
 [dev-dependencies]
 libloading.workspace = true
+
+rustix = { version = "1.1.5", features = ["fs"] }
+uuid.workspace = true
+
+[[example]]
+name = "c7_vm_library"
+crate-type = ["cdylib"]
+test = false

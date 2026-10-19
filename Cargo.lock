@@ -93,9 +93,11 @@ version = "0.1.0"
 dependencies = [
  "disksgraph",
  "libloading",
+ "rustix",
  "serde",
  "serde_json",
  "stabby",
+ "uuid",
 ]
 
 [[package]]

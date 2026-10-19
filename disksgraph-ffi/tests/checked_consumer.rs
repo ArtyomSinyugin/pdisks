@@ -64,7 +64,7 @@ fn draft() -> Result<Value, Error> {
 #[test]
 fn checked_import_preserves_editing_parity_and_rejects_foreign_handles() -> Result<(), Error> {
     let scratch = Scratch::new()?;
-    let api = Api::load(&library()?)?;
+    let api = Api::load(&library()?, "disksgraph")?;
     assert_eq!(api.version()?, 1);
     assert!(api.rejects_wrong_signature());
     assert_eq!(
@@ -205,7 +205,7 @@ fn native_provider_calls_retain_one_owner_and_failed_run_evidence() -> Result<()
     let manifest = std::env::var_os("DISKSGRAPH_NATIVE_MANIFEST")
         .ok_or("DISKSGRAPH_NATIVE_MANIFEST is required")?;
     let scratch = Scratch::new()?;
-    let api = Api::load(&library()?)?;
+    let api = Api::load(&library()?, "disksgraph")?;
     let mut config = scratch.config();
     config["manifest"] = json!(PathBuf::from(manifest));
     let opened = api.open(&config)?;
@@ -345,7 +345,7 @@ fn native_reviews_are_owned_and_acknowledgment_preserves_marker() -> Result<(), 
     let manifest = std::env::var_os("DISKSGRAPH_NATIVE_MANIFEST")
         .ok_or("DISKSGRAPH_NATIVE_MANIFEST is required")?;
     let scratch = Scratch::new()?;
-    let api = Api::load(&library()?)?;
+    let api = Api::load(&library()?, "disksgraph")?;
     let mut config = scratch.config();
     config["manifest"] = json!(PathBuf::from(manifest));
     let opened = api.open(&config)?;
@@ -522,4 +522,24 @@ fn incident_marker() -> Result<disksgraph::host::checkpoint::ActiveAttempt, Erro
         plan_digest: "a".repeat(64),
         backend_id: BackendId::new("cli-unconfigured").ok_or("backend")?,
     })
+}
+
+/// The separately compiled write-capable test artifact must refuse a normal host before native setup.
+#[test]
+#[ignore = "requires cargo build -p disksgraph-ffi --example c7_vm_library"]
+fn vm_library_refuses_an_unguarded_host() -> Result<(), Error> {
+    let scratch = Scratch::new()?;
+    let library = std::env::current_exe()?
+        .parent()
+        .ok_or("deps")?
+        .parent()
+        .ok_or("debug")?
+        .join("examples/libc7_vm_library.so");
+    let api = Api::load(&library, "disksgraph_vm")?;
+    assert_eq!(api.version()?, 1);
+    assert!(api.rejects_wrong_signature());
+    let reply = api.open(&scratch.config())?;
+    assert_eq!(reply["error"]["code"], "open_failed", "{reply}");
+    assert_eq!(fs::read_dir(&scratch.0)?.count(), 0);
+    Ok(())
 }
