@@ -626,6 +626,26 @@ Verified actions. При final Unknown повторная проверка по�
 проверяются по actual observations; persistent/managed boot/namespace adapters
 и production policies пока не реализованы. Default configuration остаётся read-only.
 
+C4 runtime поддерживает проверяемый ext4 prefix на явно настроенном dispatcher:
+`CreateLv → SetActivation → CreateFilesystem(ext4)`. Resolver принимает только
+подтверждённый LV этой попытки с active/writable endpoint evidence. Отдельные
+`check_consumer_exclusion()` и `check_destructive()` по умолчанию Unknown;
+обычный scope/authorization не подтверждает отсутствие потребителей и согласие
+на уничтожение содержимого. Endpoint facts ещё не являются удерживаемым native fd.
+
+Receipt различает LV и filesystem UUID. Ext4 completion требует нового
+канонического UUID, единственной Present ФС с точным label, единственной Backs
+связи с подтверждённым LV и неизменности остального scope. Binding публикуется
+только после всех postconditions; последующие probe заново проверяют владельца,
+UUID и первоначально наблюдённый размер ФС. Исторический UUID нельзя выдать за
+созданный output. Checkpoint сохраняет ext4 intent и предшествующий LV UUID.
+Сквозные mock-тесты проверяют Verified run, смену transient IDs и сохранение
+checkpoint/запрет retry при ошибочных receipts, duplicate UUID, неверном владельце,
+label drift, дополнительных consumers и blocking diagnostics.
+Native ext4 mkfs, удержание/проверка device descriptors и mount dispatch ещё не
+реализованы; NativeLvmAdapter по-прежнему отклоняет FS actions до первого write.
+Это подготовка C4 runtime, а не завершение C4 или проверка на реальных дисках.
+
 `NodeFacts.lvm_active` хранит необязательное наблюдение native LVM activation.
 Оно читается из state column `lv_attr`; suspended/неизвестное состояние остаётся
 Unknown. Отсутствие endpoint не доказывает inactive. Pure postconditions

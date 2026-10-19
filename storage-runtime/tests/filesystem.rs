@@ -9,8 +9,22 @@ use storage_engine::{LiveObservation, ObservationReference};
 use storage_runtime::filesystem::{correlate_created_ext4, observe_ext4};
 use uuid::Uuid;
 
+/// The retained publications and independent identities used by filesystem evidence tests.
+struct Fixture {
+    /// Actual state before the synthetic filesystem appears.
+    before: LiveObservation,
+    /// Later publication from the same probe instance.
+    after: LiveObservation,
+    /// Existing UUID-qualified LV.
+    backing: NodeId,
+    /// Newly observed filesystem node.
+    actual: NodeId,
+    /// New canonical ext4 UUID independent of the planned NodeId.
+    uuid: String,
+}
+
 /// Same-instance pre/post publications with a new ext4 on an existing UUID-qualified LV.
-fn fixture() -> Result<(LiveObservation, LiveObservation, NodeId, NodeId, String), Box<dyn Error>> {
+fn fixture() -> Result<Fixture, Box<dyn Error>> {
     let raw: serde_json::Value = serde_json::from_str(include_str!(
         "../../storage-engine/examples/fixtures/probe_snapshot.json"
     ))?;
@@ -48,13 +62,25 @@ fn fixture() -> Result<(LiveObservation, LiveObservation, NodeId, NodeId, String
         to: actual,
         kind: DependencyKind::Backs,
     });
-    Ok((before, after, backing, actual, uuid))
+    Ok(Fixture {
+        before,
+        after,
+        backing,
+        actual,
+        uuid,
+    })
 }
 
 /// A valid UUID is insufficient without unique identity, exact properties and owning backing.
 #[test]
 fn ext4_correlation_checks_identity_properties_and_backing() -> Result<(), Box<dyn Error>> {
-    let (before, after, backing, actual, uuid) = fixture()?;
+    let Fixture {
+        before,
+        after,
+        backing,
+        actual,
+        uuid,
+    } = fixture()?;
     let planned = NodeId::new();
     assert_eq!(
         correlate_created_ext4(&before, &after, planned, backing, &uuid, &None)?.target,
@@ -123,7 +149,13 @@ fn ext4_correlation_checks_identity_properties_and_backing() -> Result<(), Box<d
 /// Revalidation follows UUID and owning LV after both transient IDs have changed.
 #[test]
 fn ext4_revalidation_follows_identity_and_rejects_reparenting() -> Result<(), Box<dyn Error>> {
-    let (_, mut observed, backing, actual, uuid) = fixture()?;
+    let Fixture {
+        after: mut observed,
+        backing,
+        actual,
+        uuid,
+        ..
+    } = fixture()?;
     let lv = observed.snapshot.graph.node(&backing).ok_or("LV")?.clone();
     let fs = observed.snapshot.graph.node(&actual).ok_or("FS")?.clone();
     let edge = observed

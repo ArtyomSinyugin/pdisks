@@ -210,6 +210,8 @@ struct FilesystemApproval {
     inner: admission::Authorization,
     /// Planned LV whose content replacement the fixture explicitly approves.
     backing: NodeId,
+    /// Independent explicit destructive confirmation, separate from ordinary execution approval.
+    confirmation: storage_engine::LiveCheckStatus,
 }
 impl storage_runtime::authorization::AuthorizationContext for FilesystemApproval {
     /// Retains all normal principal, digest, target and observation checks.
@@ -231,7 +233,15 @@ impl storage_runtime::authorization::AuthorizationContext for FilesystemApproval
                     && matches!(item.external_ids.as_slice(), [ExternalId::LvmLvUuid(_)])
             })
         {
-            storage_runtime::authorization::AuthorizationContext::check(&mut self.inner, request)
+            let principal = storage_runtime::authorization::AuthorizationContext::check(
+                &mut self.inner,
+                request,
+            );
+            if principal == storage_engine::LiveCheckStatus::Satisfied {
+                self.confirmation.clone()
+            } else {
+                principal
+            }
         } else {
             storage_engine::LiveCheckStatus::Violated {
                 reason: "wrong destructive target".into(),
@@ -240,12 +250,39 @@ impl storage_runtime::authorization::AuthorizationContext for FilesystemApproval
     }
 }
 
+/// Post-dispatch failure modes injected only into private recorded storage state.
+#[derive(Clone, Copy, Debug)]
+enum FilesystemFault {
+    /// Successful independent UUID and ownership observations.
+    None,
+    /// Backend success lacks filesystem UUID provenance.
+    MissingReceipt,
+    /// Backend reports a different UUID from the actual observed result.
+    WrongReceipt,
+    /// Backend supplies an LV identity for a filesystem action.
+    WrongReceiptKind,
+    /// Two filesystem nodes advertise the same new UUID.
+    DuplicateUuid,
+    /// A different backing owns the observed filesystem.
+    WrongBacking,
+    /// Actual label differs from the requested create properties.
+    WrongLabel,
+    /// Invocation fails after publishing an effect, leaving partial completion uncertain.
+    AdapterError,
+    /// Another filesystem consumer appeared alongside the requested result.
+    ExtraConsumer,
+    /// A partial provider publication cannot establish positive postconditions.
+    BlockingDiagnostics,
+}
+
 /// Synthetic ext4 adapter layered over the existing private-memory LV dispatcher.
 struct FilesystemDispatcher {
     /// LV creation and activation retain their existing checkpoint assertions and independent observations.
     lvm: coordination::FakeDispatcher,
     /// Canonical new UUID returned only after this fixture publishes the ext4 result.
     uuid: String,
+    /// Explicit result corruption used to verify checkpoint retention and stopped execution.
+    fault: FilesystemFault,
 }
 impl storage_runtime::dispatcher::BackendDispatcher for FilesystemDispatcher {
     /// One composite test backend is fixed throughout the plan; no dispatch-time fallback exists.
@@ -326,11 +363,95 @@ impl storage_runtime::dispatcher::BackendDispatcher for FilesystemDispatcher {
             to: id,
             kind: DependencyKind::Backs,
         });
-        Ok(ExecutionReceipt {
+        let mut receipt = ExecutionReceipt {
             outcome: storage_engine::BackendOutcome::Succeeded,
             created_lv_uuid: None,
             created_filesystem_uuid: Some(self.uuid.clone()),
-        })
+        };
+        match self.fault {
+            FilesystemFault::None => {}
+            FilesystemFault::MissingReceipt => receipt.created_filesystem_uuid = None,
+            FilesystemFault::WrongReceipt => {
+                receipt.created_filesystem_uuid = Some(uuid::Uuid::now_v7().to_string())
+            }
+            FilesystemFault::WrongReceiptKind => {
+                receipt.created_lv_uuid = Some("wrong-kind".into());
+                receipt.created_filesystem_uuid = None;
+            }
+            FilesystemFault::DuplicateUuid | FilesystemFault::ExtraConsumer => {
+                let mut node = state
+                    .current
+                    .graph
+                    .node(&id)
+                    .cloned()
+                    .ok_or_else(|| DispatchError::Adapter("FS".into()))?;
+                if matches!(self.fault, FilesystemFault::ExtraConsumer) {
+                    node.size.identities = vec![ExternalId::Filesystem {
+                        fs_type: "ext4".into(),
+                        value: uuid::Uuid::now_v7().to_string(),
+                    }];
+                }
+                let extra = NodeId::new();
+                state
+                    .current
+                    .graph
+                    .insert_new(extra, node)
+                    .map_err(|e| DispatchError::Adapter(e.to_string()))?;
+                state.current.graph.insert_dependency(Dependency {
+                    from: backing.observed_id,
+                    to: extra,
+                    kind: DependencyKind::Backs,
+                });
+            }
+            FilesystemFault::WrongBacking => {
+                state.current.graph.remove_dependency(&Dependency {
+                    from: backing.observed_id,
+                    to: id,
+                    kind: DependencyKind::Backs,
+                });
+                state.current.graph.insert_dependency(Dependency {
+                    from: action.target().observed_id,
+                    to: id,
+                    kind: DependencyKind::Backs,
+                });
+            }
+            FilesystemFault::WrongLabel => {
+                let mut node = state
+                    .current
+                    .graph
+                    .node(&id)
+                    .cloned()
+                    .ok_or_else(|| DispatchError::Adapter("FS".into()))?;
+                node.kind.kind = NodeKind::Filesystem {
+                    kind: FilesystemKind::Ext4,
+                    label: Some("unrequested".into()),
+                };
+                state
+                    .current
+                    .graph
+                    .replace_existing(id, node)
+                    .map_err(|e| DispatchError::Adapter(e.to_string()))?;
+            }
+            FilesystemFault::AdapterError => {
+                return Err(DispatchError::Adapter(
+                    "synthetic failure after partial effect".into(),
+                ));
+            }
+            FilesystemFault::BlockingDiagnostics => {
+                state
+                    .current
+                    .diagnostics
+                    .push(storage_core::model::Diagnostic {
+                        severity: storage_core::model::DiagnosticSeverity::Error,
+                        code: "fixture.incomplete".into(),
+                        message: "synthetic incomplete filesystem probe".into(),
+                        subjects: vec![],
+                        evidence: None,
+                        suggested_remedy: None,
+                    });
+            }
+        }
+        Ok(receipt)
     }
 }
 
@@ -351,11 +472,13 @@ fn lv_activation_ext4_run_verifies_and_retains_owned_filesystem() -> Result<(), 
         FilesystemApproval {
             inner: admission::authorization(&run)?,
             backing,
+            confirmation: storage_engine::LiveCheckStatus::Satisfied,
         },
     );
     let dispatcher = FilesystemDispatcher {
         lvm,
         uuid: uuid::Uuid::now_v7().to_string(),
+        fault: FilesystemFault::None,
     };
     let mut coordinator =
         ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
@@ -408,5 +531,156 @@ fn lv_activation_ext4_run_verifies_and_retains_owned_filesystem() -> Result<(), 
             "case {case}"
         );
     }
+    Ok(())
+}
+
+/// Backend success, partial effects and malformed evidence all preserve the marker and forbid retry.
+#[test]
+fn ext4_failures_keep_checkpoint_and_never_publish_a_binding_or_retry() -> Result<(), Box<dyn Error>>
+{
+    use storage_runtime::{coordinator::CoordinatorError, host::LinuxLiveHost};
+    for fault in [
+        FilesystemFault::MissingReceipt,
+        FilesystemFault::WrongReceipt,
+        FilesystemFault::WrongReceiptKind,
+        FilesystemFault::DuplicateUuid,
+        FilesystemFault::WrongBacking,
+        FilesystemFault::WrongLabel,
+        FilesystemFault::AdapterError,
+        FilesystemFault::ExtraConsumer,
+        FilesystemFault::BlockingDiagnostics,
+    ] {
+        let (state, frozen, backing) = filesystem_plan()?;
+        let state = Rc::new(RefCell::new(state));
+        let scratch = admission::Scratch::new()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let mut lvm = coordination::dispatcher(&scratch, state.clone());
+        lvm.created_uuid = Some("created-lv".into());
+        let calls = lvm.calls.clone();
+        let host = LinuxLiveHost::new(
+            probe(state.clone()),
+            FilesystemPolicy,
+            FilesystemApproval {
+                inner: admission::authorization(&run)?,
+                backing,
+                confirmation: storage_engine::LiveCheckStatus::Satisfied,
+            },
+        );
+        let dispatcher = FilesystemDispatcher {
+            lvm,
+            uuid: uuid::Uuid::now_v7().to_string(),
+            fault,
+        };
+        let mut coordinator =
+            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+        let result = coordinator.execute_run(&mut run);
+        assert!(result.is_err() || !result?.verified, "{fault:?}");
+        assert_eq!(
+            run.state(ActionId::new(2))?,
+            ActionRunState::OutcomeUnknown,
+            "{fault:?}"
+        );
+        assert!(!run.is_verified(), "{fault:?}");
+        assert_eq!(calls.get(), 3, "{fault:?}");
+        assert_eq!(coordinator.bindings().len(), 1, "{fault:?}");
+        let marker = std::fs::read(scratch.0.join("active-attempt.json"))?;
+        let attempt = storage_runtime::checkpoint::ActiveAttempt::from_bytes(&marker)?;
+        assert_eq!(attempt.action_id, ActionId::new(2));
+        assert!(
+            matches!(
+                coordinator.execute_run(&mut run),
+                Err(CoordinatorError::Stopped)
+            ),
+            "{fault:?}"
+        );
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            std::fs::read(scratch.0.join("active-attempt.json"))?,
+            marker
+        );
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let incident =
+            storage_runtime::incident::inspect_incident(&root, &probe(state))?.ok_or("incident")?;
+        assert_eq!(incident.attempt.action_id, ActionId::new(2));
+        assert_eq!(
+            incident.assessment,
+            storage_runtime::incident::IncidentAssessment::Indeterminate
+        );
+        assert_eq!(
+            std::fs::read(scratch.0.join("active-attempt.json"))?,
+            marker
+        );
+    }
+    Ok(())
+}
+
+/// Adding an ext4 action cannot make the native LVM adapter partially execute an unsupported plan.
+#[test]
+fn native_lvm_rejects_ext4_plan_before_first_write() -> Result<(), Box<dyn Error>> {
+    use storage_runtime::{
+        coordinator::CoordinatorError, host::LinuxLiveHost, native_lvm::NativeLvmAdapter,
+    };
+    let library = mock_lvm::Fixture::new(0)?;
+    let backend = library.registry.backends().next().ok_or("backend")?;
+    let before = backend.probe_lvm()?;
+    let adapter = NativeLvmAdapter::new(backend)?;
+    let (state, frozen, _) = filesystem_plan()?;
+    let scratch = admission::Scratch::new()?;
+    let mut run = ExecutionRun::new(frozen.document())?;
+    let host = LinuxLiveHost::new(
+        probe(Rc::new(RefCell::new(state))),
+        adapter,
+        admission::authorization(&run)?,
+    );
+    let mut coordinator =
+        ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, adapter, &run);
+    assert!(matches!(
+        coordinator.execute_run(&mut run),
+        Err(CoordinatorError::PlanUnavailable(_))
+    ));
+    assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Waiting);
+    let after = backend.probe_lvm()?;
+    assert_eq!(before.lvs.len(), after.lvs.len());
+    assert_eq!(before.vgs[0].free, after.vgs[0].free);
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    Ok(())
+}
+
+/// An explicit destructive veto stops admission without arming a filesystem checkpoint or calling mkfs.
+#[test]
+fn ext4_destructive_veto_stops_before_dispatch() -> Result<(), Box<dyn Error>> {
+    use storage_runtime::host::LinuxLiveHost;
+    let (state, frozen, backing) = filesystem_plan()?;
+    let state = Rc::new(RefCell::new(state));
+    let scratch = admission::Scratch::new()?;
+    let mut run = ExecutionRun::new(frozen.document())?;
+    let mut lvm = coordination::dispatcher(&scratch, state.clone());
+    lvm.created_uuid = Some("created-lv".into());
+    let calls = lvm.calls.clone();
+    let host = LinuxLiveHost::new(
+        probe(state),
+        FilesystemPolicy,
+        FilesystemApproval {
+            inner: admission::authorization(&run)?,
+            backing,
+            confirmation: storage_engine::LiveCheckStatus::Violated {
+                reason: "content replacement was explicitly denied".into(),
+            },
+        },
+    );
+    let dispatcher = FilesystemDispatcher {
+        lvm,
+        uuid: uuid::Uuid::now_v7().to_string(),
+        fault: FilesystemFault::None,
+    };
+    let mut coordinator =
+        ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+    let summary = coordinator.execute_run(&mut run)?;
+    assert!(!summary.verified);
+    assert_eq!(summary.stopped_action, Some(ActionId::new(2)));
+    assert_eq!(run.state(ActionId::new(2))?, ActionRunState::Failed);
+    assert_eq!(calls.get(), 2);
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    assert_eq!(coordinator.bindings().len(), 1);
     Ok(())
 }

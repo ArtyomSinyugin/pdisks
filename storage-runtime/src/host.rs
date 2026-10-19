@@ -336,7 +336,13 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                 }
                 let facts_ready = checks.iter().all(|check| {
                     check.status == LiveCheckStatus::Satisfied
-                        || (matches!(check.status, LiveCheckStatus::Unknown { .. }) && matches!((&check.condition, backing), (storage_provider::ActionPrerequisite::DestructiveApproval(node), Some(backing)) if *node == backing))
+                        || match check.condition {
+                            storage_provider::ActionPrerequisite::DestructiveApproval(node) => {
+                                Some(node) == backing
+                                    && matches!(check.status, LiveCheckStatus::Unknown { .. })
+                            }
+                            _ => false,
+                        }
                 });
                 if facts_ready {
                     let request = ApprovalRequest {
@@ -359,14 +365,11 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext> RuntimeHost for LinuxLi
                                 check.status = self.authorization.check_destructive(&request, node);
                             }
                         }
-                        if !checks
+                        if let Some(incomplete) = checks
                             .iter()
-                            .all(|check| check.status == LiveCheckStatus::Satisfied)
+                            .find(|check| check.status != LiveCheckStatus::Satisfied)
                         {
-                            applicability = LiveCheckStatus::Unknown {
-                                required_evidence:
-                                    "explicit destructive confirmation is incomplete".into(),
-                            };
+                            applicability = incomplete.status.clone();
                         }
                     }
                 } else {

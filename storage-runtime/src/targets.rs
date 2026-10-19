@@ -37,7 +37,7 @@ pub enum TargetError {
     #[error("ext4 creation requires an active unused verified LV with a known block endpoint")]
     FilesystemEndpoint,
     /// A planned LV has no verified identity in this attempt, or that identity changed.
-    #[error("activation target is not an unchanged verified output of this run")]
+    #[error("target is not an unchanged verified output of this run")]
     UnverifiedOutput,
     /// The resolved native endpoint or parameters fail the narrow recipe's validation.
     #[error(transparent)]
@@ -99,7 +99,7 @@ pub struct ResolvedAction {
     observation: ObservationReference,
     /// The sole existing metadata target in the initial recipe.
     target: ResolvedTarget,
-    /// Present only for activation of a verified created LV.
+    /// Present for activation or ext4 creation on a verified created LV.
     lv_target: Option<ResolvedLvTarget>,
 }
 
@@ -128,7 +128,7 @@ impl ResolvedAction {
     pub fn target(&self) -> &ResolvedTarget {
         &self.target
     }
-    /// Returns the verified UUID-qualified LV endpoint for activation, if this recipe uses one.
+    /// Returns the verified LV endpoint for activation or ext4 creation, if this recipe uses one.
     pub fn lv_target(&self) -> Option<&ResolvedLvTarget> {
         self.lv_target.as_ref()
     }
@@ -218,8 +218,7 @@ pub fn resolve_action_with_bindings(
             }
             if let ProviderAction::Filesystem(FilesystemAction::Create { label, .. }) =
                 &planned.operation
-            {
-                if label
+                && (label
                     .as_ref()
                     .is_some_and(|label| label.len() > 16 || label.contains('\0'))
                     || node.size.lvm_active != Some(true)
@@ -244,10 +243,9 @@ pub fn resolve_action_with_bindings(
                         .snapshot
                         .graph
                         .relations()
-                        .any(|edge| edge.from == id || edge.to == id)
-                {
-                    return Err(TargetError::FilesystemEndpoint);
-                }
+                        .any(|edge| edge.from == id || edge.to == id))
+            {
+                return Err(TargetError::FilesystemEndpoint);
             }
             let uuid = node
                 .size

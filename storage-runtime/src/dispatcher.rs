@@ -16,7 +16,7 @@ pub enum DispatchError {
     Progress(#[from] ExecutionRunError),
 }
 
-/// Completed adapter result; an optional native LV UUID never replaces a fresh provider pass.
+/// Completed adapter result; optional output UUIDs never replace a fresh provider pass.
 #[derive(Debug)]
 pub struct ExecutionReceipt {
     /// Classified synchronous completion, including partial failure or uncertainty.

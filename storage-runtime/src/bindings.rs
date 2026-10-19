@@ -1,4 +1,4 @@
-//! New LV identities become usable only after receipt, fresh observation, and verified postconditions.
+//! New LV and ext4 identities become usable only after receipt, fresh observation and verified postconditions.
 
 use crate::targets::{ResolvedAction, TargetError, check_scope};
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ pub enum BindingError {
     #[error("output binding does not belong to this verified action")]
     NotVerified,
     /// Receipt UUID is absent, ambiguous, preexisting, or points outside the admitted VG.
-    #[error("created LV identity or ownership is not established by fresh evidence")]
+    #[error("created output identity or ownership is not established by fresh evidence")]
     Identity,
     /// Activation did not establish the contract's actual writable block interface.
     #[error("activation requires a freshly observed writable block interface with known geometry")]
@@ -97,7 +97,7 @@ impl OutputBindings {
             filesystems: HashMap::new(),
         }
     }
-    /// Reports the number of independently verified created outputs.
+    /// Reports the number of independently verified LV and filesystem outputs.
     pub fn len(&self) -> usize {
         self.entries.len() + self.filesystems.len()
     }
@@ -106,7 +106,7 @@ impl OutputBindings {
         self.entries.is_empty() && self.filesystems.is_empty()
     }
 
-    /// Resolves a verified output again by UUID and owning VG in a fresh observation.
+    /// Resolves a verified output by UUID and its owning VG or backing LV in a fresh observation.
     /// Neither its old transient NodeId nor a matching name suffices after another provider pass.
     pub fn resolve(
         &self,

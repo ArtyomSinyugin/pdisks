@@ -1281,7 +1281,7 @@ mod incidents {
                 calls: 0,
             };
             let result = acknowledge_incident(&root, &probe, review, token, &mut policy);
-            assert_eq!(result.is_ok(), case == 0);
+            assert_eq!(result.is_ok(), case == 0, "case {case}: {result:?}");
             assert_eq!(policy.calls, usize::from(case != 1));
             assert_eq!(scratch.0.join("active-attempt.json").exists(), case != 0);
             assert_eq!(run.state(ActionId::new(0))?, ActionRunState::OutcomeUnknown);
