@@ -26,3 +26,5 @@ pub mod native_lvm;
 
 #[cfg(target_os = "linux")]
 pub mod incident;
+
+pub mod filesystem;
