@@ -1,6 +1,9 @@
 //! Typed libblockdev-fs FFI adapter.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::{
+    ffi::{CStr, CString, c_char, c_int, c_void},
+    sync::Mutex,
+};
 
 use libloading::{Library, Symbol};
 
@@ -9,6 +12,9 @@ use crate::{
     FilesystemCapabilities, FilesystemCreateOptions, FilesystemOperationAvailability,
     FilesystemResizeCapabilities, NativeProbeError,
 };
+
+/// Standalone filesystem plugin init/close share process-global state across registered handles.
+pub(super) static FILESYSTEM_SESSION: Mutex<()> = Mutex::new(());
 
 const MAX_NATIVE_ENTRIES: usize = 256;
 const RESIZE_OFFLINE_SHRINK: c_int = 1 << 1;
@@ -95,6 +101,11 @@ pub(super) fn probe_capabilities(
     library: &Library,
 ) -> Result<Vec<FilesystemCapabilities>, NativeProbeError> {
     let api = Api::load(library)?;
+    let _lock = FILESYSTEM_SESSION
+        .lock()
+        .map_err(|_| NativeProbeError::InvalidData {
+            operation: "filesystem session lock",
+        })?;
     // SAFETY: standalone plugin initialization takes no arguments.
     if unsafe { (api.init)() } == 0 {
         return Err(NativeProbeError::CallFailed {
