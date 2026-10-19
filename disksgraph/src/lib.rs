@@ -34,8 +34,8 @@ pub mod host {
     };
     pub use storage_provider::{
         BACKEND_MANIFEST_VERSION, BackendCapability, BackendId, BackendLibrary, BackendManifest,
-        BackendManifests, BackendRegistry, EXT4_HOST_MOUNT_OPTIONS, LvmVgObservation,
-        ProviderAction, ProviderConnectionKind, RegisteredBackend,
+        BackendManifests, BackendRegistry, EXT4_HOST_MOUNT_OPTIONS, FilesystemAction, LvmAction,
+        LvmVgObservation, MountAction, ProviderAction, ProviderConnectionKind, RegisteredBackend,
     };
     pub use storage_runtime::{
         authorization, capability, checkpoint, coordinator, dispatcher, host, incident, lease,

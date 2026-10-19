@@ -19,6 +19,17 @@ use storage_runtime::{
     targets::{TargetError, resolve_action},
 };
 
+/// Forked C-fixture compilers temporarily inherit other threads' CLOEXEC lock descriptors.
+/// Match the lease suite's process isolation so release assertions observe only their own guards.
+static PROCESS_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes runtime test lifetimes with native-fixture compiler children in this test executable.
+fn isolate_processes() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 /// One mutable recorded provider, used to create fresh publication generations across dispatch.
 struct Recorded(Rc<RefCell<ProbeSnapshot>>);
 impl StateProvider for Recorded {
@@ -120,6 +131,7 @@ fn backend() -> BackendId {
 /// Transient IDs may change, but reused IDs/names with another VG UUID cannot select an endpoint.
 #[test]
 fn resolves_by_uuid_and_rejects_replacement_and_geometry_drift() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     let (state, frozen) = fixture()?;
     let run = ExecutionRun::new(frozen.document())?;
     let old = state.lvm_vgs[0].node;
@@ -160,6 +172,7 @@ fn resolves_by_uuid_and_rejects_replacement_and_geometry_drift() -> Result<(), B
 /// Extra scope cannot be hidden by preserving the VG UUID or a familiar display name.
 #[test]
 fn rejects_new_consumers_and_foreign_mounts() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_core::model::{
         Dependency, DependencyKind, LvmLv, LvmLvKind, MountContext, MountSource, ObservedMount,
     };
@@ -319,6 +332,7 @@ mod admission {
     /// Every positive admission prerequisite is independent; unknown capability/scope never becomes true.
     #[test]
     fn admission_requires_capability_scope_and_exact_authorization() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for case in 0..7 {
             let (state, frozen) = fixture()?;
             let scratch = Scratch::new()?;
@@ -388,6 +402,7 @@ mod admission {
     /// A report cannot reuse another host's publication, an old generation, or another run's guard.
     #[test]
     fn admission_rejects_foreign_lease_and_stale_publications() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         let (state, frozen) = fixture()?;
         let scratch = Scratch::new()?;
         let root = ExecutionRoot::open(&scratch.0)?;
@@ -702,6 +717,7 @@ mod coordination {
     #[test]
     fn checkpoint_precedes_dispatch_and_missing_result_stops_continuation()
     -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         let (state, frozen) = fixture()?;
         let state = Rc::new(RefCell::new(state));
         let scratch = Scratch::new()?;
@@ -746,6 +762,7 @@ mod coordination {
     /// Every incomplete or contradicted live gate prevents the synthetic call and any checkpoint.
     #[test]
     fn every_admission_veto_prevents_dispatch() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for case in 0..6 {
             let (state, frozen) = fixture()?;
             let state = Rc::new(RefCell::new(state));
@@ -809,6 +826,7 @@ mod coordination {
     /// Known failure, uncertain adapter error, and post-probe failure retain the marker and stop.
     #[test]
     fn backend_failure_and_probe_loss_retain_checkpoint() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for case in 0..3 {
             let (state, frozen) = fixture()?;
             let state = Rc::new(RefCell::new(state));
@@ -882,6 +900,7 @@ mod coordination {
     /// An arm failure stays before invocation, retains the competing data, and records its reason.
     #[test]
     fn checkpoint_failure_stops_before_dispatch() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         let (state, frozen) = fixture()?;
         let state = Rc::new(RefCell::new(state));
         let scratch = Scratch::new()?;
@@ -919,6 +938,7 @@ mod coordination {
     /// Receipt UUID plus independent LV properties/ownership is required before clear or binding.
     #[test]
     fn created_lv_binding_requires_verified_result_and_exact_owner() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         use storage_provider::{LvmAction, ProviderAction};
         for case in 0..7 {
             let (state, frozen) = fixture()?;
@@ -1015,6 +1035,7 @@ mod coordination {
     /// Neither a different adapter nor an old unresolved incident may reach the dispatcher.
     #[test]
     fn backend_mismatch_and_existing_incident_prevent_dispatch() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for existing in [false, true] {
             let (state, frozen) = fixture()?;
             let state = Rc::new(RefCell::new(state));
@@ -1059,6 +1080,7 @@ mod coordination {
     #[test]
     fn clear_failure_keeps_coordinator_stopped_after_verified_result() -> Result<(), Box<dyn Error>>
     {
+        let _process = isolate_processes();
         let (state, frozen) = fixture()?;
         let state = Rc::new(RefCell::new(state));
         let scratch = Scratch::new()?;
@@ -1133,6 +1155,7 @@ mod incidents {
     /// Compatible observed properties do not remove the marker or recover any execution state.
     #[test]
     fn inspection_is_fresh_read_only_and_conservative() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         let (state, frozen) = fixture()?;
         let state = Rc::new(RefCell::new(state));
         let scratch = Scratch::new()?;
@@ -1181,6 +1204,7 @@ mod incidents {
     /// No incident needs no provider pass; unsafe or corrupt state remains a blocking error.
     #[test]
     fn inspection_rejects_busy_lock_corruption_and_probe_failure() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         let (state, frozen) = fixture()?;
         let state = Rc::new(RefCell::new(state));
         let scratch = Scratch::new()?;
@@ -1256,6 +1280,7 @@ mod incidents {
     /// Confirmation never marks the old run verified or resumes its action; unsafe evidence retains the marker.
     #[test]
     fn acknowledgment_requires_exact_confirmation_and_quiescence() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         use storage_engine::{ActionRunState, LiveCheckStatus};
         use storage_runtime::incident::{acknowledge_incident, review_incident};
         for case in 0..5 {
@@ -1298,6 +1323,7 @@ mod incidents {
     /// Another root, marker replacement, or new observed state invalidates review before policy or clear.
     #[test]
     fn acknowledgment_rejects_changed_attempt_root_and_state() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         use storage_runtime::incident::{acknowledge_incident, review_incident};
         for case in 0..3 {
             let (state, frozen) = fixture()?;
@@ -1358,6 +1384,7 @@ mod incidents {
 #[test]
 fn vg_membership_requires_same_pass_count_present_pvs_and_physical_ancestry()
 -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_core::model::{DependencyKind, MemberRole, Presence};
     use storage_engine::LiveCheckStatus;
     let (state, _) = fixture()?;
@@ -1424,6 +1451,7 @@ fn vg_membership_requires_same_pass_count_present_pvs_and_physical_ancestry()
 /// Device paths/numbers can change, while geometry drift and unknown/read-only endpoints forbid resolution.
 #[test]
 fn physical_scope_checks_geometry_and_writable_evidence() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_core::model::BlockSize;
     let (state, frozen) = fixture()?;
     let run = ExecutionRun::new(frozen.document())?;
@@ -1486,6 +1514,7 @@ mod native_lvm {
     #[test]
     fn native_adapter_requires_independent_scope_and_rejects_unsupported_operations()
     -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         let library = mock_lvm::Fixture::new(0)?;
         let backend = library.registry.backends().next().ok_or("mock backend")?;
         let adapter = NativeLvmAdapter::new(backend)?;
@@ -1811,6 +1840,7 @@ mod native_execution {
     #[test]
     fn native_execution_observes_checkpoint_and_never_retries_uncertain_effects()
     -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for scenario in [0, 7, 8, 9, 14, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29] {
             let library = mock_lvm::Fixture::new(scenario)?;
             let backend = library.registry.backends().next().ok_or("mock backend")?;
@@ -1890,6 +1920,7 @@ mod native_execution {
     /// Whole native runs need final evidence; unavailable successors veto even the first native write.
     #[test]
     fn native_dag_summary_requires_independent_final_success() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for case in 0..4 {
             let scenario = match case {
                 2 => 29,
@@ -2032,6 +2063,7 @@ mod native_execution {
     /// Existing mounted filesystems survive transient IDs; final drift cannot be hidden by earlier Verified actions.
     #[test]
     fn native_run_rechecks_existing_mounts_after_verified_actions() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         use storage_core::model::{FilesystemKind, MountContext, MountSource, ObservedMount};
         for fault in 0..4 {
             let library = mock_lvm::Fixture::new(0)?;
@@ -2140,6 +2172,7 @@ mod activation {
     /// A verified LV survives transient IDs; replacement, unknown activation and read-only results fail closed.
     #[test]
     fn activation_uses_verified_output_and_checks_actual_interface() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for case in 0..6 {
             let (state, frozen) = fixture()?;
             let state = Rc::new(RefCell::new(state));
@@ -2286,6 +2319,7 @@ mod final_host {
     /// Final success requires complete fresh coverage and independent positive preservation.
     #[test]
     fn final_host_requires_fresh_coverage_and_preservation() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         let (state, _) = fixture()?;
         let session = PlanSession::new(HistoricalBaseline::from_lvm_observations(
             state.current.clone(),
@@ -2397,6 +2431,7 @@ mod run_coordinator {
     /// A complete DAG gets an independent final publication; unknown/failed actions stop successors.
     #[test]
     fn executes_dag_under_one_lock_and_verifies_final_goal() -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for case in 0..3 {
             let (state, frozen) = fixture()?;
             let state = Rc::new(RefCell::new(state));
@@ -2504,6 +2539,7 @@ mod plan_gate {
     #[test]
     fn rejects_late_unsupported_action_and_protection_before_any_dispatch()
     -> Result<(), Box<dyn Error>> {
+        let _process = isolate_processes();
         for case in 0..4 {
             let (state, frozen) = fixture()?;
             let mut document = frozen.document().clone();
@@ -2570,6 +2606,7 @@ mod final_preservation_default {
     #[test]
     fn nonempty_protection_requires_independent_preservation_evidence() -> Result<(), Box<dyn Error>>
     {
+        let _process = isolate_processes();
         let (state, _) = fixture()?;
         let session = PlanSession::new(HistoricalBaseline::from_lvm_observations(
             state.current.clone(),
@@ -2609,6 +2646,7 @@ mod final_preservation_default {
 #[test]
 fn mount_scope_correlates_unrelated_sources_and_rejects_replacements() -> Result<(), Box<dyn Error>>
 {
+    let _process = isolate_processes();
     use storage_core::model::{FilesystemKind, MountContext, MountSource, ObservedMount};
     let (mut state, _) = fixture()?;
     let vg = state.lvm_vgs[0].node;
@@ -2681,3 +2719,28 @@ fn mount_scope_correlates_unrelated_sources_and_rejects_replacements() -> Result
 #[cfg(target_os = "linux")]
 #[path = "support/ext4.rs"]
 mod ext4;
+
+/// Incident methods cannot leave an older regular probe admissible after a separate inspection boundary.
+#[test]
+fn host_incident_queries_invalidate_prior_admission_publications() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
+    use storage_runtime::{
+        host::{HostError, RuntimeHost},
+        lease::ExecutionRoot,
+    };
+    let (state, frozen) = fixture()?;
+    let state = Rc::new(RefCell::new(state));
+    let scratch = admission::Scratch::new()?;
+    let run = ExecutionRun::new(frozen.document())?;
+    let mut host = coordination::host(state.clone(), &run)?;
+    let prior = host.probe()?;
+    let root = ExecutionRoot::open(&scratch.0)?;
+    assert!(host.inspect_incident(&root)?.is_none());
+    let lock = root.try_lock_host()?;
+    let dispatcher = coordination::dispatcher(&scratch, state);
+    assert!(matches!(
+        host.check_plan(&run, &prior, &dispatcher, &lock),
+        Err(HostError::ObservationMismatch)
+    ));
+    Ok(())
+}

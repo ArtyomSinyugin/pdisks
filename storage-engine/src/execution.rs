@@ -272,6 +272,10 @@ pub struct ActionStatus {
     pub state: ActionRunState,
     /// Latest applicability decision; individual prerequisites remain independently visible.
     pub applicability: Option<LiveCheckStatus>,
+    /// Publication that supplied the latest prerequisite and applicability evidence.
+    pub admission_observation: Option<ObservationReference>,
+    /// Independent post-backend publication, without cloning a complete graph for every action.
+    pub completion_observation: Option<ObservationReference>,
     /// Complete most recently checked prerequisite set, empty before admission.
     pub prerequisites: Vec<LiveCheck<ActionPrerequisite>>,
     /// Classified backend result, absent until an actual completion was recorded.
@@ -533,6 +537,14 @@ impl ExecutionRun {
                         .admission
                         .as_ref()
                         .map(|report| report.applicability.clone()),
+                    admission_observation: action
+                        .admission
+                        .as_ref()
+                        .map(|report| report.observation.reference),
+                    completion_observation: action
+                        .completion
+                        .as_ref()
+                        .map(|completion| completion.observation.reference),
                     prerequisites: action
                         .admission
                         .as_ref()
@@ -585,7 +597,7 @@ impl ExecutionRun {
         })
     }
 
-    /// Returns ordered events after a client's last consumed sequence.
+    /// Compatibility iterator over retained events; new clients use events_page to detect eviction gaps.
     pub fn events_since(&self, sequence: u64) -> impl Iterator<Item = &RunEvent> {
         self.events
             .iter()

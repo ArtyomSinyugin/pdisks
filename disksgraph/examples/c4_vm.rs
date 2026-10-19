@@ -1,29 +1,29 @@
-//! Destructive integration experiment, restricted to the disposable disk supplied by tests/vm/run_c4.py.
+//! Destructive integration experiment, restricted to the disposable disk supplied by storage-runtime/tests/vm/run_c4.py.
+//! The application workflow imports only disksgraph; host configuration stays explicit.
 //! This isolated guest policy is deliberately not a production authorization policy.
 
-use std::{collections::BTreeSet, error::Error, fs, path::Path, process::Command};
-use storage_core::model::*;
-use storage_engine::{
-    ActionId, ExecutionContext, ExecutionRun, HistoricalBaseline, LiveCheckStatus, LiveObservation,
-    editing::PlanSession,
-};
-use storage_probe::{LinuxProbe, ProviderProbeError, ProviderState, StateProvider};
-use storage_provider::{
+use disksgraph::host::{
     BACKEND_MANIFEST_VERSION, BackendCapability, BackendId, BackendLibrary, BackendManifest,
     BackendManifests, BackendRegistry, LvmVgObservation, ProviderAction, ProviderConnectionKind,
     RegisteredBackend,
 };
-use storage_runtime::{
+use disksgraph::host::{ExecutionContext, ExecutionRunError};
+use disksgraph::host::{LinuxProbe, ProviderProbeError, ProviderState, StateProvider};
+use disksgraph::host::{
     authorization::{ApprovalRequest, AuthorizationContext},
     capability::{BackendCapabilityCheck, OperationAvailability},
     checkpoint::{ActiveAttempt, plan_digest},
-    coordinator::{CoordinatorError, ExecutionCoordinator},
     dispatcher::{BackendDispatcher, DispatchError, ExecutionReceipt},
     host::LinuxLiveHost,
     lease::ExecutionRoot,
     native_storage::NativeStorageAdapter,
     targets::ResolvedAction,
 };
+use disksgraph::model::*;
+use disksgraph::{
+    ActionId, ActionRunState, DisksGraph, LiveCheckStatus, LiveObservation, PlanEdit, PlanRequest,
+};
+use std::{collections::BTreeSet, error::Error, fs, path::Path, process::Command};
 
 /// Read actual sysfs bytes; errors never become synthetic geometry or writable defaults.
 fn number(path: impl AsRef<Path>) -> Result<u64, Box<dyn Error>> {
@@ -412,14 +412,14 @@ impl BackendCapabilityCheck for GuestPolicy<'_> {
         action: &ResolvedAction,
         _: &LiveObservation,
     ) -> LiveCheckStatus {
-        let ProviderAction::Mount(storage_provider::MountAction::Mount { target, .. }) =
+        let ProviderAction::Mount(disksgraph::host::MountAction::Mount { target, .. }) =
             action.operation()
         else {
             return LiveCheckStatus::Violated {
                 reason: "wrong mount action".into(),
             };
         };
-        match storage_runtime::native_mount::open_mount_target(target) {
+        match disksgraph::host::native_mount::open_mount_target(target) {
             Ok(_) => LiveCheckStatus::Satisfied,
             Err(error) => LiveCheckStatus::Violated {
                 reason: error.to_string(),
@@ -432,14 +432,20 @@ impl BackendCapabilityCheck for GuestPolicy<'_> {
     }
 }
 
-/// Approval binds the exact in-memory experiment and its planned destructive endpoint.
-struct GuestApproval {
-    /// This single attempt, never supplied by saved approval JSON.
-    run: uuid::Uuid,
-    /// Canonical reviewed plan digest.
+/// Exact plan reviewed by this VM-only caller before any runtime admission can pass.
+struct ReviewedPlan {
+    /// First admitted attempt binds this explicit review; a different run cannot reuse it.
+    run: Option<uuid::Uuid>,
+    /// Digest computed from the already reviewed immutable plan, never learned from incoming requests.
     digest: String,
-    /// Exact newly created LV allowed to receive ext4.
+    /// Exact planned LV permitted to receive ext4.
     lv: NodeId,
+}
+
+/// Trusted caller supplies the reviewed scope separately from the plan and application wire data.
+struct GuestApproval {
+    /// None is fail-closed until the caller has reviewed and frozen this precise VM plan.
+    reviewed: std::rc::Rc<std::cell::RefCell<Option<ReviewedPlan>>>,
 }
 impl AuthorizationContext for GuestApproval {
     /// Checks exact run/document and the fixed route for each supported action.
@@ -451,14 +457,21 @@ impl AuthorizationContext for GuestApproval {
         } else {
             "vm-lvm"
         };
-        if request.run_id == self.run
-            && request.plan_digest == self.digest
+        let mut reviewed = self.reviewed.borrow_mut();
+        let Some(reviewed) = reviewed.as_mut() else {
+            return LiveCheckStatus::Unknown {
+                required_evidence: "explicit reviewed VM plan".into(),
+            };
+        };
+        if reviewed.run.is_none_or(|run| request.run_id == run)
+            && request.plan_digest == reviewed.digest
             && request.backend.as_str() == backend
             && request
                 .targets
                 .iter()
                 .any(|target| matches!(target.external_ids.as_slice(), [ExternalId::LvmVgUuid(_)]))
         {
+            reviewed.run = Some(request.run_id);
             LiveCheckStatus::Satisfied
         } else {
             LiveCheckStatus::Violated {
@@ -468,7 +481,8 @@ impl AuthorizationContext for GuestApproval {
     }
     /// Authorizes formatting only the verified new LV fingerprint of this exact plan.
     fn check_destructive(&mut self, request: &ApprovalRequest, target: NodeId) -> LiveCheckStatus {
-        if target == self.lv
+        let reviewed_lv = self.reviewed.borrow().as_ref().map(|review| review.lv);
+        if Some(target) == reviewed_lv
             && request.action_id == ActionId::new(2)
             && request.targets.iter().any(|fingerprint| {
                 fingerprint.planned_id == target
@@ -509,7 +523,7 @@ impl BackendDispatcher for GuestDispatch<'_> {
     fn execute(
         &mut self,
         action: &ResolvedAction,
-        progress: &mut dyn FnMut(String) -> Result<(), storage_engine::ExecutionRunError>,
+        progress: &mut dyn FnMut(String) -> Result<(), ExecutionRunError>,
     ) -> Result<ExecutionReceipt, DispatchError> {
         let check = || -> Result<(), Box<dyn Error>> {
             let marker =
@@ -570,47 +584,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("mount registration")?;
     let provider = GuestProbe { lvm, blkid, mount };
     let probe = LinuxProbe::from_providers(vec![Box::new(provider)]);
-    let snapshot = probe.probe();
-    let baseline = HistoricalBaseline::from_lvm_observations(snapshot.current, &snapshot.lvm_vgs)?;
-    let vg = baseline
-        .snapshot
-        .graph
-        .nodes()
-        .find_map(|(id, node)| matches!(node.kind.kind, NodeKind::LvmVg { .. }).then_some(*id))
-        .ok_or("private VG")?;
-    let mut session = PlanSession::new(baseline)?;
-    let lv = session
-        .add_lv(session.revision(), vg, "data", Bytes::new(64 * 1024 * 1024))?
-        .created_node
-        .ok_or("LV output")?;
-    let filesystem = session
-        .add_filesystem(session.revision(), lv, FilesystemKind::Ext4)?
-        .created_node
-        .ok_or("filesystem output")?;
-    session.mount(
-        session.revision(),
-        MountEntry {
-            source: MountSource::Filesystem(filesystem),
-            target: "/mnt/c4".into(),
-            options: storage_provider::EXT4_HOST_MOUNT_OPTIONS
-                .iter()
-                .map(|option| (*option).into())
-                .collect(),
-            context: MountContext::Host,
-        },
-    )?;
-    let frozen = session.freeze(session.revision())?;
-    fs::write(
-        "/run/c4-plan.json",
-        serde_json::to_vec_pretty(frozen.document())?,
-    )?;
-    let mut run = ExecutionRun::new(frozen.document())?;
     println!("C4_STAGE=native_readiness");
     let native = NativeStorageAdapter::new(lvm, ext4, mount)?;
+    let reviewed = std::rc::Rc::new(std::cell::RefCell::new(None));
     let approval = GuestApproval {
-        run: run.run_id(),
-        digest: plan_digest(run.document())?,
-        lv,
+        reviewed: reviewed.clone(),
     };
     let host = LinuxLiveHost::new(probe, GuestPolicy(native), approval);
     fs::create_dir("/run/c4-execution")?;
@@ -624,91 +602,170 @@ fn main() -> Result<(), Box<dyn Error>> {
         fail_mount,
         calls: calls.clone(),
     };
-    let mut coordinator = ExecutionCoordinator::new(
-        ExecutionRoot::open("/run/c4-execution")?,
-        host,
-        dispatcher,
-        &run,
+    let mut app = DisksGraph::new("/run/c4-execution", host, dispatcher)?;
+    let observed = app.probe()?;
+    assert!(
+        !observed
+            .snapshot
+            .graph
+            .nodes()
+            .any(|(_, node)| matches!(node.kind.kind, NodeKind::LvmLv(_)))
     );
-    println!("C4_STAGE=coordinator");
-    let result = coordinator.execute_run(&mut run);
-    for index in 0..4 {
-        println!("C4_ACTION_{index}={:?}", run.state(ActionId::new(index))?);
-        if let Some(report) = run.admission(ActionId::new(index))? {
-            println!(
-                "C4_ADMISSION_{index}={:?} {:?}",
-                report.applicability, report.checks
-            );
-        }
-        if let Some(completion) = run.completion(ActionId::new(index))? {
-            println!("C4_BACKEND_{index}={:?}", completion.outcome);
-        }
-        println!(
-            "C4_REASON_{index}={:?}",
-            run.unknown_reason(ActionId::new(index))?
-        );
+    let session = app.create_session()?;
+    let baseline = app.export_draft(session)?.baseline;
+    let vg = baseline
+        .snapshot
+        .graph
+        .nodes()
+        .find_map(|(id, node)| matches!(node.kind.kind, NodeKind::LvmVg { .. }).then_some(*id))
+        .ok_or("private VG")?;
+    let lv = app
+        .edit(
+            session,
+            app.revision(session)?,
+            PlanEdit::Add(PlanRequest::CreateLv {
+                vg,
+                name: "data".into(),
+                size: Bytes::new(64 * 1024 * 1024),
+                layout: LvmLvKind::Linear,
+                activate: true,
+            }),
+        )?
+        .created_node
+        .ok_or("LV output")?;
+    let filesystem = app
+        .edit(
+            session,
+            app.revision(session)?,
+            PlanEdit::Add(PlanRequest::CreateFilesystem {
+                backing: lv,
+                filesystem: FilesystemKind::Ext4,
+                label: None,
+            }),
+        )?
+        .created_node
+        .ok_or("filesystem output")?;
+    app.edit(
+        session,
+        app.revision(session)?,
+        PlanEdit::Add(PlanRequest::Mount(MountEntry {
+            source: MountSource::Filesystem(filesystem),
+            target: "/mnt/c4".into(),
+            options: disksgraph::host::EXT4_HOST_MOUNT_OPTIONS
+                .iter()
+                .map(|option| (*option).into())
+                .collect(),
+            context: MountContext::Host,
+        })),
+    )?;
+    assert!(matches!(
+        app.preview(session)?.status(),
+        disksgraph::PreviewStatus::Conditional | disksgraph::PreviewStatus::Complete
+    ));
+    let frozen = app.freeze(session, app.revision(session)?)?;
+    fs::write(
+        "/run/c4-plan.json",
+        serde_json::to_vec_pretty(frozen.document())?,
+    )?;
+    // This explicit VM-only review is supplied through host-owned state, never imported approval JSON.
+    *reviewed.borrow_mut() = Some(ReviewedPlan {
+        run: None,
+        digest: plan_digest(frozen.document())?,
+        lv,
+    });
+    let operations: Vec<_> = frozen
+        .document()
+        .actions
+        .iter()
+        .map(|action| action.operation.clone())
+        .collect();
+    let capability = app.capabilities(&operations)?;
+    assert!(
+        capability
+            .operations
+            .iter()
+            .all(|entry| matches!(entry.availability, OperationAvailability::Available(_)))
+    );
+    println!("C4_STAGE=facade_apply");
+    let run = app.apply_frozen(&frozen)?;
+    let status = app.run_snapshot(run)?;
+    assert!(status.execution.finished);
+    assert!(status.error.is_none());
+    assert_eq!(status.source_map, frozen.source_map());
+    assert_eq!(
+        status
+            .source_map
+            .iter()
+            .map(|entry| entry.actions.len())
+            .sum::<usize>(),
+        4
+    );
+    let events = app.events(run, 0)?;
+    assert!(!events.gap);
+    assert_eq!(events.next_sequence, status.execution.event_sequence);
+    assert!(app.events(run, events.next_sequence)?.events.is_empty());
+    println!("C5_EVENTS={}", events.events.len());
+    for action in &status.execution.actions {
+        println!("C4_ACTION_{}={:?}", action.action.get(), action.state);
+        println!("C4_BACKEND_{}={:?}", action.action.get(), action.outcome);
     }
     println!(
         "C4_CHECKPOINT={}",
         Path::new("/run/c4-execution/active-attempt.json").exists()
     );
-    println!(
-        "C4_RESULT={:?}",
-        result
-            .as_ref()
-            .map(|summary| (summary.verified, summary.stopped_action))
-    );
-    let summary = result?;
+    println!("C4_RESULT_VERIFIED={}", status.execution.verified);
     assert_eq!(calls.get(), 4);
     for index in 0..3 {
         assert_eq!(
-            run.state(ActionId::new(index))?,
-            storage_engine::ActionRunState::Verified
+            status.execution.actions[index].state,
+            ActionRunState::Verified
         );
     }
     if fail_mount {
-        assert!(!summary.verified);
-        assert_eq!(summary.stopped_action, Some(ActionId::new(3)));
+        assert!(!status.execution.verified);
         assert_eq!(
-            run.state(ActionId::new(3))?,
-            storage_engine::ActionRunState::OutcomeUnknown
+            status.execution.actions[3].state,
+            ActionRunState::OutcomeUnknown
         );
         let marker =
             ActiveAttempt::from_bytes(&fs::read("/run/c4-execution/active-attempt.json")?)?;
         assert_eq!(marker.action_id, ActionId::new(3));
         assert_eq!(marker.backend_id.as_str(), "vm-mount");
         assert_eq!(marker.targets.len(), 3);
-        assert!(matches!(
-            coordinator.execute_run(&mut run),
-            Err(CoordinatorError::Stopped)
-        ));
+        // A new facade attempt is also blocked by the retained marker, before another native call.
+        let rejected = app
+            .apply_frozen(&frozen)
+            .err()
+            .ok_or("incident must block another attempt")?;
+        assert_eq!(rejected.code, disksgraph::ErrorCode::CheckpointBlocked);
         assert_eq!(calls.get(), 4);
+        assert!(app.incident()?.is_some());
+        println!("C5_FACADE_VERIFIED");
         println!("C4_EXPECTED_FAILURE_VERIFIED");
         return Ok(());
     }
-    if !summary.verified {
-        return Err("native vertical slice did not independently verify".into());
+    if !status.execution.verified {
+        return Err("facade vertical slice did not independently verify".into());
     }
-    assert_eq!(
-        run.state(ActionId::new(3))?,
-        storage_engine::ActionRunState::Verified
-    );
+    assert_eq!(status.execution.actions[3].state, ActionRunState::Verified);
     assert!(!Path::new("/run/c4-execution/active-attempt.json").exists());
     assert!(
-        run.goal_verification()
+        status
+            .execution
+            .goal_verification
+            .as_ref()
             .ok_or("final report")?
             .observation
             .reference
             .epoch
-            > run
-                .completion(ActionId::new(3))?
+            > status.execution.actions[3]
+                .completion_observation
                 .ok_or("mount completion")?
-                .observation
-                .reference
                 .epoch
     );
-    fs::write("/mnt/c4/proof", b"C4 real mounted ext4")?;
-    assert_eq!(fs::read("/mnt/c4/proof")?, b"C4 real mounted ext4");
+    fs::write("/mnt/c4/proof", b"C5 facade real mounted ext4")?;
+    assert_eq!(fs::read("/mnt/c4/proof")?, b"C5 facade real mounted ext4");
+    println!("C5_FACADE_VERIFIED");
     println!("C4_VERTICAL_VERIFIED");
     Ok(())
 }

@@ -1,7 +1,10 @@
-# Bounded C4 integration experiment
+# C4 recipe through the C5 public Rust facade
 
 The experiment runs `CreateLv → SetActivation → CreateFilesystem(ext4) → Mount(Host)`
-through the real `ExecutionCoordinator`. Each action requires a durable checkpoint
+through `disksgraph::DisksGraph` and the real `ExecutionCoordinator`.
+The guest example now lives in `disksgraph/examples/c4_vm.rs`; it imports neither
+`storage-engine` nor `storage-provider` directly. Probe, session creation, editing,
+preview, freeze, apply, events, snapshots and incident inspection use the facade. Each action requires a durable checkpoint
 and held lock before entering the actual installed native adapter. Actual LVM,
 blkid, libmount and sysfs observations supply verification; the separate final probe
 must also pass. The success case writes and reads a file on the mounted filesystem.
@@ -34,9 +37,16 @@ assertions and success sentinel, since a clean QEMU exit alone proves nothing.
 `mount-target-change` inserts one file in the target **after** Mount's checkpoint
 is armed. Native endpoint validation then fails. The guest requires the first
 three actions to remain Verified, Mount to become OutcomeUnknown, its checkpoint
-to retain all three native fingerprints, and a second coordinator invocation to
-stop without another native dispatch. No fault injection exists in production
+to retain all three native fingerprints, and a new facade apply attempt to stop
+on that marker without another native dispatch. The original run remains inspectable. No fault injection exists in production
 adapters or policies.
+
+The guest supplies the exact reviewed plan digest and destructive LV scope through
+separate host-owned state after freezing. JSON never contains an approval flag;
+the first admitted request binds this review to its actual run UUID. Snapshot
+assertions check action-to-operation source maps, bounded event cursors, and final
+publication freshness independently of native success. The runner also requires
+`C5_FACADE_VERIFIED`, in addition to the existing C4 outcome sentinel.
 
 The VM policy attests exclusion only for this sole-process, disposable environment;
 it is not a production policy. General scope and `check_mount_exclusion()` still

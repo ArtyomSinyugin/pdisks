@@ -123,26 +123,29 @@ pub struct LinuxLiveHost<'probe, C, A> {
 impl<'probe, C, A> LinuxLiveHost<'probe, C, A> {
     /// Inspects the existing marker using this exact host's providers and the ordinary shared lock.
     pub fn inspect_incident(
-        &self,
+        &mut self,
         root: &crate::lease::ExecutionRoot,
     ) -> Result<Option<crate::incident::IncidentInspection>, crate::incident::IncidentError> {
+        self.last_probe = None;
         crate::incident::inspect_incident(root, &self.probe)
     }
     /// Issues the runtime's immutable review and challenge; it does not clear or resume anything.
     pub fn review_incident(
-        &self,
+        &mut self,
         root: &crate::lease::ExecutionRoot,
     ) -> Result<Option<crate::incident::IncidentReview>, crate::incident::IncidentError> {
+        self.last_probe = None;
         crate::incident::review_incident(root, &self.probe)
     }
     /// Reuses confirmation, fresh-probe, unchanged-marker and trusted quiescence/authorization checks.
     pub fn acknowledge_incident(
-        &self,
+        &mut self,
         root: &crate::lease::ExecutionRoot,
         review: crate::incident::IncidentReview,
         confirmation: uuid::Uuid,
         policy: &mut impl crate::incident::IncidentAcknowledgmentPolicy,
     ) -> Result<crate::incident::IncidentInspection, crate::incident::IncidentError> {
+        self.last_probe = None;
         crate::incident::acknowledge_incident(root, &self.probe, review, confirmation, policy)
     }
 

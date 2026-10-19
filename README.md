@@ -5,11 +5,13 @@
 Сейчас реализован безопасный read-only контур: обнаружение доступных провайдеров, чтение данных из Linux, преобразование результатов в каноническую
 модель и сборка единого снимка состояния. Библиотечный `storage-engine` композирует
 типизированные фрагменты в план, проверяет переходы и строит условный прогноз.
-Реальная запись на диски остаётся выключенной.
+Обычная конфигурация остаётся read-only. Узкая native LVM/ext4/Host mount цепочка
+доступна через явно настроенный runtime и проверена на одноразовых VM-дисках.
 
 ## Текущая реализованная архитектура
 
-Workspace разделён на пять крейтов. Поток данных во время probe выглядит так:
+Workspace разделён на шесть крейтов; прикладной вход — `disksgraph`, исполнение
+принадлежит `storage-runtime`. Поток данных во время probe выглядит так:
 
 ```text
 native-библиотеки / результаты системных утилит
@@ -119,10 +121,54 @@ resize-переходы, общий расход ёмкости, доступн�
 
 `ExecutionRun` хранит отдельные статусы попытки и события прогресса. Допуск требует
 полного live-отчёта, зависимые действия ждут `Verified`, а конечная цель проверяется
-отдельно по новому наблюдению. `LiveExecutionChecks` задаёт контракт будущего
-доверенного исполнителя; полный admission и native write-dispatch
-пока не подключены. История выполнения на диск не записывается;
+отдельно по новому наблюдению. `storage-runtime` реализует live admission, checkpoint
+и typed dispatch для поддержанного native recipe. История выполнения на диск не записывается;
 универсальный resolver всех desired-diff также не реализован.
+
+## Rust API C5
+
+Крейт [`disksgraph`](disksgraph/src/lib.rs) владеет сессиями, импортированными
+планами и результатами запусков. Он принимает явно настроенные host/dispatcher и
+существующий private execution root; `apply_blocking`, `apply_frozen` и `apply_plan`
+вызывают единственный `ExecutionCoordinator`. Сохранённый plan не содержит approval.
+Trusted principal policy настраивается владельцем host отдельно от JSON и проверяет
+полный `ApprovalRequest` при каждом admission. Положительной production policy нет.
+
+`create_session` берёт baseline и capacity из одного свежего provider-pass. NodeId
+для редактирования следует выбирать из `export_draft(session).baseline`, поскольку
+другой probe может назначить новые transient IDs. Фасад сохраняет revision checks,
+invalid/conditional preview, undo/redo и отдельно проверяемый rebase. Import draft
+пересчитывает preview и не восстанавливает сохранённую историю. Freeze сохраняет
+source map; импортированный `PlanDocument` его не получает. Handles принадлежат
+одному экземпляру; session/plan/run collections ограничены 64 объектами каждая,
+освобождаются явно через `close_session/close_plan/close_run`. Закрытие run не
+удаляет аварийный checkpoint. Plan JSON ограничен 16 MiB до разбора.
+
+`ExecutionRun` хранит максимум 1024 события, progress message — максимум 4096 bytes.
+Sequence монотонен независимо от вытеснения; переполнение отклоняется без wrap и
+частичной публикации admission. `events(run, since)` принимает последний прочитанный
+sequence **исключительно**. Возвращённый `next_sequence` передаётся следующим `since`
+без прибавления единицы. При `gap=true` клиент получает `run_snapshot`, заменяет
+своё состояние и продолжает от `snapshot.execution.event_sequence`. Будущий cursor
+отклоняется. Прежний `events_since()` остаётся iterator по сохранившимся событиям,
+поэтому не подходит для обнаружения потерь.
+
+Snapshot содержит все action states, actual outcomes/checks, ссылки на admission и
+completion publications, последнюю actual observation и отдельный final report.
+`finished` означает завершение blocking-попытки, `verified` — успешную независимую
+проверку конечной цели. Даже `Ok(run_id)` требует проверки `verified`: Unknown
+admission или OutcomeUnknown не являются успехом. Ошибка coordinator сохраняет
+попытку и возвращает её ID в `DisksGraphError.run_id`; typed `ErrorCode` сериализуется
+отдельно от текста. Фасад не возобновляет попытки автоматически и не создаёт jobs
+после завершения вызывающего процесса.
+
+`incident/review_incident/acknowledge_incident` используют тех же providers, lock,
+challenge и независимую safety policy runtime. Никакого нового пути clear/retry нет.
+Пример [`c4_vm.rs`](disksgraph/examples/c4_vm.rs) импортирует только `disksgraph` для
+публичного workflow и явной host-конфигурации. Существующий [VM runner](storage-runtime/tests/vm/README.md)
+проверяет через фасад реальную четырёхшаговую цепочку, fresh final probe, events,
+source map и отказ после arm. CLI (C6), асинхронные ABI jobs и Stabby (C7) пока не
+реализованы. Disks preview остаётся отключённым.
 
 ## Редактирование плана без доступа к дискам
 

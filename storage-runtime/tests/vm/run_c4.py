@@ -62,7 +62,7 @@ def main():
     args = parser.parse_args()
     iso = args.rescue_iso.resolve(strict=True)
     repo = pathlib.Path(__file__).resolve().parents[3]
-    run("cargo", "build", "-p", "storage-runtime", "--example", "c4_vm", "--offline", cwd=repo)
+    run("cargo", "build", "-p", "disksgraph", "--example", "c4_vm", "--offline", cwd=repo)
     base = pathlib.Path(tempfile.mkdtemp(prefix="disksgraph-c4-"))
     print(f"Artifacts: {base}", flush=True)
     root = base / "root"
@@ -117,7 +117,7 @@ def main():
     result = log.read_text()
     print(result)
     sentinel = "C4_VERTICAL_VERIFIED" if args.case == "success" else "C4_EXPECTED_FAILURE_VERIFIED"
-    if f"{sentinel}\n" not in result or "C4_EXIT=0\n" not in result:
+    if f"{sentinel}\n" not in result or "C4_EXIT=0\n" not in result or "C5_FACADE_VERIFIED\n" not in result:
         raise SystemExit(f"C4 experiment failed; retained {log} and {disk}")
 
 

@@ -64,7 +64,7 @@ pub struct DisksGraphError {
     pub code: ErrorCode,
     /// Human-readable context copied from the typed failure.
     pub message: String,
-    /// Retained execution attempt, including failures before dispatch; absent if no run was created.
+    /// New attempt retained by a failed apply call; other errors carry no newly created run.
     pub run_id: Option<crate::RunId>,
 }
 impl DisksGraphError {

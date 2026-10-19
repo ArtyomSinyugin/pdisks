@@ -29,6 +29,7 @@ fn filesystem_plan() -> Result<(ProbeSnapshot, FrozenPlan, NodeId), Box<dyn Erro
 /// Ext4 resolution requires the same run's verified LV plus fresh active writable endpoint evidence.
 #[test]
 fn ext4_resolution_requires_verified_active_unused_lv() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     let (state, frozen, _) = filesystem_plan()?;
     let state = Rc::new(RefCell::new(state));
     let scratch = admission::Scratch::new()?;
@@ -156,6 +157,7 @@ impl storage_runtime::capability::BackendCapabilityCheck for FilesystemPolicy {
 #[test]
 fn ext4_admission_requires_explicit_consumer_exclusion_and_destructive_confirmation()
 -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_runtime::host::{LinuxLiveHost, RuntimeHost};
     /// Exercises the same coordinator path for hosts with independent policy types.
     fn check<H: RuntimeHost>(
@@ -475,6 +477,7 @@ impl storage_runtime::dispatcher::BackendDispatcher for FilesystemDispatcher {
 /// The roadmap's three-action prefix verifies actual ext4 output and rechecks it after transient ID drift.
 #[test]
 fn lv_activation_ext4_run_verifies_and_retains_owned_filesystem() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_runtime::host::LinuxLiveHost;
     let (state, frozen, backing) = filesystem_plan()?;
     let state = Rc::new(RefCell::new(state));
@@ -560,6 +563,7 @@ fn lv_activation_ext4_run_verifies_and_retains_owned_filesystem() -> Result<(), 
 #[test]
 fn ext4_failures_keep_checkpoint_and_never_publish_a_binding_or_retry() -> Result<(), Box<dyn Error>>
 {
+    let _process = isolate_processes();
     use storage_runtime::{coordinator::CoordinatorError, host::LinuxLiveHost};
     for fault in [
         FilesystemFault::MissingReceipt,
@@ -640,6 +644,7 @@ fn ext4_failures_keep_checkpoint_and_never_publish_a_binding_or_retry() -> Resul
 /// Adding an ext4 action cannot make the native LVM adapter partially execute an unsupported plan.
 #[test]
 fn native_lvm_rejects_ext4_plan_before_first_write() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_runtime::{
         coordinator::CoordinatorError, host::LinuxLiveHost, native_lvm::NativeLvmAdapter,
     };
@@ -672,6 +677,7 @@ fn native_lvm_rejects_ext4_plan_before_first_write() -> Result<(), Box<dyn Error
 /// An explicit destructive veto stops admission without arming a filesystem checkpoint or calling mkfs.
 #[test]
 fn ext4_destructive_veto_stops_before_dispatch() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_runtime::host::LinuxLiveHost;
     let (state, frozen, backing) = filesystem_plan()?;
     let state = Rc::new(RefCell::new(state));
@@ -713,6 +719,7 @@ fn ext4_destructive_veto_stops_before_dispatch() -> Result<(), Box<dyn Error>> {
 #[test]
 fn native_ext4_adapter_requires_explicit_recipe_and_independent_scope() -> Result<(), Box<dyn Error>>
 {
+    let _process = isolate_processes();
     use storage_runtime::{
         capability::{BackendCapabilityCheck, OperationAvailability},
         dispatcher::BackendDispatcher,
@@ -899,6 +906,7 @@ impl storage_runtime::authorization::AuthorizationContext for RoutedApproval {
 /// Every selected backend is checked before the first arm and again at admission and dispatch.
 #[test]
 fn routed_filesystem_backend_is_fixed_before_any_plan_write() -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_runtime::{coordinator::CoordinatorError, host::LinuxLiveHost};
     for mismatch in [false, true] {
         let (state, frozen, backing) = filesystem_plan()?;
@@ -948,6 +956,7 @@ fn routed_filesystem_backend_is_fixed_before_any_plan_write() -> Result<(), Box<
 #[test]
 fn native_storage_routes_exact_registrations_and_refuses_incomplete_plans()
 -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_core::model::{MountContext, MountEntry, MountSource};
     use storage_runtime::{
         capability::{BackendCapabilityCheck, OperationAvailability},
@@ -1080,6 +1089,7 @@ impl storage_runtime::dispatcher::BackendDispatcher for GuardedFilesystemDispatc
 #[test]
 fn native_ext4_descriptor_failure_preserves_checkpoint_and_forbids_retry()
 -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_runtime::{
         coordinator::CoordinatorError, dispatcher::BackendDispatcher, host::LinuxLiveHost,
         native_ext4::NativeExt4Adapter,
@@ -1264,6 +1274,7 @@ impl storage_runtime::dispatcher::BackendDispatcher for MountDispatcher {
 #[test]
 fn mount_vertical_verifies_exact_result_and_blocks_uncertain_namespace()
 -> Result<(), Box<dyn Error>> {
+    let _process = isolate_processes();
     use storage_core::model::{MountContext, MountEntry, MountSource};
     use storage_runtime::{coordinator::CoordinatorError, host::LinuxLiveHost};
     for (fault, coverage) in [(0, true), (1, true), (2, true), (0, false)] {
