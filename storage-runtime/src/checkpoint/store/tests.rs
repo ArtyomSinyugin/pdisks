@@ -421,3 +421,46 @@ fn read_failure_blocks_inspect_arm_and_clear() -> Result<(), Box<dyn Error>> {
     assert_eq!(fs::read_dir(&scratch.0)?.count(), 2);
     Ok(())
 }
+
+/// Every diagnostic binding matters; keeping only run/action IDs does not authorize deletion.
+#[test]
+fn clear_compares_the_complete_expected_attempt() -> Result<(), Box<dyn Error>> {
+    let _serial = serialize_process_tests();
+    for case in 0..5 {
+        let scratch = Scratch::new()?;
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let lock = root.try_lock_host()?;
+        let store = CheckpointStore::new(&lock);
+        let expected = fixture();
+        store.arm(&expected)?;
+        let mut changed = expected.clone();
+        match case {
+            0 => changed.plan_digest = "b".repeat(64),
+            1 => changed.backend_id = BackendId::new("another-backend").ok_or("backend")?,
+            2 => {
+                changed.targets[0].external_ids =
+                    vec![ExternalId::LvmVgUuid("replacement-vg".into())]
+            }
+            3 => changed.plan_id = Uuid::now_v7(),
+            _ => {
+                let ProviderAction::Lvm(LvmAction::CreateLv { name, .. }) = &mut changed.action
+                else {
+                    unreachable!("fixture action")
+                };
+                *name = "replacement-name".into();
+            }
+        }
+        let bytes = changed.to_bytes()?;
+        fs::write(scratch.0.join(ACTIVE_FILE), &bytes)?;
+        assert!(
+            matches!(
+                store.clear(&expected),
+                Err(CheckpointError::AttemptMismatch)
+            ),
+            "case {case}"
+        );
+        assert_eq!(fs::read(scratch.0.join(ACTIVE_FILE))?, bytes);
+        assert_eq!(store.inspect()?, Some(changed));
+    }
+    Ok(())
+}
