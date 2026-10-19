@@ -41,6 +41,25 @@ pub enum Error {
     Configuration(String),
 }
 
+impl Error {
+    /// Stable process category: malformed input is 2, host/application/output failure is 1.
+    /// Use the application code rather than message text for typed saved-document failures.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Usage(_) | Self::Document(_) => 2,
+            Self::Application(error)
+                if matches!(
+                    error.code,
+                    disksgraph::ErrorCode::InvalidDraft | disksgraph::ErrorCode::InvalidPlan
+                ) =>
+            {
+                2
+            }
+            _ => 1,
+        }
+    }
+}
+
 impl From<std::io::Error> for Error {
     /// Keeps OS failures separate from parse and application errors.
     fn from(error: std::io::Error) -> Self {
@@ -55,6 +74,42 @@ impl From<serde_json::Error> for Error {
             Self::Io(error.to_string())
         } else {
             Self::Document(error.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Embedders and the executable classify typed validation errors without parsing diagnostics.
+    #[test]
+    fn error_exit_codes_distinguish_input_from_host_failures() {
+        for error in [Error::Usage("usage".into()), Error::Document("json".into())] {
+            assert_eq!(error.exit_code(), 2);
+        }
+        for error in [
+            Error::Io("output".into()),
+            Error::Configuration("manifest".into()),
+        ] {
+            assert_eq!(error.exit_code(), 1);
+        }
+        for (code, expected) in [
+            (disksgraph::ErrorCode::InvalidDraft, 2),
+            (disksgraph::ErrorCode::InvalidPlan, 2),
+            (disksgraph::ErrorCode::LeaseUnavailable, 1),
+            (disksgraph::ErrorCode::CheckpointBlocked, 1),
+            (disksgraph::ErrorCode::VerificationFailed, 1),
+        ] {
+            assert_eq!(
+                Error::Application(disksgraph::DisksGraphError {
+                    code,
+                    message: "same opaque diagnostic".into(),
+                    run_id: None,
+                })
+                .exit_code(),
+                expected
+            );
         }
     }
 }

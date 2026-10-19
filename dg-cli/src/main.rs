@@ -4,7 +4,7 @@
 
 mod native;
 
-use dg_cli::{Error, Invocation, result_exit_code};
+use dg_cli::{Invocation, result_exit_code};
 use std::{
     io::{self, Write},
     process::ExitCode,
@@ -26,11 +26,7 @@ fn main() -> ExitCode {
             (value, exit)
         }
         Err(error) => {
-            let exit = if matches!(error, Error::Usage(_) | Error::Document(_)) {
-                2
-            } else {
-                1
-            };
+            let exit = error.exit_code();
             (serde_json::json!({"error": error}), exit)
         }
     };
