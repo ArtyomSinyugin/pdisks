@@ -174,6 +174,10 @@ snapshot/events polling. Reviewed rebase и incident confirmation использ
 context-owned handles; default incident safety policy остаётся Unknown.
 Положительная и отказная native VM приёмка через отдельно загружаемую тестовую
 `.so` прошли с явным guarded guest host; production constructor остаётся read-only.
+MSRV 1.88.0 проверен actual compiler, включая standalone checked consumer и
+cross-compiler imports 1.88.0/1.98.1. [Локальный bundle](packaging/README.md)
+содержит CLI, `lib/libdisksgraph.so`, consumer SDK и checksums. Функциональная
+приёмка C7 для текущего API завершена; далее — эксплуатационные gates C8.
 Disks preview остаётся отключённым.
 
 ## CLI C6 — сохранённые черновики и foreground apply

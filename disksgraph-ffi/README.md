@@ -1,7 +1,11 @@
 # Stabby API с ограниченными apply jobs (C7)
 
 `cargo build -p disksgraph-ffi --offline` собирает `target/debug/libdisksgraph_ffi.so`.
-Это незавершённый этап C7; финальное packaging-имя `libdisksgraph.so` ещё не настроено.
+`scripts/stage-package.sh /path/to/new-bundle` укладывает release ABI как
+`lib/libdisksgraph.so`, CLI и standalone consumer SDK в новый локальный bundle.
+Cargo-имя сохраняется, чтобы не конфликтовать с Rust facade crate `disksgraph`.
+Это завершение функциональной/compatibility приёмки C7 для текущего API;
+production deployment и write/safety policies относятся к C8.
 Все методы делегируются `disksgraph`; runtime остаётся единственным владельцем
 execution/admission/checkpoint. Конфигурация native reads общая с `dg-cli`.
 Native writes в этом конструкторе отключены: capability/authorization возвращают
@@ -9,10 +13,14 @@ Unknown, dispatcher не выполняет mutations.
 
 Экспорты используют Stabby **72.1.16**, закреплённый в workspace. Consumer обязан
 получать функции через `StabbyLibrary::get_stabbied`, который проверяет signature
-report. Пример границы загрузки: [tests/support/dylib.rs](tests/support/dylib.rs).
+report. Пример границы загрузки: [standalone checked loader](../packaging/consumer/src/api.rs).
 Обычный поиск символа по имени пропускает эту проверку. Crate использует edition
-2021 из-за export attributes этой версии Stabby. Workspace MSRV — Rust 1.88;
-фактическая сборка на 1.88 пока не проверена, текущие проверки выполнены на 1.98.1.
+2021 из-за export attributes этой версии Stabby. Workspace MSRV — Rust **1.88.0**;
+полный locked workspace и actual checked cdylib consumer проверены на официальном
+Rust/Cargo 1.88.0 и текущем Rust 1.98.1. Воспроизведение:
+`scripts/check-msrv.sh /path/to/rust-1.88.0/bin`. Скрипт требует exact compiler/cargo,
+использует отдельный target directory и также собирает standalone consumer.
+Обновления зависимостей проверяются с сохранёнными lockfiles.
 
 ```rust,ignore
 // StableString = stabby::string::String; все строки передаются во владение.
@@ -241,7 +249,30 @@ exact incident confirmation не очищает marker, original run остаё�
 в новом context ни одного native dispatch. Bytes checkpoint остаются прежними.
 Подробности и ограничения — в [VM runner docs](../storage-runtime/tests/vm/README.md).
 
-C7 остаётся открыт: отдельный credential channel не реализован, cancellation явно
-отклоняется. Native VM acceptance выполнена для этого scoped test host. Actual MSRV
-и финальное packaging требуют отдельной приёмки. Production write и incident safety
-policies относятся к C8. Disks preview остаётся отключённым.
+В bundle есть самостоятельный Cargo workspace `consumer/` с закреплённым Stabby
+72.1.16, libloading 0.9.0 и собственным lockfile. Он не зависит от facade/runtime
+и не требует исходного monorepo. Программа принимает explicit library path, existing
+private root и regular draft JSON до 16 MiB, возвращает preview и закрывает context
+до unload. Это пример stable owned-string checked imports, не plain C header:
+`stabby::string::String` нельзя заменять C string или обычным Rust String.
+
+```sh
+CARGO_TARGET_DIR=/tmp/disksgraph-client cargo build --manifest-path /path/to/bundle/consumer/Cargo.toml --locked --offline
+/tmp/disksgraph-client/debug/disksgraph-consumer-example /path/to/bundle/lib/libdisksgraph.so /private/root /path/to/draft.json
+python3 scripts/check-package.py /path/to/bundle /tmp/disksgraph-client/debug/disksgraph-consumer-example
+```
+
+Последняя команда выполняется из исходного checkout: проверяет checksums и exact
+file set, production exports без VM symbols, ABI/CLI preview parity на записанном
+fixture и сохранение synthetic incident marker при preview/close. Проверены все
+четыре сочетания compiler library/client **1.88.0 × 1.98.1**, включая client,
+собранный из перемещённого bundle. Это evidence для этих pinned signatures/toolchains,
+не обещание совместимости произвольных будущих compiler/dependency combinations.
+Staging не устанавливает систему и не публикует release; детали в
+[packaging README](../packaging/README.md).
+
+Критерий C7 для текущего API выполнен: checked consumer, native success/failure
+с guarded test host, actual MSRV и public bundle filename проверены. C8 production
+write/incident policies, system packaging и fault injection ещё не завершены.
+Отдельный credential channel не реализован, LUKS writes не включены; cancellation
+явно отклоняется. Disks preview остаётся отключённым.
