@@ -2,12 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use storage_core::model::{ExternalId, NodeId};
+use storage_core::model::{ExternalId, FilesystemKind, NodeId};
 use storage_engine::{
     ActionId, ActionRunState, ExecutionRun, ExecutionRunError, PlanDocument, PlanDocumentError,
     editing::OperationId,
 };
-use storage_provider::{BackendId, LvmAction, ProviderAction};
+use storage_provider::{BackendId, FilesystemAction, LvmAction, ProviderAction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -45,7 +45,7 @@ pub enum CheckpointError {
     /// Required identity or binding data is absent or inconsistent.
     #[error("invalid checkpoint: {0}")]
     InvalidData(&'static str),
-    /// Only parameters reviewed for the initial LVM recipe may be persisted.
+    /// Only parameters reviewed for the narrow LVM and ext4 recipes may be persisted.
     #[error("checkpoint action is not supported")]
     UnsupportedAction,
     /// Capture must occur after full admission and before the invocation boundary.
@@ -183,7 +183,7 @@ impl ActiveAttempt {
         {
             return Err(CheckpointError::InvalidData("invalid SHA-256 plan digest"));
         }
-        // shortcut: persist only the first LVM recipe, review redaction before adding other actions.
+        // Every added action needs an explicit non-secret persistence rule.
         let (primary, volume_group) = match &self.action {
             ProviderAction::Lvm(LvmAction::CreateLv {
                 vg,
@@ -192,6 +192,19 @@ impl ActiveAttempt {
                 ..
             }) if !planned_node_id.as_uuid().is_nil() && size.as_u64() != 0 => (*vg, true),
             ProviderAction::Lvm(LvmAction::SetActivation { target, .. }) => (*target, false),
+            ProviderAction::Filesystem(FilesystemAction::Create {
+                backing,
+                planned_node_id,
+                filesystem: FilesystemKind::Ext4,
+                label,
+            }) if !planned_node_id.as_uuid().is_nil()
+                && planned_node_id != backing
+                && label
+                    .as_ref()
+                    .is_none_or(|label| label.len() <= 16 && !label.contains('\0')) =>
+            {
+                (*backing, false)
+            }
             _ => return Err(CheckpointError::UnsupportedAction),
         };
         if self.targets.is_empty()

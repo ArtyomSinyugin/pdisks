@@ -219,3 +219,36 @@ fn rejects_unreviewed_actions_and_accepts_lv_activation() -> Result<(), Box<dyn 
     );
     Ok(())
 }
+
+/// Ext4 intent retains only reviewed parameters and the pre-dispatch LV UUID, never a guessed FS UUID.
+#[test]
+fn ext4_checkpoint_requires_lv_identity_and_bounded_label() -> Result<(), Box<dyn Error>> {
+    let mut checkpoint = attempt(&admitted_run()?)?;
+    let backing = checkpoint.targets[0].planned_id;
+    let planned_node_id = storage_core::model::NodeId::new();
+    checkpoint.action = ProviderAction::Filesystem(FilesystemAction::Create {
+        backing,
+        planned_node_id,
+        filesystem: storage_core::model::FilesystemKind::Ext4,
+        label: Some("data".into()),
+    });
+    assert!(checkpoint.to_bytes().is_err());
+    checkpoint.targets[0].external_ids = vec![ExternalId::LvmLvUuid("verified-lv".into())];
+    assert_eq!(
+        ActiveAttempt::from_bytes(&checkpoint.to_bytes()?)?,
+        checkpoint
+    );
+    for label in ["x".repeat(17), "bad\0label".into()] {
+        let mut changed = checkpoint.clone();
+        if let ProviderAction::Filesystem(FilesystemAction::Create { label: actual, .. }) =
+            &mut changed.action
+        {
+            *actual = Some(label);
+        }
+        assert!(changed.to_bytes().is_err());
+    }
+    let mut changed = serde_json::to_value(&checkpoint)?;
+    changed["action"]["operation"]["create"]["password"] = serde_json::json!("reject");
+    assert!(ActiveAttempt::from_bytes(&serde_json::to_vec(&changed)?).is_err());
+    Ok(())
+}
