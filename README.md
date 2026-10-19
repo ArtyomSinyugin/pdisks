@@ -284,7 +284,19 @@ Rust host использовать **тот же** command adapter и собст
 десериализуется из пользовательского JSON. `execute()` и обычный executable
 используют `incident::UnconfiguredPolicy`, всегда Unknown: правильного token
 недостаточно для удаления marker. `result_exit_code()` общий для executable и
-embedding host. Production scope/authorization остаются Unknown, native dispatcher
+embedding host; `Error::exit_code()` задаёт ту же классификацию ошибок.
+
+| Код выхода CLI | Значение |
+| --- | --- |
+| `0` | Команда завершена; apply — только при независимой final verification |
+| `1` | Ошибка хоста, конфигурации, I/O или приложения |
+| `2` | Неверные аргументы или входной документ, включая `invalid_draft`/`invalid_plan` |
+| `3` | Apply вернул сохранённый run без подтверждённого final success |
+
+Ошибка event output имеет приоритет и возвращает `1`, даже при Verified run.
+Окончательный stdout тоже проверяется: закрытый pipe даёт `1`. JSON diagnostics
+сохраняют typed error code; exit code не заменяет анализ retained run/checkpoint.
+Production scope/authorization остаются Unknown, native dispatcher
 обычного executable отключён; даже manifest с Execute не включает запись.
 
 **Приёмочный проход C6 command layer завершён.** В
@@ -530,8 +542,13 @@ set frozen action и не зависит от transient NodeId, plan UUID или
 
 Все hosts одного effective user должны использовать **один и тот же постоянный
 локальный каталог** с правами 0700 под доверенным родителем. API требует готовый
-каталог, проверяет ownership/permissions и открывает directory/lock без следования
-symlink; lock должен быть regular, private и иметь ровно одну hard link.
+каталог: effective-user owner, ровно `0700` без special bits и ненулевой link count.
+Проверка повторяется на сохранённом fd до и после захвата lock; удалённый каталог
+отклоняется. Directory/lock открываются без следования финальному symlink;
+родительские компоненты этим не проверяются. Lock должен быть regular, private
+и иметь ровно одну hard link; соответствие имени и inode проверяется до и после
+`flock`. [Эксплуатационный контракт каталога](packaging/README.md#execution-directory-and-process-contract)
+обязателен и для Rust, и для CLI/ABI.
 `execution.lock` не удаляется и не обнуляется. Каталог и lock нельзя заменять или
 удалять, пока hosts могут работать: новый inode создаст другую область блокировки.
 Разные каталоги и произвольные внешние disk tools этой блокировкой не исключаются.
@@ -723,8 +740,16 @@ inode файла, удаляет только совпадающий checkpoint 
 посторонних или оставшихся временных файлов не выполняется. После публикации
 checkpoint переживает завершение процесса и требует отдельного разбора.
 
-Тесты проверяют I/O-отказы на границах sync/publication/removal, конкуренцию
-hosts и реальные дочерние процессы с `SIGKILL`. Это не проверка отключения питания
+Тесты проверяют I/O-отказы чтения, частичной записи, fsync, rename и unlink;
+ошибка чтения не превращается в отсутствие marker, ошибка unlink сохраняет bytes.
+Отдельные дочерние процессы получают `SIGKILL` при частичной записи, перед file
+sync, до/после публикации и до/после unlink. Ещё одна subprocess-матрица проходит
+`armed`, `running`, `completed`, `verified_before_clear` с реальным checkpoint и
+переходами engine, но синтетическими admission/completion/verification reports.
+Во всех четырёх фазах marker остаётся неизменным, flock освобождается ядром,
+новая попытка блокируется. Эта матрица не вызывает coordinator/native backend
+и не доказывает crash parity всех публичных transports.
+Это не проверка отключения питания
 или аппаратной надёжности накопителя. Полный запуск первого LVM recipe проверен
 через mock native adapter, без изменения реальных устройств;
 настройки по умолчанию не разрешают native writes, незавершённый disks preview

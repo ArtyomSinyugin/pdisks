@@ -47,3 +47,63 @@ preservation on a new private fixture root. It invokes no native writes. Both Ru
 1.88.0 and 1.98.1 producers and consumers were verified, in all four combinations;
 other targets/toolchains need their own acceptance. SHA256SUMS provides local
 integrity checking, not a signed release or an authenticity mechanism.
+
+## Execution directory and process contract
+
+All cooperating Rust, CLI and ABI hosts must explicitly select the same local
+execution directory, owned by their effective user with exactly mode `0700` and
+no special permission bits. Missing roots are rejected; the application neither
+creates a root nor repairs its permissions. An opened but subsequently removed
+root is rejected on lock acquisition. Renaming a retained root does not redirect
+its descriptor: the operator must keep its original directory and permanent
+`execution.lock` inode stable for the entire lifetime of all hosts.
+
+Use a durable location for write-capable host integration so an active incident
+survives reboot. `/var/lib/disksgraph/execution` is a proposed ALT deployment
+location, not an installed default or a completed distribution policy. `/run` and
+private temporary directories are suitable for disposable acceptance fixtures;
+they do not establish reboot persistence. The parent path must be trusted and
+stable: only the final component is opened with `NOFOLLOW`, so writable parents
+or parent symlinks are not validated by this API. The filesystem must support
+advisory flock, no-replace rename and directory fsync; failure has no weaker
+fallback. A container or another UID selecting a different root does not share
+this exclusion. External disk tools do not participate in it.
+
+Do not delete or recreate `execution.lock` to resolve contention. Its name and
+inode are checked before and after flock acquisition, but this is not protection
+against a privileged writer replacing them later. A completed run leaves only
+that lock in an initially empty root. An active, malformed or unreadable
+`active-attempt.json` blocks new execution. Process death before publication can
+leave an inert `.active-attempt-*.tmp`; it grants no permission to dispatch.
+There is no automatic checkpoint retry, replay or deletion during close. Use
+incident review; acknowledgment still requires an independently configured
+trusted principal/scope/quiescence policy and fails closed by default.
+
+The executable never elevates privileges. Effective UID, directory ownership,
+a provider manifest and a saved plan are not execution authorization. Production
+privilege separation, service principals, ALT package ownership/lifecycle,
+redaction and power-loss acceptance remain unfinished. No service unit,
+privileged helper, setuid bit or system install is supplied by this bundle.
+Treat raw observations, progress and backend diagnostics as potentially sensitive:
+redaction is not implemented, so restrict access to captured output and documents.
+
+CLI process codes are `0` for command success (apply requires final verification),
+`1` for host/configuration/application/output failure, `2` for usage or invalid
+input documents, and `3` for a returned unverified apply run. Invalid saved drafts
+and plans now use `2`; their structured application codes are retained. Event
+output failure takes priority and uses `1`, including after verified execution.
+Embedders use the same `Error::exit_code()` and `result_exit_code()` helpers.
+
+Focused source-checkout acceptance commands:
+
+```sh
+cargo test -p storage-runtime --lib checkpoint::store::tests --offline
+cargo test -p storage-runtime --test checkpoint crash_lifecycle --offline
+cargo test -p storage-runtime --test execution_leases --offline
+cargo test -p dg-cli --test exit_codes --offline
+```
+
+The ignored child helpers are invoked by their normal parent tests; do not run
+all ignored tests manually. Fault switches exist only in unit-test builds.
+SIGKILL phase tests use synthetic engine reports and no native dispatch. They
+verify process/filesystem behavior, not power loss or public-route crash parity.
