@@ -2672,3 +2672,7 @@ fn mount_scope_correlates_unrelated_sources_and_rejects_replacements() -> Result
     }
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/ext4.rs"]
+mod ext4;

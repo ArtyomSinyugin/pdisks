@@ -128,8 +128,12 @@ impl OutputBindings {
             let NodeKind::Filesystem { label, .. } = &binding.spec.kind else {
                 return Err(BindingError::Identity);
             };
-            return crate::filesystem::observe_ext4(observed, backing, &binding.uuid, label)
-                .map_err(|_| BindingError::Identity);
+            let id = crate::filesystem::observe_ext4(observed, backing, &binding.uuid, label)
+                .map_err(|_| BindingError::Identity)?;
+            if observed.snapshot.graph.node(&id).map(|node| &node.kind) != Some(&binding.spec) {
+                return Err(BindingError::Identity);
+            }
+            return Ok(id);
         }
         let binding = self
             .entries
@@ -582,6 +586,15 @@ pub(crate) fn verify_created_filesystem(
                 _ => None,
             })
             .ok_or(BindingError::Identity)?;
+        let mut spec = spec;
+        // Preserve the first actual capacity for later scope checks; creation did not predict it.
+        spec.size = actual
+            .snapshot
+            .graph
+            .node(&binding.target)
+            .ok_or(BindingError::Identity)?
+            .kind
+            .size;
         correlations.push(binding);
         pending = Some(PendingFilesystemBinding {
             run_id: run.run_id(),

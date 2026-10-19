@@ -3,7 +3,8 @@
 use crate::{bindings::OutputBindings, checkpoint::TargetFingerprint};
 use std::collections::HashMap;
 use storage_core::model::{
-    Bytes, CurrentState, ExternalId, LvmLvKind, MountSource, NodeId, NodeKind,
+    BlockFacts, Bytes, CurrentState, ExternalId, FilesystemKind, LvmLvKind, MountSource, NodeId,
+    NodeKind,
 };
 use storage_engine::{
     ActionId, ExecutionRun, ExecutionRunError, LiveObservation, ObservationReference,
@@ -11,7 +12,8 @@ use storage_engine::{
     live::ObservationError,
 };
 use storage_provider::{
-    BackendId, LinearLvRequest, LvActivationRequest, LvmAction, LvmWriteError, ProviderAction,
+    BackendId, FilesystemAction, LinearLvRequest, LvActivationRequest, LvmAction, LvmWriteError,
+    ProviderAction,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -28,9 +30,12 @@ pub enum TargetError {
     /// The requested action does not belong to this run.
     #[error(transparent)]
     Run(#[from] ExecutionRunError),
-    /// Only linear CreateLv and activation of its verified outputs are supported.
+    /// Only linear creation, activation and ext4 on verified LV outputs are resolved.
     #[error("target resolution does not support this action")]
     UnsupportedAction,
+    /// Ext4 creation requires an active writable verified LV and representable label.
+    #[error("ext4 creation requires an active unused verified LV with a known block endpoint")]
+    FilesystemEndpoint,
     /// A planned LV has no verified identity in this attempt, or that identity changed.
     #[error("activation target is not an unchanged verified output of this run")]
     UnverifiedOutput,
@@ -74,6 +79,8 @@ pub struct ResolvedLvTarget {
     pub lv_name: String,
     /// Exact reviewed capacity, rechecked natively before activation.
     pub size: Bytes,
+    /// Block facts from this exact probe; these are observations, not a held native descriptor.
+    pub block: Option<BlockFacts>,
 }
 
 /// An operation bound to one run, action, probe publication, and concrete backend.
@@ -152,7 +159,7 @@ pub fn resolve_action(
     resolve_action_with_bindings(run, action, observed, backend, &OutputBindings::new(run))
 }
 
-/// Resolves linear creation or activation of verified outputs and checks the entire accumulated scope.
+/// Resolves linear creation, activation or ext4 on verified outputs and checks accumulated scope.
 /// An output binding never adopts arbitrary live consumers or changes to existing reviewed devices.
 pub fn resolve_action_with_bindings(
     run: &ExecutionRun,
@@ -181,6 +188,11 @@ pub fn resolve_action_with_bindings(
         ProviderAction::Lvm(LvmAction::SetActivation {
             target,
             active: true,
+        })
+        | ProviderAction::Filesystem(FilesystemAction::Create {
+            backing: target,
+            filesystem: FilesystemKind::Ext4,
+            ..
         }) => {
             let id = bindings
                 .resolve(run, *target, observed)
@@ -204,6 +216,39 @@ pub fn resolve_action_with_bindings(
             if parents.next().is_some() {
                 return Err(TargetError::UnverifiedOutput);
             }
+            if let ProviderAction::Filesystem(FilesystemAction::Create { label, .. }) =
+                &planned.operation
+            {
+                if label
+                    .as_ref()
+                    .is_some_and(|label| label.len() > 16 || label.contains('\0'))
+                    || node.size.lvm_active != Some(true)
+                    || !node.size.block.as_ref().is_some_and(|block| {
+                        block.read_only == Some(false)
+                            && block.geometry.is_some()
+                            && !block.paths.is_empty()
+                            && block.paths.iter().all(|path| {
+                                path.is_absolute()
+                                    && !path
+                                        .components()
+                                        .any(|part| part == std::path::Component::ParentDir)
+                                    && !path.as_os_str().as_encoded_bytes().contains(&0)
+                            })
+                    })
+                    || observed
+                        .snapshot
+                        .graph
+                        .dependencies()
+                        .any(|edge| edge.from == id)
+                    || observed
+                        .snapshot
+                        .graph
+                        .relations()
+                        .any(|edge| edge.from == id || edge.to == id)
+                {
+                    return Err(TargetError::FilesystemEndpoint);
+                }
+            }
             let uuid = node
                 .size
                 .identities
@@ -221,6 +266,7 @@ pub fn resolve_action_with_bindings(
                     lv_uuid: uuid,
                     lv_name: lv.name.clone(),
                     size: node.kind.size.ok_or(TargetError::UnverifiedOutput)?,
+                    block: node.size.block.clone(),
                 }),
             )
         }
