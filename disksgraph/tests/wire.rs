@@ -121,3 +121,24 @@ fn saved_input_context_rejects_fresh_operations() -> Result<(), Box<dyn Error>> 
     assert_eq!(probes.get(), 0);
     Ok(())
 }
+
+/// An owned saved-input application reports missing native reads rather than inventing device absence.
+#[test]
+fn owned_native_configuration_preserves_explicit_missing_evidence() -> Result<(), Box<dyn Error>> {
+    let (scratch, _, _, _) = support::application()?;
+    let mut app = disksgraph::native::open(&scratch.0, None)?;
+    let first = app.probe()?;
+    let second = app.probe()?;
+    assert!(second.reference.epoch > first.reference.epoch);
+    assert!(second.snapshot.diagnostics.iter().any(|item| {
+        item.code == "provider.probe_failed"
+            && item
+                .evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.contains("saved inputs only"))
+    }));
+    assert!(
+        disksgraph::native::open(&scratch.0, Some(&scratch.0.join("missing-manifest"))).is_err()
+    );
+    Ok(())
+}

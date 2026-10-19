@@ -12,6 +12,7 @@ pub use runs::RunSnapshot;
 pub use storage_runtime::incident::{
     IncidentAcknowledgmentPolicy, IncidentAssessment, IncidentInspection, IncidentReview,
 };
+pub mod native;
 mod sessions;
 pub mod wire;
 pub use error::{DisksGraphError, ErrorCode};
