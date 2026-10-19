@@ -92,6 +92,7 @@ name = "disksgraph-ffi"
 version = "0.1.0"
 dependencies = [
  "disksgraph",
+ "libloading",
  "serde",
  "serde_json",
  "stabby",
