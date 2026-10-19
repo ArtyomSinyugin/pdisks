@@ -27,6 +27,7 @@ mod filesystem_write;
 mod logical;
 mod luks;
 mod lvm_write;
+mod mount_write;
 mod planning;
 mod transport;
 
@@ -47,6 +48,7 @@ pub use luks::{
     LuksProbeReport, LuksProvider, LuksValidationError,
 };
 pub use lvm_write::{LinearLvRequest, LvActivationRequest, LvmWriteError};
+pub use mount_write::{EXT4_HOST_MOUNT_OPTIONS, MountWriteError, is_ext4_host_mount};
 pub use planning::{
     DependencyReason, ExternalRequirement, FragmentAction, FragmentDependency, FragmentOrigin,
     LocalActionId, PlanFragment,
@@ -431,6 +433,39 @@ impl RegisteredBackend {
         match &self.access {
             LoadedBackendAccess::Library { library } => library.probe_nvme(),
             LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired),
+        }
+    }
+
+    /// Checks the complete helper-free Host mount ABI before checkpoint publication.
+    pub fn check_ext4_mount_support(&self) -> Result<(), MountWriteError> {
+        if !self
+            .manifest
+            .capabilities
+            .contains(&BackendCapability::Execute)
+        {
+            return Err(MountWriteError::ExecutionNotDeclared);
+        }
+        match &self.access {
+            LoadedBackendAccess::Library { library } => Ok(library.check_ext4_mount_support()?),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
+        }
+    }
+
+    /// Mounts ext4 once on retained block/directory descriptors with the fixed Host option profile.
+    /// Caller excludes outside source writers and target/namespace mutations through fresh verification.
+    pub fn mount_ext4(
+        &self,
+        source: &std::fs::File,
+        target: &std::fs::File,
+    ) -> Result<(), MountWriteError> {
+        use std::os::unix::fs::FileTypeExt;
+        self.check_ext4_mount_support()?;
+        if !source.metadata()?.file_type().is_block_device() || !target.metadata()?.is_dir() {
+            return Err(MountWriteError::Endpoint);
+        }
+        match &self.access {
+            LoadedBackendAccess::Library { library } => Ok(library.mount_ext4(source, target)?),
+            LoadedBackendAccess::Executable => Err(NativeProbeError::LibraryRequired.into()),
         }
     }
 

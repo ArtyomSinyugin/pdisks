@@ -134,3 +134,29 @@ void bd_fs_ext4_info_free(struct ExtInfo *info) {
 }
 /* Releases the sensitive native message together with its owned error prefix. */
 void g_error_free(struct Error *error) { assert(error && error_live-- == 1); free(error->message); free(error); }
+
+/* Private libmount ABI fixture; never invokes a syscall or a mount helper. */
+struct MountContext { int configured, source, target, fstype, options, called; };
+/* Allocates a new isolated mount context for readiness or invocation. */
+void *mnt_new_context(void) { return calloc(1, sizeof(struct MountContext)); }
+/* Releases exactly one fixture context. */
+void mnt_free_context(void *context) { free(context); }
+/* Checks fixed flags so fstab, helpers, mtab and read-only fallback cannot slip into the recipe. */
+int mnt_context_set_optsmode(void *context, int value) { assert(value == 4098); ((struct MountContext *)context)->configured++; return SCENARIO == 31 ? -1 : 0; }
+#define MOUNT_FLAG(name) int name(void *context, int value) { assert(value == 1); ((struct MountContext *)context)->configured++; return 0; }
+MOUNT_FLAG(mnt_context_disable_helpers)
+MOUNT_FLAG(mnt_context_disable_canonicalize)
+MOUNT_FLAG(mnt_context_disable_mtab)
+MOUNT_FLAG(mnt_context_enable_rwonly_mount)
+/* Checks descriptor addressing, never opening or changing either test file. */
+int mnt_context_set_source(void *context, const char *value) { assert(!strncmp(value, "/proc/self/fd/", 14)); ((struct MountContext *)context)->source++; return 0; }
+int mnt_context_set_target(void *context, const char *value) { assert(!strncmp(value, "/proc/self/fd/", 14) && value[strlen(value) - 1] == '/'); ((struct MountContext *)context)->target++; return 0; }
+int mnt_context_set_fstype(void *context, const char *value) { assert(!strcmp(value, "ext4")); ((struct MountContext *)context)->fstype++; return 0; }
+int mnt_context_set_options(void *context, const char *value) { assert(!strcmp(value, "rw,nosuid,nodev,noexec,relatime")); ((struct MountContext *)context)->options++; return 0; }
+/* Records one mock invocation, requiring all endpoint/policy setters first. */
+int mnt_context_mount(void *context) { struct MountContext *c = context; assert(c->configured == 5 && c->source == 1 && c->target == 1 && c->fstype == 1 && c->options == 1 && !c->called); c->called++; return SCENARIO == 32 ? -1 : 0; }
+/* Independent status fields exercise each post-call success requirement. */
+int mnt_context_get_status(void *context) { (void)context; return SCENARIO == 33 ? 0 : 1; }
+int mnt_context_syscall_called(void *context) { return SCENARIO == 34 ? 0 : ((struct MountContext *)context)->called; }
+int mnt_context_helper_executed(void *context) { (void)context; return SCENARIO == 35 ? 1 : 0; }
+int mnt_context_get_syscall_errno(void *context) { (void)context; return SCENARIO == 36 ? 5 : 0; }

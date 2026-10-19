@@ -19,6 +19,10 @@ mod btrfs;
 mod btrfs_blockdev;
 mod cryptsetup;
 mod devmapper;
+/// Shared inert native fixture for filesystem and mount unit ABI checks.
+#[cfg(test)]
+#[path = "../tests/support/ext4.rs"]
+mod ext4_fixture;
 mod fdisk;
 mod filesystem;
 mod filesystem_write;
@@ -76,6 +80,20 @@ impl LoadedLibrary {
             }
         }
         Some(loaded)
+    }
+
+    /// Checks every symbol and disables ambient configuration before a mount can be admitted.
+    pub(super) fn check_ext4_mount_support(&self) -> Result<(), NativeProbeError> {
+        libmount::check_mount_support(&self.handle)
+    }
+
+    /// Invokes the fixed ext4 recipe once; the caller owns the validated descriptors.
+    pub(super) fn mount_ext4(
+        &self,
+        source: &std::fs::File,
+        target: &std::fs::File,
+    ) -> Result<(), NativeProbeError> {
+        libmount::mount_ext4(&self.handle, source, target)
     }
 
     /// Reads `/proc/self/mountinfo` through libmount.

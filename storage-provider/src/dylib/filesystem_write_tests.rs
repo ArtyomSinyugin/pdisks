@@ -1,7 +1,6 @@
 //! Private ABI tests bypass only the real-block type gate and call a C fixture that never writes data.
 
-#[path = "../../tests/support/ext4.rs"]
-mod mock_ext4;
+use crate::dylib::ext4_fixture as mock_ext4;
 
 use super::*;
 use crate::LoadedBackendAccess;
