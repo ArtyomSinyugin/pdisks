@@ -13,6 +13,7 @@ pub use storage_runtime::incident::{
     IncidentAcknowledgmentPolicy, IncidentAssessment, IncidentInspection, IncidentReview,
 };
 mod sessions;
+pub mod wire;
 pub use error::{DisksGraphError, ErrorCode};
 pub use handles::{PlanId, RunId, SessionId};
 pub use plans::MAX_PLAN_JSON_BYTES;
