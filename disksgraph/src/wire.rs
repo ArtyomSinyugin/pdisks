@@ -97,6 +97,14 @@ pub enum Request {
     RunClose { run: RunId },
     /// Inspect under the configured host's ordinary incident lock.
     IncidentInspect {},
+    /// Retain the runtime's immutable incident inspection and explicit confirmation challenge.
+    IncidentReview {},
+    /// Consume a retained review only after exact conscious confirmation; safety remains host-owned.
+    IncidentAcknowledge {
+        review: Uuid,
+        run_id: Uuid,
+        token: Uuid,
+    },
 }
 
 impl Request {
@@ -111,6 +119,8 @@ impl Request {
                 | Self::ApplyBlocking { .. }
                 | Self::ApplyStart { .. }
                 | Self::IncidentInspect {}
+                | Self::IncidentReview {}
+                | Self::IncidentAcknowledge { .. }
         )
     }
 }
@@ -200,6 +210,8 @@ enum Review {
         /// Existing engine candidate retains its private source context checks.
         candidate: Box<RebasePreview>,
     },
+    /// The existing runtime owner binds exact marker, fresh observations and private root inode.
+    Incident(Box<IncidentReview>),
 }
 
 /// Owns exactly one ordinary facade; JSON cannot select another host or reconstruct a live run.
@@ -258,6 +270,15 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>
     }
     /// Delegates every implemented method to the instance-owned facade.
     pub fn call(&mut self, request: Request) -> Result<Value, ProtocolError> {
+        self.call_with_policy(request, &mut native::ReadOnlyPolicy)
+    }
+    /// Accepts independent incident safety evidence only from a trusted Rust host, never request JSON.
+    /// The default ABI/JSON entrypoint uses ReadOnlyPolicy; no confirmation token grants authorization.
+    pub fn call_with_policy(
+        &mut self,
+        request: Request,
+        policy: &mut impl IncidentAcknowledgmentPolicy,
+    ) -> Result<Value, ProtocolError> {
         if request.needs_live_host() && !self.live_host {
             return Err(ProtocolError::LiveUnavailable);
         }
@@ -370,6 +391,37 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>
                 Ok(Value::Null)
             }
             Request::IncidentInspect {} => serde_json::to_value(self.app.incident()?),
+            Request::IncidentReview {} => {
+                self.reserve_review()?;
+                if let Some(candidate) = self.app.review_incident()? {
+                    let review = Uuid::now_v7();
+                    let result = json!({"review":review,"incident":candidate.inspection(),"token":candidate.confirmation_token()});
+                    self.reviews
+                        .insert(review, Review::Incident(Box::new(candidate)));
+                    Ok(result)
+                } else {
+                    Ok(json!({"review":null,"incident":null}))
+                }
+            }
+            Request::IncidentAcknowledge {
+                review,
+                run_id,
+                token,
+            } => {
+                let Some(Review::Incident(candidate)) = self.reviews.get(&review) else {
+                    return Err(ProtocolError::UnknownReview);
+                };
+                if candidate.inspection().attempt.run_id != run_id
+                    || candidate.confirmation_token() != token
+                {
+                    return Err(ProtocolError::ReviewMismatch);
+                }
+                let Some(Review::Incident(candidate)) = self.reviews.remove(&review) else {
+                    return Err(ProtocolError::UnknownReview);
+                };
+                let incident = self.app.acknowledge_incident(*candidate, token, policy)?;
+                Ok(json!({"incident":incident,"acknowledged":true}))
+            }
         };
         value.map_err(|error| ProtocolError::Serialization(error.to_string()))
     }

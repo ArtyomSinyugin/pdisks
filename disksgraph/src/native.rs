@@ -36,6 +36,21 @@ impl AuthorizationContext for ReadOnlyPolicy {
     }
 }
 
+impl crate::IncidentAcknowledgmentPolicy for ReadOnlyPolicy {
+    /// A confirmation challenge and fresh graph cannot establish principal authority or backend quiescence.
+    fn check(
+        &mut self,
+        _: &crate::IncidentInspection,
+        _: &crate::IncidentInspection,
+    ) -> LiveCheckStatus {
+        LiveCheckStatus::Unknown {
+            required_evidence:
+                "trusted principal authorization, complete scope and native backend quiescence"
+                    .into(),
+        }
+    }
+}
+
 /// Defense in depth: this default application has no mutation route.
 pub struct DisabledDispatcher(BackendId);
 impl BackendDispatcher for DisabledDispatcher {
