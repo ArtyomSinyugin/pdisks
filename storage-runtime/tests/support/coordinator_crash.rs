@@ -113,3 +113,55 @@ fn coordinator_sigkill_preserves_checkpoint_at_durable_boundaries() -> Result<()
     }
     Ok(())
 }
+
+/// A pending marker must be rejected before any observation or admission request reaches the host.
+struct NoProbe;
+impl storage_runtime::host::RuntimeHost for NoProbe {
+    /// Entering a provider pass while a crash marker exists would violate the restart gate.
+    fn probe(&mut self) -> Result<ProbedObservation, storage_runtime::host::HostError> {
+        panic!("restart must inspect the checkpoint before probing");
+    }
+    /// A prior crash cannot be converted into an ordinary fresh admission attempt.
+    fn check_admission(
+        &mut self,
+        _: &ExecutionRun,
+        _: ActionId,
+        _: &ProbedObservation,
+        _: &storage_runtime::bindings::OutputBindings,
+        _: &storage_runtime::lease::ExecutionLease,
+    ) -> Result<storage_runtime::host::AdmissionDecision, storage_runtime::host::HostError> {
+        panic!("restart must not request admission");
+    }
+}
+
+/// Neither full-run nor single-action entry points resume effects after an actual coordinator death.
+#[test]
+fn coordinator_restart_blocks_before_probe_and_dispatch() -> Result<(), Box<dyn Error>> {
+    use storage_runtime::{coordinator::CoordinatorError, host::HostError};
+    let _process = isolate_processes();
+    for phase in ["armed", "running", "completed", "verified_before_clear"] {
+        let scratch = kill_at(phase)?;
+        let execution = admission::Scratch(scratch.0.join("execution"));
+        let bytes = fs::read(execution.0.join("active-attempt.json"))?;
+        let (state, frozen) = fixture()?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let fake = coordination::dispatcher(&execution, Rc::new(RefCell::new(state)));
+        let calls = fake.calls.clone();
+        let mut coordinator =
+            ExecutionCoordinator::new(ExecutionRoot::open(&execution.0)?, NoProbe, fake, &run);
+        assert!(matches!(
+            coordinator.execute_run(&mut run),
+            Err(CoordinatorError::Host(HostError::ActiveAttempt))
+        ));
+        assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Waiting);
+        assert!(matches!(
+            coordinator.execute_action(&mut run, ActionId::new(0), None),
+            Err(CoordinatorError::Host(HostError::ActiveAttempt))
+        ));
+        assert_eq!(calls.get(), 0);
+        assert!(!run.is_verified());
+        assert_eq!(fs::read(execution.0.join("active-attempt.json"))?, bytes);
+        assert!(ExecutionRoot::open(&execution.0)?.try_lock_host().is_ok());
+    }
+    Ok(())
+}
