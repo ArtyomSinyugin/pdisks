@@ -19,6 +19,7 @@ use thiserror::Error;
 mod action;
 mod contract;
 mod dylib;
+mod filesystem_write;
 mod logical;
 mod luks;
 mod lvm_write;
@@ -35,6 +36,7 @@ pub use contract::{
     NodeKindClass, Postcondition, PredictedEffect, ResourceAccess, ResourceAccessMode,
     RestartPolicy, canonicalize_contract, describe_action, verify_imported_contract,
 };
+pub use filesystem_write::{Ext4CreateRequest, FilesystemWriteError};
 pub use logical::{LogicalProvider, ProviderId, validate_provider_action};
 pub use luks::{
     CredentialRef, CryptsetupBackend, LuksAction, LuksObservation, LuksProbeFailure,
