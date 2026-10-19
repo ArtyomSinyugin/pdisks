@@ -6,18 +6,20 @@
 mod error;
 mod handles;
 mod plans;
+mod runs;
+pub use runs::RunSnapshot;
 mod sessions;
 pub use error::{DisksGraphError, ErrorCode};
 pub use handles::{PlanId, RunId, SessionId};
 pub use plans::MAX_PLAN_JSON_BYTES;
 pub use storage_core::model;
 pub use storage_engine::editing::{
-    DraftDocument, DraftRevision, EditReceipt, FrozenPlan, OperationId, PlanEdit, PlanRequest,
-    PreviewDocument, PreviewState, PreviewStatus, RebasePreview,
+    DraftDocument, DraftRevision, EditReceipt, FrozenPlan, OperationActions, OperationId, PlanEdit,
+    PlanRequest, PreviewDocument, PreviewState, PreviewStatus, RebasePreview,
 };
 pub use storage_engine::{
     ActionId, ActionRunState, ActionStatus, BackendOutcome, EventsPage, LiveCheckStatus,
-    LiveObservation, ObservationReference, PlanDocument, ProtectedScope, RunSnapshot,
+    LiveObservation, ObservationReference, PlanDocument, ProtectedScope,
 };
 
 /// Explicit trusted host configuration; imported plans cannot choose these providers or policies.
@@ -81,6 +83,8 @@ pub struct DisksGraph<H, D> {
     sessions: HashMap<SessionId, PlanSession>,
     /// Imported documents remain historical data, independently of editing sessions and live runs.
     plans: HashMap<PlanId, PlanDocument>,
+    /// Completed synchronous attempts remain inspectable until explicitly released.
+    runs: HashMap<RunId, runs::RunRecord>,
 }
 impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
     /// Validates an existing private execution directory; never installs a permissive default policy.
@@ -91,6 +95,7 @@ impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
             dispatcher,
             sessions: HashMap::new(),
             plans: HashMap::new(),
+            runs: HashMap::new(),
         })
     }
     /// Performs an actual provider pass without exposing a forecast as current state.

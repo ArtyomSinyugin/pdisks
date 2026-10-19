@@ -64,6 +64,8 @@ pub struct DisksGraphError {
     pub code: ErrorCode,
     /// Human-readable context copied from the typed failure.
     pub message: String,
+    /// Retained execution attempt, including failures before dispatch; absent if no run was created.
+    pub run_id: Option<crate::RunId>,
 }
 impl DisksGraphError {
     /// Constructs an application diagnostic at an already classified trust boundary.
@@ -71,6 +73,7 @@ impl DisksGraphError {
         Self {
             code,
             message: error.to_string(),
+            run_id: None,
         }
     }
 }

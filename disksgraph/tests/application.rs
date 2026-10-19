@@ -209,3 +209,96 @@ fn facade_plan_import_revalidates_data_and_owns_immutable_handles() -> Result<()
     assert_eq!(writes.get(), 0);
     Ok(())
 }
+
+/// The facade obtains fresh final evidence, retains errors and never turns imported data into approval.
+#[test]
+fn facade_apply_retains_actual_runs_errors_and_source_map_boundaries() -> Result<(), Box<dyn Error>>
+{
+    use disksgraph::{
+        PlanEdit, PlanRequest,
+        model::{Bytes, LvmLvKind, NodeKind},
+    };
+    let (scratch, mut app, probes, writes) = support::application()?;
+    let session = app.create_session()?;
+    let empty = app.freeze(session, app.revision(session)?)?;
+    let run = app.apply_frozen(&empty)?;
+    let snapshot = app.run_snapshot(run)?;
+    assert!(snapshot.execution.finished && snapshot.execution.verified);
+    assert!(snapshot.execution.goal_verification.is_some());
+    assert_eq!(probes.get(), 3);
+    let page = app.events(run, 0)?;
+    assert!(!page.gap && !page.events.is_empty());
+    assert_eq!(app.events(run, page.next_sequence)?.events.len(), 0);
+    assert_eq!(
+        app.events(run, u64::MAX).err().ok_or("future cursor")?.code,
+        ErrorCode::InvalidEventCursor
+    );
+    let baseline = app.export_draft(session)?.baseline;
+    let vg = baseline
+        .snapshot
+        .graph
+        .nodes()
+        .find_map(|(id, node)| matches!(node.kind.kind, NodeKind::LvmVg { .. }).then_some(*id))
+        .ok_or("VG")?;
+    app.edit(
+        session,
+        app.revision(session)?,
+        PlanEdit::Add(PlanRequest::CreateLv {
+            vg,
+            name: "data".into(),
+            size: Bytes::new(16 * 1024 * 1024),
+            layout: LvmLvKind::Linear,
+            activate: true,
+        }),
+    )?;
+    let frozen = app.freeze(session, app.revision(session)?)?;
+    let error = app
+        .apply_frozen(&frozen)
+        .err()
+        .ok_or("unknown native support must stop")?;
+    assert_eq!(error.code, ErrorCode::PlanUnavailable);
+    let failed = error
+        .run_id
+        .ok_or("failed attempt must remain inspectable")?;
+    let snapshot = app.run_snapshot(failed)?;
+    assert!(snapshot.execution.finished && !snapshot.execution.verified);
+    assert_eq!(
+        snapshot.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::PlanUnavailable)
+    );
+    assert_eq!(snapshot.source_map, frozen.source_map());
+    assert!(!snapshot.source_map.is_empty());
+    assert!(app.events(failed, 0)?.events.is_empty());
+    let imported = app.import_plan(frozen.document().clone())?;
+    let failed = app
+        .apply_plan(imported)
+        .err()
+        .ok_or("import grants no approval")?
+        .run_id
+        .ok_or("retained imported attempt")?;
+    assert!(app.run_snapshot(failed)?.source_map.is_empty());
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    let (_other_root, other, _, _) = support::application()?;
+    assert_eq!(
+        other.run_snapshot(run).err().ok_or("foreign run")?.code,
+        ErrorCode::UnknownRun
+    );
+    assert_eq!(
+        other.events(run, 0).err().ok_or("foreign run events")?.code,
+        ErrorCode::UnknownRun
+    );
+    std::fs::write(scratch.0.join("active-attempt.json"), b"corrupt incident")?;
+    let failure = app
+        .apply_frozen(&empty)
+        .err()
+        .ok_or("checkpoint blocks an empty plan too")?;
+    assert_eq!(failure.code, ErrorCode::CheckpointBlocked);
+    let failed = failure.run_id.ok_or("pre-dispatch failure retained")?;
+    assert!(app.run_snapshot(failed)?.error.is_some());
+    assert_eq!(
+        std::fs::read(scratch.0.join("active-attempt.json"))?,
+        b"corrupt incident"
+    );
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}

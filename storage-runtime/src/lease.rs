@@ -49,6 +49,13 @@ pub struct ExecutionRoot {
 }
 
 impl ExecutionRoot {
+    /// Retains the same private root inode for a synchronous coordinator without reopening its pathname.
+    pub fn try_clone(&self) -> Result<Self, LeaseError> {
+        Ok(Self {
+            directory: self.directory.try_clone()?,
+        })
+    }
+
     /// Opens a caller-configured directory and rejects public or foreign-owned roots.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LeaseError> {
         let directory = openat(
