@@ -2,6 +2,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use storage_core::model::{Bytes, FilesystemKind, LvmLvKind, MountEntry, NodeId};
 use thiserror::Error;
 use uuid::Uuid;
@@ -18,7 +19,8 @@ use super::{
 pub const DEFAULT_HISTORY_LIMIT: usize = 64;
 
 /// One user command; valid edits may deliberately leave an invalid, editable plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlanEdit {
     /// Appends a request and reserves any created node exactly once.
     Add(PlanRequest),
@@ -48,7 +50,7 @@ pub enum PlanEdit {
 }
 
 /// Confirmation of draft publication, not confirmation of execution eligibility.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EditReceipt {
     /// New revision shared by the draft and its current preview.
     pub revision: DraftRevision,

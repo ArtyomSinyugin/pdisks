@@ -50,6 +50,11 @@ pub enum Command {
     },
     /// Inspect a persistent unresolved attempt without acknowledging or retrying it.
     Incident,
+    /// Edit one living session using JSONL stdin and explicit save commands.
+    Edit {
+        /// Existing draft to open; history lasts only until this invocation exits.
+        draft: PathBuf,
+    },
 }
 
 impl Command {
@@ -137,6 +142,9 @@ impl Invocation {
                 }
             }
             ["incident", "show"] => Command::Incident,
+            ["plan", "edit"] => Command::Edit {
+                draft: take(&mut flags, "--draft")?,
+            },
             _ => return Err(Error::Usage("unknown command; use --help".into())),
         };
         if command.needs_probe()
@@ -249,6 +257,9 @@ pub fn execute<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDis
             Ok(serde_json::json!({"run": snapshot, "event_output_error": output_error}))
         }
         Command::Incident => Ok(serde_json::json!({"incident": app.incident()?})),
+        Command::Edit { draft } => {
+            crate::repl::edit(app, draft, &mut std::io::stdin().lock(), events)
+        }
     }
 }
 

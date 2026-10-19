@@ -4,6 +4,7 @@
 
 mod commands;
 pub mod files;
+pub mod repl;
 pub use commands::{Command, Invocation, execute};
 
 /// Structured command failures; application diagnostics retain their original stable code.

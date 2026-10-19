@@ -10,6 +10,58 @@ use disksgraph::{
 };
 use std::error::Error;
 
+/// Undo/redo survive only within one REPL, and parsing errors never discard accepted requests.
+#[test]
+fn repl_keeps_history_and_requires_explicit_save() -> Result<(), Box<dyn Error>> {
+    let (scratch, mut app, probes, writes) = support::application()?;
+    let draft = scratch.0.join("repl.json");
+    execute(
+        &mut app,
+        &Command::New {
+            output: draft.clone(),
+        },
+    )?;
+    let original = files::read_document(&draft)?;
+    let saved = DraftDocument::from_json(&original)?;
+    let vg = *saved.baseline.snapshot.graph.nodes().next().ok_or("VG")?.0;
+    let request = serde_json::json!({"command":"edit", "edit": {"add": PlanRequest::CreateLv {
+        vg, name: "repl-data".into(), size: Bytes::new(16 * 1024 * 1024),
+        layout: LvmLvKind::Linear, activate: false,
+    }}});
+    let commands = format!(
+        "{request}\n{{\"command\":\"preview\",\"unexpected\":true}}\n{{\"command\":\"undo\"}}\n{{\"command\":\"preview\"}}\n{{\"command\":\"redo\"}}\n{{\"command\":\"save\"}}\n{{\"command\":\"quit\"}}\n"
+    );
+    let mut output = Vec::new();
+    let result = dg_cli::repl::edit(&mut app, &draft, &mut commands.as_bytes(), &mut output)?;
+    assert_eq!(result["saved"], true);
+    let replies: Vec<serde_json::Value> = String::from_utf8(output)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(replies[1]["error"]["kind"], "document");
+    assert_eq!(
+        replies[3]["result"]["operations"]
+            .as_array()
+            .ok_or("operations")?
+            .len(),
+        0
+    );
+    let saved = DraftDocument::from_json(&files::read_document(&draft)?)?;
+    assert_eq!(saved.draft.operations.len(), 1);
+    let bytes = files::read_document(&draft)?;
+    let result = dg_cli::repl::edit(
+        &mut app,
+        &draft,
+        &mut b"{\"command\":\"edit\",\"edit\":\"clear\"}\n".as_slice(),
+        &mut Vec::new(),
+    )?;
+    assert_eq!(result["saved"], false);
+    assert_eq!(files::read_document(&draft)?, bytes);
+    assert_eq!(probes.get(), 1);
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
+
 /// Discards the unused event stream for commands that only inspect or edit saved inputs.
 fn execute(
     app: &mut support::Application,
