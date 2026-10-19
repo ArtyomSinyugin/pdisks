@@ -939,3 +939,84 @@ fn routed_filesystem_backend_is_fixed_before_any_plan_write() -> Result<(), Box<
     }
     Ok(())
 }
+
+/// A supported two-registration native prefix still needs scope policies; unsupported mount stops before LVM.
+#[test]
+fn native_storage_routes_exact_registrations_and_refuses_incomplete_plans()
+-> Result<(), Box<dyn Error>> {
+    use storage_core::model::{MountContext, MountEntry, MountSource};
+    use storage_runtime::{
+        capability::{BackendCapabilityCheck, OperationAvailability},
+        coordinator::CoordinatorError,
+        dispatcher::BackendDispatcher,
+        host::LinuxLiveHost,
+        native_storage::NativeStorageAdapter,
+    };
+    for add_mount in [false, true] {
+        let lvm = mock_lvm::Fixture::new(0)?;
+        let fs = mock_ext4::Fixture::new(0, true)?;
+        let lvm_backend = lvm.registry.backends().next().ok_or("LVM backend")?;
+        let fs_backend = fs.registry.backends().next().ok_or("FS backend")?;
+        let native = NativeStorageAdapter::new(lvm_backend, fs_backend)?;
+        let before = lvm_backend.probe_lvm()?;
+        let (state, _) = fixture()?;
+        let baseline =
+            HistoricalBaseline::from_lvm_observations(state.current.clone(), &state.lvm_vgs)?;
+        let mut session = PlanSession::new(baseline)?;
+        let lv = session
+            .add_lv(
+                session.revision(),
+                state.lvm_vgs[0].node,
+                "data",
+                Bytes::new(16 * 1024 * 1024),
+            )?
+            .created_node
+            .ok_or("LV")?;
+        let filesystem = session
+            .add_filesystem(session.revision(), lv, FilesystemKind::Ext4)?
+            .created_node
+            .ok_or("FS")?;
+        if add_mount {
+            session.mount(
+                session.revision(),
+                MountEntry {
+                    source: MountSource::Filesystem(filesystem),
+                    target: "/data".into(),
+                    options: vec!["rw".into()],
+                    context: MountContext::Host,
+                },
+            )?;
+        }
+        let frozen = session.freeze(session.revision())?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let observation = ProbedObservation::collect(&probe(Rc::new(RefCell::new(state.clone()))))?;
+        for (index, expected) in [(0, lvm_backend), (1, lvm_backend), (2, fs_backend)] {
+            let operation = &run.context().plan.actions()[index].operation;
+            assert_eq!(native.backend_for(operation), &expected.manifest().id);
+            assert_eq!(
+                native.availability(operation, observation.observation()),
+                OperationAvailability::Available(expected.manifest().id.clone())
+            );
+        }
+        let scratch = admission::Scratch::new()?;
+        let host = LinuxLiveHost::new(
+            probe(Rc::new(RefCell::new(state))),
+            native,
+            admission::authorization(&run)?,
+        );
+        let mut coordinator =
+            ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, native, &run);
+        let result = coordinator.execute_run(&mut run);
+        if add_mount {
+            assert!(matches!(result, Err(CoordinatorError::PlanUnavailable(_))));
+        } else {
+            assert!(!result?.verified);
+            assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Checking);
+        }
+        let after = lvm_backend.probe_lvm()?;
+        assert_eq!(before.lvs.len(), after.lvs.len());
+        assert_eq!(before.vgs[0].free, after.vgs[0].free);
+        assert!(!scratch.0.join("active-attempt.json").exists());
+    }
+    Ok(())
+}
