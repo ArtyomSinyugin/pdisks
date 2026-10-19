@@ -3,9 +3,11 @@
 use crate::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use storage_runtime::{
     authorization::AuthorizationContext, capability::BackendCapabilityCheck, host::LinuxLiveHost,
 };
+use uuid::Uuid;
 
 /// Application protocol version; owner transports may implement the job lifecycle methods.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -52,6 +54,19 @@ pub enum Request {
         session: SessionId,
         revision: DraftRevision,
     },
+    /// Prepare fresh translated inputs without modifying the active session.
+    SessionPrepareRebase {
+        session: SessionId,
+        revision: DraftRevision,
+    },
+    /// Consume an instance-owned reviewed candidate at its expected source revision.
+    SessionAcceptRebase {
+        session: SessionId,
+        revision: DraftRevision,
+        review: Uuid,
+    },
+    /// Discard one process-owned review without changing drafts, runs or checkpoints.
+    ReviewClose { review: Uuid },
     /// Release only the owning facade's editor and history.
     SessionClose { session: SessionId },
     /// Reanalyse and retain a bounded immutable plan.
@@ -91,6 +106,7 @@ impl Request {
             self,
             Self::Probe {}
                 | Self::SessionCreate {}
+                | Self::SessionPrepareRebase { .. }
                 | Self::Capabilities { .. }
                 | Self::ApplyBlocking { .. }
                 | Self::ApplyStart { .. }
@@ -128,6 +144,12 @@ pub enum ProtocolError {
     /// The synchronous adapter has no background owner, or the requested interruption is unsupported.
     #[error("operation requires an owner transport or is unsupported: {0}")]
     UnsupportedOperation(String),
+    /// Review was closed, has another kind or belongs to another protocol owner.
+    #[error("review is not owned by this context")]
+    UnknownReview,
+    /// An existing review cannot confirm another session, revision, run or challenge.
+    #[error("request does not match the retained review")]
+    ReviewMismatch,
     /// The sole facade supplies detailed stable codes and instance ownership checks.
     #[error(transparent)]
     Application(#[from] DisksGraphError),
@@ -169,12 +191,25 @@ pub fn encode_reply(result: Result<Value, ProtocolError>) -> String {
     })
 }
 
+/// Immutable process-owned candidates; returned JSON is display data, never the trusted object.
+enum Review {
+    /// Only the exact owning facade session may accept this translation.
+    Rebase {
+        /// Facade handle, independent of the imported document's source session UUID.
+        session: SessionId,
+        /// Existing engine candidate retains its private source context checks.
+        candidate: Box<RebasePreview>,
+    },
+}
+
 /// Owns exactly one ordinary facade; JSON cannot select another host or reconstruct a live run.
 pub struct Protocol<H, D> {
     /// The same editor, plan registry, coordinator and evidence retention as direct Rust callers.
     app: DisksGraph<H, D>,
     /// Explicit host configuration, not an attestation of coverage or authorization.
     live_host: bool,
+    /// Combined bounded registry; releasing a context discards candidates without accepting them.
+    reviews: HashMap<Uuid, Review>,
 }
 
 impl<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>
@@ -185,7 +220,11 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>
         app: DisksGraph<LinuxLiveHost<'_, C, A>, D>,
         live_host: bool,
     ) -> Protocol<LinuxLiveHost<'_, C, A>, D> {
-        Protocol { app, live_host }
+        Protocol {
+            app,
+            live_host,
+            reviews: HashMap::new(),
+        }
     }
     /// Decodes and dispatches one bounded message; neither imported JSON nor a success envelope grants permission.
     pub fn call_json(&mut self, input: &str) -> String {
@@ -207,6 +246,15 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>
         };
         serde_json::to_value(self.app.run_snapshot(run)?)
             .map_err(|error| ProtocolError::Serialization(error.to_string()))
+    }
+    /// Bounds pending reviews before native work; failed allocation cannot consume a provider pass.
+    fn reserve_review(&mut self) -> Result<(), ProtocolError> {
+        if self.reviews.len() >= MAX_APPLICATION_OBJECTS {
+            return Err(ProtocolError::ResourceLimit);
+        }
+        self.reviews
+            .try_reserve(1)
+            .map_err(|_| ProtocolError::ResourceLimit)
     }
     /// Delegates every implemented method to the instance-owned facade.
     pub fn call(&mut self, request: Request) -> Result<Value, ProtocolError> {
@@ -239,8 +287,54 @@ impl<C: BackendCapabilityCheck, A: AuthorizationContext, D: BackendDispatcher>
             Request::SessionFreeze { session, revision } => {
                 serde_json::to_value(self.app.freeze(session, revision)?.document())
             }
+            Request::SessionPrepareRebase { session, revision } => {
+                self.reserve_review()?;
+                let candidate = self.app.prepare_rebase(session, revision)?;
+                let review = Uuid::now_v7();
+                let result = json!({
+                    "review":review, "source_revision":candidate.source_revision(),
+                    "baseline":candidate.target_baseline(), "draft":candidate.draft(),
+                    "correlations":candidate.correlations(), "status":candidate.preview().status(),
+                    "diagnostics":candidate.preview().diagnostics(),
+                });
+                self.reviews.insert(
+                    review,
+                    Review::Rebase {
+                        session,
+                        candidate: Box::new(candidate),
+                    },
+                );
+                Ok(result)
+            }
+            Request::SessionAcceptRebase {
+                session,
+                revision,
+                review,
+            } => {
+                let Some(Review::Rebase {
+                    session: owner,
+                    candidate,
+                }) = self.reviews.get(&review)
+                else {
+                    return Err(ProtocolError::UnknownReview);
+                };
+                if *owner != session || candidate.source_revision() != revision {
+                    return Err(ProtocolError::ReviewMismatch);
+                }
+                let Some(Review::Rebase { candidate, .. }) = self.reviews.remove(&review) else {
+                    return Err(ProtocolError::UnknownReview);
+                };
+                Ok(json!({"revision":self.app.accept_rebase(session, revision, *candidate)?}))
+            }
+            Request::ReviewClose { review } => {
+                self.reviews
+                    .remove(&review)
+                    .ok_or(ProtocolError::UnknownReview)?;
+                Ok(Value::Null)
+            }
             Request::SessionClose { session } => {
                 self.app.close_session(session)?;
+                self.reviews.retain(|_, review| !matches!(review, Review::Rebase { session: owner, .. } if *owner == session));
                 Ok(Value::Null)
             }
             Request::PlanImport { document } => {

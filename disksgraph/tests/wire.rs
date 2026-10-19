@@ -186,3 +186,172 @@ fn job_requests_require_an_owner_and_observed_apply_preserves_final_evidence()
     assert_eq!(writes.get(), 0);
     Ok(())
 }
+
+/// Prepared JSON cannot replace the private candidate, foreign/stale handles cannot rebase a session.
+#[test]
+fn rebase_reviews_are_owned_single_use_and_revision_checked() -> Result<(), Box<dyn Error>> {
+    let (_scratch, app, probes, writes) = support::application()?;
+    let mut protocol = Protocol::new(app, true);
+    let session = call(&mut protocol, "session_create", json!({}))?["result"]["session"].clone();
+    let original =
+        call(&mut protocol, "session_export", json!({"session":session}))?["result"].clone();
+    let reviewed = call(
+        &mut protocol,
+        "session_prepare_rebase",
+        json!({"session":session,"revision":0}),
+    )?;
+    let review = reviewed["result"]["review"].clone();
+    assert!(review.is_string(), "{reviewed}");
+    assert_eq!(
+        call(&mut protocol, "session_export", json!({"session":session}))?["result"],
+        original
+    );
+    assert!(reviewed["result"]["baseline"]["snapshot"].is_object());
+    assert!(reviewed["result"]["draft"].is_object());
+    assert!(reviewed["result"]["correlations"].is_array());
+    let other =
+        call(&mut protocol, "session_import", json!({"draft":original}))?["result"]["session"]
+            .clone();
+    assert_eq!(
+        call(
+            &mut protocol,
+            "session_accept_rebase",
+            json!({"session":other,"revision":0,"review":review})
+        )?["error"]["code"],
+        "review_mismatch"
+    );
+    assert_eq!(
+        call(
+            &mut protocol,
+            "session_accept_rebase",
+            json!({"session":session,"revision":1,"review":review})
+        )?["error"]["code"],
+        "review_mismatch"
+    );
+    assert_eq!(
+        call(
+            &mut protocol,
+            "session_accept_rebase",
+            json!({"session":session,"revision":0,"review":review,"candidate":reviewed["result"]})
+        )?["error"]["code"],
+        "invalid_request"
+    );
+    let (_foreign_root, app, _, _) = support::application()?;
+    let mut foreign = Protocol::new(app, true);
+    assert_eq!(
+        call(&mut foreign, "review_close", json!({"review":review}))?["error"]["code"],
+        "unknown_review"
+    );
+    assert_eq!(
+        call(
+            &mut protocol,
+            "session_accept_rebase",
+            json!({"session":session,"revision":0,"review":review})
+        )?["result"]["revision"],
+        1
+    );
+    assert_eq!(
+        call(&mut protocol, "session_export", json!({"session":session}))?["result"]["baseline"],
+        reviewed["result"]["baseline"]
+    );
+    assert_eq!(
+        call(&mut protocol, "review_close", json!({"review":review}))?["error"]["code"],
+        "unknown_review"
+    );
+    let stale = call(
+        &mut protocol,
+        "session_prepare_rebase",
+        json!({"session":session,"revision":1}),
+    )?["result"]["review"]
+        .clone();
+    assert_eq!(
+        call(
+            &mut protocol,
+            "session_edit",
+            json!({"session":session,"revision":1,"edit":disksgraph::PlanEdit::Clear}),
+        )?["result"]["revision"],
+        2
+    );
+    let rejected = call(
+        &mut protocol,
+        "session_accept_rebase",
+        json!({"session":session,"revision":1,"review":stale}),
+    )?;
+    assert_eq!(
+        rejected["error"]["detail"]["code"], "revision_conflict",
+        "{rejected}"
+    );
+    assert_eq!(
+        call(&mut protocol, "review_close", json!({"review":stale}))?["error"]["code"],
+        "unknown_review"
+    );
+    let before = probes.get();
+    assert_eq!(
+        call(
+            &mut protocol,
+            "session_prepare_rebase",
+            json!({"session":session,"revision":1})
+        )?["error"]["detail"]["code"],
+        "revision_conflict"
+    );
+    assert_eq!(probes.get(), before);
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
+
+/// Review capacity is checked before probe; discard and session close release only retained memory.
+#[test]
+fn review_capacity_rejects_before_probe_and_session_close_releases_it() -> Result<(), Box<dyn Error>>
+{
+    let (_scratch, app, probes, writes) = support::application()?;
+    let mut protocol = Protocol::new(app, true);
+    let session = call(&mut protocol, "session_create", json!({}))?["result"]["session"].clone();
+    let mut first = Value::Null;
+    for _ in 0..disksgraph::MAX_APPLICATION_OBJECTS {
+        first = call(
+            &mut protocol,
+            "session_prepare_rebase",
+            json!({"session":session,"revision":0}),
+        )?["result"]["review"]
+            .clone();
+        assert!(first.is_string());
+    }
+    let before = probes.get();
+    assert_eq!(
+        call(
+            &mut protocol,
+            "session_prepare_rebase",
+            json!({"session":session,"revision":0})
+        )?["error"]["code"],
+        "resource_limit"
+    );
+    assert_eq!(probes.get(), before);
+    assert!(
+        call(&mut protocol, "review_close", json!({"review":first}))?
+            .get("error")
+            .is_none()
+    );
+    let replacement = call(
+        &mut protocol,
+        "session_prepare_rebase",
+        json!({"session":session,"revision":0}),
+    )?["result"]["review"]
+        .clone();
+    assert_ne!(replacement, first);
+    call(&mut protocol, "session_close", json!({"session":session}))?;
+    assert_eq!(
+        call(&mut protocol, "review_close", json!({"review":replacement}))?["error"]["code"],
+        "unknown_review"
+    );
+    let session = call(&mut protocol, "session_create", json!({}))?["result"]["session"].clone();
+    assert!(
+        call(
+            &mut protocol,
+            "session_prepare_rebase",
+            json!({"session":session,"revision":0})
+        )?["result"]["review"]
+            .is_string()
+    );
+    assert_eq!(writes.get(), 0);
+    Ok(())
+}
