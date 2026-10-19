@@ -1020,3 +1020,116 @@ fn native_storage_routes_exact_registrations_and_refuses_incomplete_plans()
     }
     Ok(())
 }
+
+/// Uses synthetic LV mutations and the actual native FS adapter to test its endpoint failure boundary.
+struct GuardedFilesystemDispatcher<'backend> {
+    /// Existing in-memory LV recipe with its own exact checkpoint assertions.
+    lvm: coordination::FakeDispatcher,
+    /// Real Rust-to-C adapter pointing exclusively at the private C fixture.
+    filesystem: storage_runtime::native_ext4::NativeExt4Adapter<'backend>,
+    /// Records attempts to enter filesystem dispatch, without claiming a native mkfs call happened.
+    filesystem_attempts: Rc<std::cell::Cell<usize>>,
+}
+impl storage_runtime::dispatcher::BackendDispatcher for GuardedFilesystemDispatcher<'_> {
+    /// Retains the original LVM route as the primary single-backend identity.
+    fn backend_id(&self) -> &BackendId {
+        &self.lvm.backend
+    }
+    /// Selects the native FS registration before admission; LVM still uses recorded state.
+    fn backend_for(&self, operation: &storage_provider::ProviderAction) -> &BackendId {
+        if matches!(operation, storage_provider::ProviderAction::Filesystem(_)) {
+            storage_runtime::dispatcher::BackendDispatcher::backend_id(&self.filesystem)
+        } else {
+            &self.lvm.backend
+        }
+    }
+    /// The native FS adapter must refuse these intentionally synthetic block facts before its C mutator.
+    fn execute(
+        &mut self,
+        action: &storage_runtime::targets::ResolvedAction,
+        progress: &mut dyn FnMut(String) -> Result<(), storage_engine::ExecutionRunError>,
+    ) -> Result<
+        storage_runtime::dispatcher::ExecutionReceipt,
+        storage_runtime::dispatcher::DispatchError,
+    > {
+        use storage_runtime::{checkpoint::ActiveAttempt, dispatcher::DispatchError};
+        if matches!(
+            action.operation(),
+            storage_provider::ProviderAction::Filesystem(_)
+        ) {
+            let bytes = std::fs::read(self.lvm.root.join("active-attempt.json"))
+                .map_err(|error| DispatchError::Adapter(error.to_string()))?;
+            let attempt = ActiveAttempt::from_bytes(&bytes)
+                .map_err(|error| DispatchError::Adapter(error.to_string()))?;
+            assert_eq!(&attempt.backend_id, action.backend());
+            assert_eq!(attempt.targets, action.fingerprints());
+            self.filesystem_attempts
+                .set(self.filesystem_attempts.get() + 1);
+            self.filesystem.execute(action, progress)
+        } else {
+            self.lvm.execute(action, progress)
+        }
+    }
+}
+
+/// Descriptor failure after arm stays uncertain and cannot adopt recorded facts as a native device.
+#[test]
+fn native_ext4_descriptor_failure_preserves_checkpoint_and_forbids_retry()
+-> Result<(), Box<dyn Error>> {
+    use storage_runtime::{
+        coordinator::CoordinatorError, dispatcher::BackendDispatcher, host::LinuxLiveHost,
+        native_ext4::NativeExt4Adapter,
+    };
+    let native = mock_ext4::Fixture::new(0, true)?;
+    let backend = native.registry.backends().next().ok_or("FS backend")?;
+    let adapter = NativeExt4Adapter::new(backend)?;
+    let (state, frozen, backing) = filesystem_plan()?;
+    let state = Rc::new(RefCell::new(state));
+    let scratch = admission::Scratch::new()?;
+    let mut run = ExecutionRun::new(frozen.document())?;
+    let mut lvm = coordination::dispatcher(&scratch, state.clone());
+    lvm.created_uuid = Some("created-lv".into());
+    let lv_calls = lvm.calls.clone();
+    let attempts = Rc::new(std::cell::Cell::new(0));
+    let fs_backend = adapter.backend_id().clone();
+    let host = LinuxLiveHost::new(
+        probe(state.clone()),
+        RoutedPolicy {
+            filesystem_backend: fs_backend.clone(),
+        },
+        RoutedApproval::new(&run, backing, fs_backend.clone())?,
+    );
+    let dispatcher = GuardedFilesystemDispatcher {
+        lvm,
+        filesystem: adapter,
+        filesystem_attempts: attempts.clone(),
+    };
+    let mut coordinator =
+        ExecutionCoordinator::new(ExecutionRoot::open(&scratch.0)?, host, dispatcher, &run);
+    assert!(!coordinator.execute_run(&mut run)?.verified);
+    assert_eq!(lv_calls.get(), 2);
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(run.state(ActionId::new(2))?, ActionRunState::OutcomeUnknown);
+    assert_eq!(coordinator.bindings().len(), 1);
+    let bytes = std::fs::read(scratch.0.join("active-attempt.json"))?;
+    let attempt = storage_runtime::checkpoint::ActiveAttempt::from_bytes(&bytes)?;
+    assert_eq!(attempt.backend_id, fs_backend);
+    assert_eq!(attempt.action_id, ActionId::new(2));
+    assert!(matches!(
+        coordinator.execute_run(&mut run),
+        Err(CoordinatorError::Stopped)
+    ));
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(std::fs::read(scratch.0.join("active-attempt.json"))?, bytes);
+    let incident = storage_runtime::incident::inspect_incident(
+        &ExecutionRoot::open(&scratch.0)?,
+        &probe(state),
+    )?
+    .ok_or("incident")?;
+    assert_eq!(
+        incident.assessment,
+        storage_runtime::incident::IncidentAssessment::Indeterminate
+    );
+    assert_eq!(incident.attempt.backend_id, attempt.backend_id);
+    Ok(())
+}
