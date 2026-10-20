@@ -2,8 +2,6 @@
 
 //! Native CLI entry point; its manifest configures reads, never execution authorization.
 
-mod native;
-
 use dg_cli::{Invocation, result_exit_code};
 use std::{
     io::{self, Write},
@@ -18,7 +16,7 @@ fn main() -> ExitCode {
         let mut output = stdout.lock();
         let result = writeln!(
             output,
-            "dg-cli probe --manifest FILE --root PRIVATE_DIR\ndg-cli plan new --manifest FILE --root PRIVATE_DIR --output DRAFT\ndg-cli plan add --root PRIVATE_DIR --draft DRAFT --request REQUEST --output DRAFT\ndg-cli plan preview --root PRIVATE_DIR --draft DRAFT\ndg-cli plan freeze --root PRIVATE_DIR --draft DRAFT --output PLAN\ndg-cli plan edit --root PRIVATE_DIR --draft DRAFT [--manifest FILE]\ndg-cli plan apply --manifest FILE --root PRIVATE_DIR --file PLAN [--events jsonl]\ndg-cli incident show --manifest FILE --root PRIVATE_DIR\ndg-cli incident acknowledge --manifest FILE --root PRIVATE_DIR\nAll results are JSON. The execution root must already exist with mode 0700.\nSaved-draft commands do not probe or refresh the baseline.\nNative writes are unconfigured and fail closed. Events are flushed live during blocking execution."
+            "dg-cli probe --manifest FILE --root PRIVATE_DIR\ndg-cli plan new --manifest FILE --root PRIVATE_DIR --output DRAFT\ndg-cli plan add --root PRIVATE_DIR --draft DRAFT --request REQUEST --output DRAFT\ndg-cli plan preview --root PRIVATE_DIR --draft DRAFT\ndg-cli plan freeze --root PRIVATE_DIR --draft DRAFT --output PLAN\ndg-cli plan edit --root PRIVATE_DIR --draft DRAFT [--manifest FILE]\ndg-cli plan apply --manifest FILE --root PRIVATE_DIR --file PLAN [--events jsonl]\ndg-cli incident show --manifest FILE --root PRIVATE_DIR\ndg-cli incident acknowledge --manifest FILE --root PRIVATE_DIR\nAll results are JSON. The execution root must already exist with mode 0700.\nSaved-draft commands do not probe or refresh the baseline.\nNative apply requires root, execute-enabled backends and exact plan confirmation. Events are flushed live during blocking execution."
         );
         return if result.and_then(|_| output.flush()).is_ok() {
             ExitCode::SUCCESS
@@ -26,7 +24,7 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         };
     }
-    let result = Invocation::parse(args).and_then(|invocation| native::run(&invocation));
+    let result = Invocation::parse(args).and_then(|invocation| dg_cli::native::run(&invocation));
     let (value, exit) = match result {
         Ok(value) => {
             let exit = result_exit_code(&value);

@@ -7,6 +7,7 @@ mod commands;
 pub mod confirmation;
 pub mod files;
 pub mod incident;
+pub mod native;
 pub mod repl;
 pub use commands::{Command, Invocation, execute, execute_with_io};
 

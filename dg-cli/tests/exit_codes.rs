@@ -107,7 +107,7 @@ fn binary_help_reports_broken_stdout_without_panicking() -> Result<(), Box<dyn E
         .arg("--help")
         .output()?;
     assert_eq!(success.status.code(), Some(0));
-    assert!(String::from_utf8(success.stdout)?.contains("Native writes are unconfigured"));
+    assert!(String::from_utf8(success.stdout)?.contains("Native apply requires root"));
     assert!(success.stderr.is_empty());
     Ok(())
 }

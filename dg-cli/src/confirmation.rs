@@ -7,6 +7,7 @@ use disksgraph::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::BufRead;
 
 /// Reviewed execution scope captured before authorization; no policy result is imported from a plan.
 #[derive(Serialize)]
@@ -240,6 +241,19 @@ mod tests {
         ));
     }
 
+    /// Confirmation input must be one bounded JSON record; absence and oversized input refuse consent.
+    #[test]
+    fn confirmation_input_is_bounded_and_explicit() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(read_reply(&mut &b""[..]).is_err());
+        assert!(read_reply(&mut &b"broken\n"[..]).is_err());
+        assert!(read_reply(&mut &vec![b' '; 64 * 1024 + 1][..]).is_err());
+        assert_eq!(
+            read_reply(&mut &b"{\"command\":\"cancel\"}\n"[..])?["command"],
+            "cancel"
+        );
+        Ok(())
+    }
+
     /// One consent covers one immutable run; altered documents/attempts and unbound destructive targets fail.
     #[test]
     fn confirmed_plan_is_bound_and_not_prompted_again() {
@@ -280,4 +294,16 @@ mod tests {
         ));
         assert_eq!(calls.get(), 1);
     }
+}
+
+/// Reads one bounded confirmation record; EOF or malformed data can never imply consent.
+pub fn read_reply(input: &mut impl std::io::BufRead) -> Result<Value, crate::Error> {
+    let mut line = Vec::new();
+    let count = std::io::Read::take(input, 64 * 1024 + 1).read_until(b'\n', &mut line)?;
+    if count == 0 || line.len() > 64 * 1024 {
+        return Err(crate::Error::Usage(
+            "one bounded explicit confirmation is required".into(),
+        ));
+    }
+    Ok(serde_json::from_slice(&line)?)
 }
