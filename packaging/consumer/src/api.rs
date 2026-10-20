@@ -74,6 +74,30 @@ impl Api {
         Ok(value)
     }
 
+    /// Supplies policy through a checked function pointer, never through ordinary request JSON.
+    /// The callback and its cookie remain valid until this context is closed and joined.
+    pub fn open_with_policy(
+        &self,
+        config: &Value,
+        callback: extern "C" fn(u64, StableString) -> StableString,
+        cookie: u64,
+    ) -> Result<Value, Error> {
+        let function = self.symbol::<extern "C" fn(
+            StableString,
+            extern "C" fn(u64, StableString) -> StableString,
+            u64,
+        ) -> StableString>("open_with_policy")?;
+        let value = Self::value(function(
+            StableString::from(config.to_string().as_str()),
+            callback,
+            cookie,
+        ))?;
+        if let Some(id) = value["result"]["context"].as_u64() {
+            self.contexts.borrow_mut().push(id);
+        }
+        Ok(value)
+    }
+
     /// Sends bounded application JSON using stable owned strings in both directions.
     pub fn call(&self, context: u64, request: &Value) -> Result<Value, Error> {
         let function = self.symbol::<extern "C" fn(u64, StableString) -> StableString>("call")?;

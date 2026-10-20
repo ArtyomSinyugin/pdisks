@@ -31,6 +31,36 @@ pub extern "C" fn disksgraph_open(config: StableString) -> StableString {
     boundary(|| crate::registry::reply(crate::registry::open(config.as_str())))
 }
 
+/// Opens an explicitly write-capable native host with a checked application policy callback.
+/// The callback and its cookie remain owned by the caller until close joins the worker.
+#[stabby::export]
+pub extern "C" fn disksgraph_open_with_policy(
+    config: StableString,
+    callback: crate::policy::PolicyCallback,
+    cookie: u64,
+) -> StableString {
+    boundary(|| {
+        crate::registry::reply(crate::registry::open_with(
+            config.as_str(),
+            move |root, manifest, worker| {
+                let manifest = manifest.ok_or_else(|| {
+                    crate::registry::Error::InvalidConfig(
+                        "native manifest required for host policy".into(),
+                    )
+                })?;
+                let policy = disksgraph::native::HostPolicy::new(crate::policy::CallbackPolicy {
+                    callback,
+                    cookie,
+                });
+                let app = disksgraph::native::open_with_policy(&root, &manifest, policy.clone())
+                    .map_err(|error| crate::registry::Error::OpenFailed(error.to_string()))?;
+                worker.serve_with_policy(app, policy);
+                Ok(())
+            },
+        ))
+    })
+}
+
 /// Dispatches versioned application JSON; background jobs expose passive polling without facade transfer.
 #[stabby::export]
 pub extern "C" fn disksgraph_call(context: u64, request: StableString) -> StableString {

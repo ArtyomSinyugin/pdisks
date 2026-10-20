@@ -200,6 +200,20 @@ impl Worker {
         A: disksgraph::host::authorization::AuthorizationContext,
         D: disksgraph::host::dispatcher::BackendDispatcher,
     {
+        self.serve_with_policy(app, disksgraph::native::ReadOnlyPolicy);
+    }
+
+    /// Keeps incident safety on the same host-owned policy channel as native admission.
+    pub fn serve_with_policy<C, A, D, P>(
+        self,
+        app: disksgraph::DisksGraph<disksgraph::host::host::LinuxLiveHost<'_, C, A>, D>,
+        mut policy: P,
+    ) where
+        C: disksgraph::host::capability::BackendCapabilityCheck,
+        A: disksgraph::host::authorization::AuthorizationContext,
+        D: disksgraph::host::dispatcher::BackendDispatcher,
+        P: disksgraph::IncidentAcknowledgmentPolicy,
+    {
         let mut protocol = Protocol::new(app, self.live);
         if self.ready.send(Ok(())).is_err() {
             return;
@@ -209,7 +223,7 @@ impl Worker {
                 Message::Stop => break,
                 Message::Call(input, response) => {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        encode_reply(protocol.call(*input))
+                        encode_reply(protocol.call_with_policy(*input, &mut policy))
                     })) {
                         Ok(result) => {
                             let _ = response.send(result);

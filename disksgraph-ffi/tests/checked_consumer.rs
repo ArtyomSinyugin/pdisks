@@ -648,3 +648,21 @@ fn checked_open_validates_root_before_loading_native_configuration() -> Result<(
     assert!(!scratch.0.join("active-attempt.json").exists());
     Ok(())
 }
+
+/// Missing host configuration is rejected through the new checked signature without invoking policy.
+#[test]
+fn checked_policy_open_requires_a_native_manifest() -> Result<(), Error> {
+    /// No policy question may be asked while native configuration is absent.
+    extern "C" fn policy(_: u64, _: stabby::string::String) -> stabby::string::String {
+        stabby::string::String::from(
+            r#"{"policy_version":1,"status":{"violated":{"reason":"unexpected callback"}}}"#,
+        )
+    }
+    let scratch = Scratch::new()?;
+    let api = Api::load(&library()?, "disksgraph")?;
+    let reply = api.open_with_policy(&scratch.config(), policy, 42)?;
+    assert_eq!(reply["error"]["code"], "invalid_config");
+    assert!(reply.get("result").is_none());
+    assert!(!scratch.0.join("execution.lock").exists());
+    Ok(())
+}
