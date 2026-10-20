@@ -25,6 +25,7 @@ install -Dm644 disksgraph-ffi/include/disksgraph.h "$bundle_dir/include/disksgra
 install -Dm644 LICENSE "$bundle_dir/share/doc/disksgraph/LICENSE"
 install -Dm644 Cargo.lock "$bundle_dir/share/doc/disksgraph/Cargo.lock"
 install -Dm644 disksgraph-ffi/README.md "$bundle_dir/share/doc/disksgraph/ABI.md"
+install -Dm644 docs/root-cli.md "$bundle_dir/share/doc/disksgraph/ROOT-CLI.md"
 install -Dm644 docs/embedding.md "$bundle_dir/share/doc/disksgraph/EMBEDDING.md"
 install -Dm644 docs/backend4.md "$bundle_dir/share/doc/disksgraph/BACKEND4.md"
 install -Dm644 docs/host-trust.md "$bundle_dir/share/doc/disksgraph/HOST-TRUST.md"

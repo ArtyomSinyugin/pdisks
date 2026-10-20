@@ -1,16 +1,26 @@
 # disksgraph
 
-`disksgraph` — будущий инструмент для работы с дисковой подсистемой Linux. Проект предназначен для повторного использования в инсталляторах и обычных системных утилитах.
+`disksgraph` предоставляет Rust-библиотеку и отдельно собираемую динамическую
+`libdisksgraph.so` со Stabby API. Встраивающая программа задаёт собственную
+авторизацию и safety policy через typed Rust API или host callback динамической
+библиотеки. Для клиентов не на Rust поставляются C JSON header и Python SDK.
 
-Сейчас реализован безопасный read-only контур: обнаружение доступных провайдеров, чтение данных из Linux, преобразование результатов в каноническую
-модель и сборка единого снимка состояния. Библиотечный `storage-engine` композирует
-типизированные фрагменты в план, проверяет переходы и строит условный прогноз.
-Обычная конфигурация остаётся read-only. Узкая native LVM/ext4/Host mount цепочка
-доступна через явно настроенный runtime и проверена на одноразовых VM-дисках.
+`dg-cli` — самостоятельная программа поверх Rust-библиотеки. Native apply
+запускается от root, показывает exact plan review и требует одноразового
+подтверждения digest/plan/run/token. `dg-backend4` предоставляет тот же facade
+через stdin/stdout JSON для backend4 Altera и использует ту же root policy.
+
+Поддержанный native write-рецепт — `CreateLv → activation → ext4 → Mount(Host)`.
+Остальные planning recipes не получают write support от положительного callback.
+Device correlation, prerequisites, checkpoint и независимая verification остаются
+обязательными. Native host использует явный execute-enabled manifest; обычный
+ABI open остаётся read-only. Незавершённый disks preview отключён.
+Контракты: [продукт](docs/product-contract.md), [embedding](docs/embedding.md),
+[root CLI](docs/root-cli.md), [backend4](docs/backend4.md).
 
 ## Текущая реализованная архитектура
 
-Workspace разделён на шесть крейтов; прикладной вход — `disksgraph`, исполнение
+Workspace разделён на восемь крейтов; прикладной вход — `disksgraph`, исполнение
 принадлежит `storage-runtime`. Поток данных во время probe выглядит так:
 
 ```text
@@ -175,7 +185,7 @@ imports и versioned JSON, включая один bounded apply job на contex
 snapshot/events polling. Reviewed rebase и incident confirmation используют
 context-owned handles; default incident safety policy остаётся Unknown.
 Положительная и отказная native VM приёмка через отдельно загружаемую тестовую
-`.so` прошли с явным guarded guest host; production constructor остаётся read-only.
+`.so` прошли с явным guarded guest host; обычный open остаётся read-only, а open_with_policy принимает внешний host callback.
 MSRV 1.88.0 проверен actual compiler, включая standalone checked consumer и
 cross-compiler imports 1.88.0/1.98.1. [Локальный bundle](packaging/README.md)
 содержит CLI, `lib/libdisksgraph.so`, consumer SDK и checksums. Функциональная

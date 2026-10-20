@@ -51,8 +51,29 @@ oversized frame receives a resource-limit reply and closes the stream without
 interpreting its remaining bytes. EOF releases process-owned objects and never
 clears an incident checkpoint. Broken stdout ends with an I/O failure.
 
-The current executable uses the existing synchronous application protocol: owner
+For native writes the trusted startup configuration explicitly sets `"write":true`
+and supplies an execute-enabled `manifest`. The process must run as root. This
+selects the same root application policy as dg-cli, without per-user ACL inside
+the executable. Ordinary config with no write flag remains read-only.
+
+When a nonempty apply reaches authorization, stdout first emits a versioned reply
+whose result has `type:"plan_review"` and the same review fields as the root CLI.
+The frontend must respond on the same connection with a separate authorized frame:
+
+```json
+{"action":{"write":{"command":"apply","run_id":"<review.run_id>","plan_id":"<review.plan_id>","digest":"<review.digest>","token":"<review.token>"}}}
+```
+
+A read frame cannot confirm writes. Cancellation, EOF, wrong IDs/token or invalid
+input refuses admission. The already-pending apply then emits its normal final
+result. No other command is processed while consent is pending; do not send a
+second apply in place of confirmation. Input buffering is shared with this exchange
+so prefetched lines cannot disappear and there is no recursive stdin lock.
+The same exclusive-storage administration assumption as [root CLI](root-cli.md)
+applies. Altera still owns authorization of each outer write message.
+
+The executable uses the existing synchronous application protocol: owner
 job methods return unsupported-operation, while blocking apply uses the ordinary
-coordinator. Native policy/confirmation support is tracked separately in the
-[product contract](product-contract.md); a backend4 write wrapper alone does not
-authorize disk mutations. Default native construction currently disables writes.
+coordinator. A backend4 write wrapper alone does not authorize disk mutations: root host
+configuration, native capability, live safety checks and exact-plan confirmation
+remain required.

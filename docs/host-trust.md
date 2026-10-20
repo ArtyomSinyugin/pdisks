@@ -51,8 +51,9 @@ plan, action, canonical plan digest, backend, all target fingerprints and fresh
 observation. It must check again for each admitted action. The request is context,
 not a credential. Root, a valid plan, a manifest `execute` capability and a held
 flock cannot supply approval. Destructive filesystem creation requires the separate
-`check_destructive` result as well. Native constructor policies remain Unknown and
-its dispatcher remains disabled.
+`check_destructive` result as well. The ordinary read-only constructor keeps policies Unknown and its dispatcher
+disabled. Explicit `open_with_policy` uses the embedding application policy and
+the same native adapters; root CLI/backend4 supply their own confirmation policy.
 
 Incident acknowledgment has a separate trusted policy. A matching challenge only
 confirms review; it does not authenticate the caller or prove native backend
@@ -60,6 +61,10 @@ quiescence. Authorization, complete scope and stopped native operations must all
 be established before clearing the exact active attempt. Close, reopen and root
 privileges do not acknowledge an incident.
 
-This contract does not complete C8: production principal/exclusion/quiescence
-policies, ALT installation ownership/lifecycle, complete observation export policy
-and native crash/power-loss acceptance remain open. The disks preview stays disabled.
+[Embedding](embedding.md) defines the native policy callback; [root CLI](root-cli.md)
+defines the standalone application's authority/confirmation and exclusion contract.
+A separate user permission system or privileged service is not required for these
+products. Native crash/power-loss acceptance and system installation remain distinct
+acceptance work; they must not reopen already-proved synthetic gates. Full storage
+observation anonymization is a separate feature, not an implicit library guarantee.
+The disks preview stays disabled.
