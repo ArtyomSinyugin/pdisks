@@ -355,3 +355,29 @@ fn review_capacity_rejects_before_probe_and_session_close_releases_it() -> Resul
     assert_eq!(writes.get(), 0);
     Ok(())
 }
+
+/// Invalid execution roots fail before even opening a native manifest.
+#[test]
+fn native_configuration_checks_root_before_manifest() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let scratch = support::Scratch::new()?;
+    let missing = scratch.0.join("missing.json");
+    std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o755))?;
+    assert!(matches!(
+        disksgraph::native::open(&scratch.0, Some(&missing)),
+        Err(disksgraph::native::OpenError::Application(_))
+    ));
+    std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(0o700))?;
+    let alias = scratch.0.join("root-link");
+    symlink(&scratch.0, &alias)?;
+    assert!(matches!(
+        disksgraph::native::open(&alias, Some(&missing)),
+        Err(disksgraph::native::OpenError::Application(_))
+    ));
+    assert!(matches!(
+        disksgraph::native::open(&scratch.0, Some(&missing)),
+        Err(disksgraph::native::OpenError::Configuration(_))
+    ));
+    assert!(!scratch.0.join("execution.lock").exists());
+    Ok(())
+}

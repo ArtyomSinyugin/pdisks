@@ -143,6 +143,7 @@ pub type Application =
 /// Opens an existing private root with optional native reads and deliberately disabled writes.
 /// Without a manifest, transports must restrict calls to saved inputs; direct probing reports missing data.
 pub fn open(root: &Path, manifest: Option<&Path>) -> Result<Application, OpenError> {
+    let root = lease::ExecutionRoot::open(root).map_err(DisksGraphError::from)?;
     let registry = manifest
         .map(|path| {
             BackendRegistry::load_from(path)
@@ -158,5 +159,5 @@ pub fn open(root: &Path, manifest: Option<&Path>) -> Result<Application, OpenErr
         DisabledDispatcher(BackendId::new("cli-unconfigured").ok_or_else(|| {
             OpenError::Configuration("invalid unavailable backend identity".into())
         })?);
-    Ok(DisksGraph::new(root, host, dispatcher)?)
+    Ok(DisksGraph::with_root(root, host, dispatcher))
 }

@@ -96,14 +96,22 @@ pub struct DisksGraph<H, D> {
 impl<H: RuntimeHost, D: BackendDispatcher> DisksGraph<H, D> {
     /// Validates an existing private execution directory; never installs a permissive default policy.
     pub fn new(root: impl AsRef<Path>, host: H, dispatcher: D) -> Result<Self, DisksGraphError> {
-        Ok(Self {
-            root: ExecutionRoot::open(root)?,
+        Ok(Self::with_root(
+            ExecutionRoot::open(root)?,
+            host,
+            dispatcher,
+        ))
+    }
+    /// Retains a root validated before trusted native configuration can execute library constructors.
+    pub(crate) fn with_root(root: ExecutionRoot, host: H, dispatcher: D) -> Self {
+        Self {
+            root,
             host,
             dispatcher,
             sessions: HashMap::new(),
             plans: HashMap::new(),
             runs: HashMap::new(),
-        })
+        }
     }
     /// Performs an actual provider pass without exposing a forecast as current state.
     pub fn probe(&mut self) -> Result<LiveObservation, DisksGraphError> {
