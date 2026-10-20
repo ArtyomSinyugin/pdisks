@@ -600,3 +600,51 @@ fn checked_errors_redact_request_and_loader_context() -> Result<(), Error> {
     api.close(context)?;
     Ok(())
 }
+
+/// Even the actual checked production constructor rejects an unsafe root before mapping a backend.
+#[test]
+fn checked_open_validates_root_before_loading_native_configuration() -> Result<(), Error> {
+    let scratch = Scratch::new()?;
+    let source = scratch.0.join("sentinel.rs");
+    let sentinel = scratch.0.join("sentinel.so");
+    fs::write(
+        &source,
+        "/// Private native configuration sentinel.\npub fn sentinel() {}\n",
+    )?;
+    let output =
+        std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .args([
+                "--crate-type=cdylib",
+                "--crate-name=checked_config_sentinel",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&sentinel)
+            .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = scratch.0.join("providers.json");
+    fs::write(&manifest, json!({"manifest_version":1,"providers":[{
+        "id":"sentinel","library":{"path":sentinel,"required_symbols":[]},"capabilities":["probe"]
+    }]}).to_string())?;
+    let api = Api::load(&library()?, "disksgraph")?;
+    let config = json!({"abi_version":1,"protocol_version":1,"root":scratch.0,"manifest":manifest});
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o755))?;
+    let rejected = api.open(&config)?;
+    assert_eq!(rejected["error"]["code"], "open_failed");
+    assert_eq!(
+        rejected["error"]["detail"],
+        disksgraph::diagnostics::REDACTED
+    );
+    assert!(!fs::read_to_string("/proc/self/maps")?.contains(sentinel.to_string_lossy().as_ref()));
+    assert!(!scratch.0.join("execution.lock").exists());
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700))?;
+    // The sentinel loads once the root is valid, then the incomplete native stack is rejected.
+    assert_eq!(api.open(&config)?["error"]["code"], "open_failed");
+    assert!(fs::read_to_string("/proc/self/maps")?.contains(sentinel.to_string_lossy().as_ref()));
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    Ok(())
+}
