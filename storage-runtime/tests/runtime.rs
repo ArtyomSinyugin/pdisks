@@ -935,6 +935,74 @@ mod coordination {
         );
         Ok(())
     }
+    /// Permission changes and lock replacement at callback boundaries cannot arm or clear an attempt.
+    #[test]
+    fn callback_lock_changes_stop_before_arm_or_successor() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let _process = isolate_processes();
+        for before_clear in [false, true] {
+            for replace_lock in [false, true] {
+                let (state, frozen) = fixture()?;
+                let state = Rc::new(RefCell::new(state));
+                let scratch = Scratch::new()?;
+                let mut run = ExecutionRun::new(frozen.document())?;
+                let mut fake = dispatcher(&scratch, state.clone());
+                fake.created_uuid = Some("callback-lv-uuid".into());
+                let calls = fake.calls.clone();
+                let mut coordinator = ExecutionCoordinator::new(
+                    ExecutionRoot::open(&scratch.0)?,
+                    host(state, &run)?,
+                    fake,
+                    &run,
+                );
+                let mut changed = false;
+                let mut bytes = Vec::new();
+                let result = coordinator.execute_run_with_updates(&mut run, &mut |run| {
+                    let phase = if before_clear {
+                        ActionRunState::Verified
+                    } else {
+                        ActionRunState::Admitted
+                    };
+                    if changed || run.state(ActionId::new(0)).ok() != Some(phase) {
+                        return;
+                    }
+                    changed = true;
+                    if before_clear {
+                        bytes = fs::read(scratch.0.join("active-attempt.json"))
+                            .unwrap_or_else(|error| panic!("read armed marker: {error}"));
+                    }
+                    if replace_lock {
+                        fs::rename(
+                            scratch.0.join("execution.lock"),
+                            scratch.0.join("retained.lock"),
+                        )
+                        .unwrap_or_else(|error| panic!("replace callback lock: {error}"));
+                    } else {
+                        fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o755))
+                            .unwrap_or_else(|error| panic!("change callback permissions: {error}"));
+                    }
+                });
+                assert!(changed);
+                assert!(matches!(result, Err(CoordinatorError::Checkpoint(_))));
+                assert!(!run.is_verified());
+                assert_eq!(calls.get(), usize::from(before_clear));
+                assert_eq!(run.state(ActionId::new(1))?, ActionRunState::Waiting);
+                if before_clear {
+                    assert_eq!(fs::read(scratch.0.join("active-attempt.json"))?, bytes);
+                    assert!(matches!(
+                        coordinator.execute_run(&mut run),
+                        Err(CoordinatorError::Stopped)
+                    ));
+                } else {
+                    assert_eq!(run.state(ActionId::new(0))?, ActionRunState::Failed);
+                    assert!(!scratch.0.join("active-attempt.json").exists());
+                }
+                fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Receipt UUID plus independent LV properties/ownership is required before clear or binding.
     #[test]
     fn created_lv_binding_requires_verified_result_and_exact_owner() -> Result<(), Box<dyn Error>> {
