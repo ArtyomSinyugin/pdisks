@@ -305,6 +305,23 @@ pub(crate) fn open(input: &str) -> Result<Value, Error> {
     })
 }
 
+/// Shares native owner construction between Stabby and C-compatible policy entry points.
+pub(crate) fn open_with_host_policy<P: disksgraph::native::NativeHostPolicy + 'static>(
+    input: &str,
+    make_policy: impl FnOnce() -> P + Send + 'static,
+) -> Result<Value, Error> {
+    open_with(input, move |root, manifest, worker| {
+        let manifest = manifest.ok_or_else(|| {
+            Error::InvalidConfig("native manifest required for host policy".into())
+        })?;
+        let policy = disksgraph::native::HostPolicy::new(make_policy());
+        let app = disksgraph::native::open_with_policy(&root, &manifest, policy.clone())
+            .map_err(|error| Error::OpenFailed(error.to_string()))?;
+        worker.serve_with_policy(app, policy);
+        Ok(())
+    })
+}
+
 /// Opens a context using an explicit trusted Rust host factory, never selected from request JSON.
 /// The factory runs on its worker; it must call serve before returning and keep its host owners scoped.
 /// Dropped factories, failed initialization and panics release the reservation after joining.

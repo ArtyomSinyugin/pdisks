@@ -4,6 +4,7 @@
 //! Every context owns one worker; close joins it before the library may be unloaded.
 
 mod abi;
+mod c_abi;
 mod jobs;
 pub mod policy;
 mod registry;

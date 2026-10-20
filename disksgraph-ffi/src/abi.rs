@@ -40,23 +40,9 @@ pub extern "C" fn disksgraph_open_with_policy(
     cookie: u64,
 ) -> StableString {
     boundary(|| {
-        crate::registry::reply(crate::registry::open_with(
+        crate::registry::reply(crate::registry::open_with_host_policy(
             config.as_str(),
-            move |root, manifest, worker| {
-                let manifest = manifest.ok_or_else(|| {
-                    crate::registry::Error::InvalidConfig(
-                        "native manifest required for host policy".into(),
-                    )
-                })?;
-                let policy = disksgraph::native::HostPolicy::new(crate::policy::CallbackPolicy {
-                    callback,
-                    cookie,
-                });
-                let app = disksgraph::native::open_with_policy(&root, &manifest, policy.clone())
-                    .map_err(|error| crate::registry::Error::OpenFailed(error.to_string()))?;
-                worker.serve_with_policy(app, policy);
-                Ok(())
-            },
+            move || crate::policy::CallbackPolicy { callback, cookie },
         ))
     })
 }

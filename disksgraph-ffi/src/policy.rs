@@ -28,18 +28,19 @@ pub struct CallbackPolicy {
 impl NativeHostPolicy for CallbackPolicy {
     /// Any serialization, size, version or response error leaves evidence Unknown.
     fn check(&mut self, request: PolicyRequest<'_>) -> LiveCheckStatus {
-        let request = match serde_json::to_value(request) {
-            Ok(request) => request,
-            Err(_) => return unknown(),
-        };
-        let input =
-            serde_json::json!({"policy_version":POLICY_VERSION,"request":request}).to_string();
-        if input.len() > MAX_POLICY_REQUEST_BYTES {
+        let Some(input) = encode_request(request) else {
             return unknown();
-        }
+        };
         let response = (self.callback)(self.cookie, StableString::from(input.as_str()));
         decode_reply(response.as_str()).unwrap_or_else(|_| unknown())
     }
+}
+
+/// Encodes the same versioned policy context for every embedding-language transport.
+pub(crate) fn encode_request(request: PolicyRequest<'_>) -> Option<String> {
+    let request = serde_json::to_value(request).ok()?;
+    let input = serde_json::json!({"policy_version":POLICY_VERSION,"request":request}).to_string();
+    (input.len() <= MAX_POLICY_REQUEST_BYTES).then_some(input)
 }
 
 /// Validates the version and strict response shape before accepting a host attestation.
@@ -65,7 +66,7 @@ fn decode_reply(input: &str) -> Result<LiveCheckStatus, Error> {
 }
 
 /// Malformed host decisions cannot grant access or masquerade as missing policy checks.
-fn unknown() -> LiveCheckStatus {
+pub(crate) fn unknown() -> LiveCheckStatus {
     LiveCheckStatus::Unknown {
         required_evidence: "valid versioned host policy decision".into(),
     }
