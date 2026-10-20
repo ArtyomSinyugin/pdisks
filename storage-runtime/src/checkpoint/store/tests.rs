@@ -464,3 +464,31 @@ fn clear_compares_the_complete_expected_attempt() -> Result<(), Box<dyn Error>> 
     }
     Ok(())
 }
+
+/// Unsafe permission bits cannot be silently accepted or repaired on retained incident evidence.
+#[test]
+fn checkpoint_rejects_executable_and_special_modes() -> Result<(), Box<dyn Error>> {
+    let _serial = serialize_process_tests();
+    let scratch = Scratch::new()?;
+    let root = ExecutionRoot::open(&scratch.0)?;
+    let lock = root.try_lock_host()?;
+    let store = CheckpointStore::new(&lock);
+    let attempt = fixture();
+    store.arm(&attempt)?;
+    let path = scratch.0.join(ACTIVE_FILE);
+    let original = fs::read(&path)?;
+    for mode in [0o700, 0o1600, 0o2600, 0o4600] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+        assert!(matches!(store.inspect(), Err(CheckpointError::InvalidFile)));
+        assert!(matches!(
+            store.clear(&attempt),
+            Err(CheckpointError::InvalidFile)
+        ));
+        assert!(store.arm(&attempt).is_err());
+        assert_eq!(fs::read(&path)?, original);
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o7777, mode);
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    assert_eq!(store.inspect()?, Some(attempt));
+    Ok(())
+}

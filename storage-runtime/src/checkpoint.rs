@@ -57,7 +57,7 @@ pub enum CheckpointError {
     /// Clear requires an existing checkpoint with the exact requested run/action identity.
     #[error("checkpoint does not belong to this run and action")]
     AttemptMismatch,
-    /// Files must be private, owned, singly linked regular files.
+    /// Files must be private, non-executable, without special bits, owned and singly linked.
     #[error("invalid checkpoint file")]
     InvalidFile,
     /// A failed mutation may have changed durable state; the host must stop this run.

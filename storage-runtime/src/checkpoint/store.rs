@@ -182,7 +182,7 @@ impl<'lock> CheckpointStore<'lock> {
 fn validate_file(info: &Stat) -> Result<(), CheckpointError> {
     if FileType::from_raw_mode(info.st_mode) != FileType::RegularFile
         || info.st_uid != geteuid().as_raw()
-        || info.st_mode & 0o077 != 0
+        || info.st_mode & 0o7177 != 0
         || info.st_nlink != 1
     {
         return Err(CheckpointError::InvalidFile);
