@@ -1316,7 +1316,7 @@ impl BackendRegistry {
         let manifests = read_manifests(path)?;
         let mut registry = Self::default();
         for manifest in manifests.backends {
-            registry.register(path, manifest)?;
+            registry.register(path, manifest);
         }
         Ok(registry)
     }
@@ -1358,19 +1358,12 @@ impl BackendRegistry {
         self.backends.values()
     }
 
-    /// Validates and conditionally registers one backend declaration.
-    fn register(
-        &mut self,
-        path: &Path,
-        manifest: BackendManifest,
-    ) -> Result<(), BackendRegistryError> {
+    /// Registers an available declaration from an already validated collection.
+    fn register(&mut self, path: &Path, manifest: BackendManifest) {
         let Some(access) = available_backend_access(&manifest) else {
-            return Ok(());
+            return;
         };
         let id = manifest.id.clone();
-        if self.backends.contains_key(&id) {
-            return Err(BackendRegistryError::DuplicateBackend(id));
-        }
         self.backends.insert(
             id,
             RegisteredBackend {
@@ -1379,7 +1372,6 @@ impl BackendRegistry {
                 access,
             },
         );
-        Ok(())
     }
 }
 
@@ -1401,8 +1393,12 @@ fn read_manifests(path: &Path) -> Result<BackendManifests, BackendRegistryError>
         });
     }
     // Validate the whole document before any dlopen can execute native constructors.
+    let mut identities = BTreeSet::new();
     for manifest in &manifests.backends {
         validate_manifest(path, manifest)?;
+        if !identities.insert(&manifest.id) {
+            return Err(BackendRegistryError::DuplicateBackend(manifest.id.clone()));
+        }
     }
     Ok(manifests)
 }
@@ -1519,7 +1515,7 @@ pub enum BackendRegistryError {
     /// Relative executable paths would make invocation process-dependent.
     #[error("backend manifest {path:?} has relative executable {executable:?}")]
     RelativeExecutable { path: PathBuf, executable: PathBuf },
-    /// More than one available manifest declared the same ID.
+    /// More than one declaration uses the same ID, regardless of host availability.
     #[error("duplicate backend ID {0:?}")]
     DuplicateBackend(BackendId),
 }
@@ -1716,6 +1712,28 @@ mod tests {
         assert!(matches!(
             BackendRegistry::validate_dependencies(&path),
             Err(BackendRegistryError::RelativeExecutable { .. })
+        ));
+        fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
+    }
+
+    /// Duplicate identities are configuration errors even when dependencies are absent.
+    #[test]
+    fn registry_rejects_duplicate_unavailable_identities() {
+        let directory = fixture_dir();
+        let path = write_manifests(
+            &directory,
+            manifests(vec![
+                manifest("duplicate", "/definitely/missing/backend"),
+                manifest("duplicate", "/bin/true"),
+            ]),
+        );
+        assert!(matches!(
+            BackendRegistry::load_from(&path),
+            Err(BackendRegistryError::DuplicateBackend(_))
+        ));
+        assert!(matches!(
+            BackendRegistry::validate_dependencies(&path),
+            Err(BackendRegistryError::DuplicateBackend(_))
         ));
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
     }
