@@ -10,12 +10,22 @@ if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
     echo 'This staging command builds for the host; unset CARGO_BUILD_TARGET.' >&2
     exit 2
 fi
+# The source archive and compiled artifacts must describe the same committed source.
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if ! git -C "$repo_dir" diff --quiet HEAD --; then
+    echo 'Commit tracked changes before staging a reproducible source/binary bundle.' >&2
+    exit 2
+fi
+source_revision=$(git -C "$repo_dir" rev-parse HEAD)
 # Refuse existing files, directories and symlinks before any build or copy.
 mkdir -m 0700 -- "$1"
 bundle_dir=$(cd "$1" && pwd)
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_dir"
 "${CARGO:-cargo}" build --release --locked --offline -p dg-cli -p disksgraph-ffi
+if ! git diff --quiet "$source_revision" -- || [ "$(git rev-parse HEAD)" != "$source_revision" ]; then
+    echo 'Tracked source changed during the build; refusing a mismatched bundle.' >&2
+    exit 2
+fi
 build_dir=${CARGO_TARGET_DIR:-"$repo_dir/target"}/release
 install -Dm755 "$build_dir/dg-cli" "$bundle_dir/bin/dg-cli"
 install -Dm755 "$build_dir/dg-backend4" "$bundle_dir/bin/dg-backend4"
@@ -33,10 +43,12 @@ install -Dm644 packaging/README.md "$bundle_dir/README.md"
 for source in Cargo.toml Cargo.lock src/main.rs src/api.rs python/disksgraph.py python/check.py; do
     install -Dm644 "packaging/consumer/$source" "$bundle_dir/consumer/$source"
 done
+mkdir "$bundle_dir/source"
+git archive --format=tar.gz --prefix=disksgraph/ "$source_revision" > "$bundle_dir/source/disksgraph.tar.gz"
 {
     "${RUSTC:-rustc}" --version --verbose
     "${CARGO:-cargo}" --version
-    git rev-parse HEAD
+    printf '%s\n' "$source_revision"
 } > "$bundle_dir/BUILD-INFO"
 # Hash only shipped regular files, with relative names usable after moving the bundle.
 cd "$bundle_dir"

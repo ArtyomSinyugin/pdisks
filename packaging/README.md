@@ -25,9 +25,11 @@ no global execution root, service, history or configuration under `/etc`.
 Use the Stabby 72.1.16 checked-import interface described in
 `share/doc/disksgraph/ABI.md`. It passes stable owned strings; it is not a plain C
 string interface. Close all contexts and free library-owned strings before
-unloading. Source links in ABI.md refer to the original source checkout. Retain
-that checkout to use the Rust facade; source archives and system packages are
-separate release work. This staging command does not publish a release.
+unloading. Source links in ABI.md refer to the original source checkout. The exact committed Rust workspace is shipped in `source/disksgraph.tar.gz`;
+extract it to build/embed the Rust facade with its locked dependencies. System
+packages remain separate release work. This staging command requires a clean tracked source tree, pins its commit in
+BUILD-INFO, refuses tracked changes during build, and never archives untracked
+user files. It does not publish a release.
 
 The SDK has its own Cargo workspace and lockfile, pinned Stabby 72.1.16 and
 libloading 0.9.0, and no path dependency on the application. From the bundle:

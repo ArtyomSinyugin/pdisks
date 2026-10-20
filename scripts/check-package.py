@@ -11,6 +11,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import tarfile
 
 
 def run(*args):
@@ -32,6 +33,13 @@ def verify(bundle):
     actual = {path.resolve() for path in bundle.rglob("*") if path.is_file() and path.name != "SHA256SUMS"}
     if actual != expected:
         raise ValueError("bundle file set differs from SHA256SUMS")
+    with tarfile.open(bundle / "source/disksgraph.tar.gz", "r:gz") as source:
+        members = set(source.getnames())
+        required = {"disksgraph/Cargo.toml", "disksgraph/Cargo.lock",
+                    "disksgraph/disksgraph/src/lib.rs", "disksgraph/storage-runtime/src/coordinator.rs",
+                    "disksgraph/disksgraph-ffi/include/disksgraph.h"}
+        if not required <= members:
+            raise ValueError("Rust workspace source archive is incomplete")
     symbols = run("nm", "-D", "--defined-only", str(bundle / "lib/libdisksgraph.so"))
     names = {line.split()[-1] for line in symbols.splitlines() if line.split()}
     for name in ["api_version", "open", "open_with_policy", "call", "close", "json_api_version", "json_open", "json_open_with_policy", "json_call", "json_close", "json_free"]:
