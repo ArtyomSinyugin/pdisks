@@ -72,23 +72,31 @@ pub fn serve(
     output: &mut impl Write,
     dispatch: &mut impl FnMut(Request) -> Result<Value, ProtocolError>,
 ) -> io::Result<()> {
-    loop {
-        let mut line = Vec::new();
-        let count = (&mut *input)
-            .take(MAX_LINE_BYTES as u64 + 1)
-            .read_until(b'\n', &mut line)?;
-        if count == 0 {
-            return Ok(());
-        }
-        if line.len() <= MAX_LINE_BYTES && line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
+    while let Some(line) = read_frame(input)? {
         let reply = call(&line, dispatch);
         writeln!(output, "{reply}")?;
         output.flush()?;
         if line.len() > MAX_LINE_BYTES {
             return Ok(());
         }
+    }
+    Ok(())
+}
+
+/// Reads one bounded nonblank frame and releases its reader borrow before dispatch/confirmation.
+pub fn read_frame(input: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
+    loop {
+        let mut line = Vec::new();
+        let count = (&mut *input)
+            .take(MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        if line.len() <= MAX_LINE_BYTES && line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        return Ok(Some(line));
     }
 }
 
@@ -125,6 +133,21 @@ mod tests {
         Ok(())
     }
 
+    /// A second message is consent only when Altera separately authorized its outer write action.
+    #[test]
+    fn confirmation_requires_a_write_frame() -> Result<(), Box<dyn std::error::Error>> {
+        let response = br#"{"action":{"write":{"command":"cancel"}}}"#;
+        assert_eq!(read_confirmation(&mut &response[..])?["command"], "cancel");
+        for response in [
+            r#"{"command":"apply"}"#,
+            r#"{"action":{"read":{"command":"apply"}}}"#,
+            r#"{"action":{"write":{},"read":{}}}"#,
+        ] {
+            assert!(read_confirmation(&mut response.as_bytes()).is_err());
+        }
+        Ok(())
+    }
+
     /// A bad line leaves the stream usable, while an oversized line closes before its tail executes.
     #[test]
     fn stream_recovers_bounded_errors_and_closes_oversized_frames()
@@ -150,5 +173,16 @@ mod tests {
         let reply: Value = serde_json::from_slice(&output)?;
         assert_eq!(reply["error"]["code"], "resource_limit");
         Ok(())
+    }
+}
+
+/// Reads consent from a separately Altera-authorized write frame, never a read wrapper or raw flag.
+pub fn read_confirmation(input: &mut impl BufRead) -> Result<Value, crate::Error> {
+    let envelope: Envelope = serde_json::from_value(crate::confirmation::read_reply(input)?)?;
+    match envelope.action {
+        Action::Write(payload) => Ok(payload),
+        _ => Err(crate::Error::Usage(
+            "confirmation requires backend4 write action".into(),
+        )),
     }
 }
