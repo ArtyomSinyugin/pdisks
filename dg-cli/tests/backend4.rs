@@ -85,3 +85,89 @@ fn executable_preserves_live_sessions_and_backend4_framing() -> Result<(), Box<d
     assert!(!scratch.0.join("active-attempt.json").exists());
     Ok(())
 }
+
+/// Actual backend4 editing/undo/redo/freeze matches direct recomputation from the same exported inputs.
+#[test]
+fn executable_edits_and_freezes_the_same_plan_as_rust() -> Result<(), Box<dyn Error>> {
+    let (scratch, mut app, _, writes) = support::application()?;
+    let original = app.create_session()?;
+    let draft = app.export_draft(original)?;
+    let vg = *draft
+        .baseline
+        .snapshot
+        .graph
+        .nodes()
+        .find(|(_, node)| matches!(node.kind.kind, disksgraph::model::NodeKind::LvmVg { .. }))
+        .ok_or("VG")?
+        .0;
+    let config = scratch.0.join("backend4.json");
+    fs::write(&config, json!({"root":scratch.0}).to_string())?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dg-backend4"))
+        .arg("--config")
+        .arg(&config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = child.stdin.take().ok_or("stdin")?;
+    let mut output = BufReader::new(child.stdout.take().ok_or("stdout")?);
+    let imported = exchange(
+        &mut input,
+        &mut output,
+        "write",
+        json!({"protocol_version":1,"request":{"method":"session_import","params":{"draft":draft}}}),
+    )?;
+    let session = imported["result"]["session"].clone();
+    let edit = disksgraph::PlanEdit::Add(disksgraph::PlanRequest::CreateLv {
+        vg,
+        name: "backend4-data".into(),
+        size: disksgraph::model::Bytes::new(16 * 1024 * 1024),
+        layout: disksgraph::model::LvmLvKind::Linear,
+        activate: true,
+    });
+    for (method, params) in [
+        (
+            "session_edit",
+            json!({"session":session,"revision":0,"edit":edit}),
+        ),
+        ("session_undo", json!({"session":session,"revision":1})),
+        ("session_redo", json!({"session":session,"revision":2})),
+    ] {
+        let reply = exchange(
+            &mut input,
+            &mut output,
+            "write",
+            json!({"protocol_version":1,"request":{"method":method,"params":params}}),
+        )?;
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+    let saved = exchange(&mut input, &mut output, "read", json!({"protocol_version":1,"request":{"method":"session_export","params":{"session":session}}}))?["result"].clone();
+    let direct = app.import_draft(disksgraph::DraftDocument::from_json(&saved.to_string())?)?;
+    let actual = exchange(
+        &mut input,
+        &mut output,
+        "read",
+        json!({"protocol_version":1,"request":{"method":"session_preview","params":{"session":session}}}),
+    )?;
+    assert_eq!(
+        actual["result"],
+        serde_json::to_value(app.preview_document(direct)?)?
+    );
+    let actual = exchange(
+        &mut input,
+        &mut output,
+        "write",
+        json!({"protocol_version":1,"request":{"method":"session_freeze","params":{"session":session,"revision":3}}}),
+    )?;
+    let frozen = app.freeze(direct, app.revision(direct)?)?;
+    let mut expected = serde_json::to_value(frozen.document())?;
+    expected["plan_id"] = actual["result"]["plan_id"].clone();
+    assert_eq!(actual["result"], expected);
+    drop(input);
+    let final_output = child.wait_with_output()?;
+    assert!(final_output.status.success());
+    assert!(final_output.stderr.is_empty());
+    assert_eq!(writes.get(), 0);
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    Ok(())
+}
