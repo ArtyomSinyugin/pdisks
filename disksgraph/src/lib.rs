@@ -24,8 +24,9 @@ pub use storage_engine::editing::{
     PlanRequest, PreviewDocument, PreviewState, PreviewStatus, RebasePreview,
 };
 pub use storage_engine::{
-    ActionId, ActionRunState, ActionStatus, BackendOutcome, EventsPage, LiveCheckStatus,
-    LiveObservation, ObservationReference, PlanDocument, ProtectedScope, RunEvent, RunEventKind,
+    ActionId, ActionRunState, ActionStatus, BackendOutcome, EventsPage, HistoricalBaseline,
+    LiveCheckStatus, LiveObservation, ObservationReference, PlanDocument, ProtectedScope, RunEvent,
+    RunEventKind,
 };
 
 /// Explicit trusted host configuration; imported plans cannot choose these providers or policies.

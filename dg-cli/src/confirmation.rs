@@ -253,6 +253,57 @@ mod tests {
         ));
     }
 
+    /// A second explicit backend4 apply gets a new challenge after cancellation of the first run.
+    #[test]
+    fn a_new_run_requires_fresh_confirmation_after_cancellation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let calls = Rc::new(Cell::new(0));
+        let captured = calls.clone();
+        let mut policy = RootPolicy::with_root(true, move |review: &Value| {
+            captured.set(captured.get() + 1);
+            if captured.get() == 1 {
+                Ok(json!({"command":"cancel"}))
+            } else {
+                Ok(answer(review))
+            }
+        });
+        let baseline: disksgraph::HistoricalBaseline = serde_json::from_str(include_str!(
+            "../../storage-engine/examples/fixtures/editing_baseline.json"
+        ))?;
+        let goal = disksgraph::model::DesiredState::from_current(&baseline.snapshot);
+        let protected = disksgraph::ProtectedScope::default();
+        let mut request = request();
+        for pass in 0..2 {
+            request.run_id = uuid::Uuid::now_v7();
+            let observed = disksgraph::LiveObservation {
+                reference: request.observation,
+                snapshot: baseline.snapshot.clone(),
+            };
+            let context = disksgraph::native::PolicyContext {
+                run_id: request.run_id,
+                plan_id: request.plan_id,
+                actions: &[],
+                dependencies: &[],
+                baseline: &baseline,
+                goal: &goal,
+                protected_scope: &protected,
+            };
+            assert_eq!(
+                policy.check(PolicyRequest::Scope {
+                    kind: ScopeCheck::Scope,
+                    context,
+                    action: None,
+                    observed: &observed
+                }),
+                LiveCheckStatus::Satisfied
+            );
+            let result = policy.authorize(&request, None);
+            assert_eq!(result == LiveCheckStatus::Satisfied, pass == 1);
+        }
+        assert_eq!(calls.get(), 2);
+        Ok(())
+    }
+
     /// Confirmation input must be one bounded JSON record; absence and oversized input refuse consent.
     #[test]
     fn confirmation_input_is_bounded_and_explicit() -> Result<(), Box<dyn std::error::Error>> {
