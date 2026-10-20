@@ -143,6 +143,9 @@ pub type Application =
 
 /// Opens an existing private root with optional native reads and deliberately disabled writes.
 /// Without a manifest, transports must restrict calls to saved inputs; direct probing reports missing data.
+/// Root and manifest are trusted host configuration: libraries may execute constructors during open.
+/// Real/effective UID and GID must match; this is not authorization or privilege separation.
+/// Credentials, loader environment and parent directories must remain under host control.
 pub fn open(root: &Path, manifest: Option<&Path>) -> Result<Application, OpenError> {
     require_matching_credentials(
         (getuid().as_raw(), getgid().as_raw()),

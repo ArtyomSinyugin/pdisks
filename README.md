@@ -125,6 +125,8 @@ resize-переходы, общий расход ёмкости, доступн�
 и typed dispatch для поддержанного native recipe. История выполнения на диск не записывается;
 универсальный resolver всех desired-diff также не реализован.
 
+Host configuration и границы привилегий описаны в [контракте trusted host](docs/host-trust.md).
+
 ## Rust API C5
 
 Крейт [`disksgraph`](disksgraph/src/lib.rs) владеет сессиями, импортированными
