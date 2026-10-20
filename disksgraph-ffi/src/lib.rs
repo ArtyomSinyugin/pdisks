@@ -9,7 +9,7 @@ mod jobs;
 pub mod policy;
 mod registry;
 
-/// Version of the four exported signatures, independently checked from the JSON protocol.
+/// Version of the exported Stabby signatures, independently checked from application and policy JSON.
 pub const ABI_VERSION: u32 = 1;
 
 /// Trusted Rust embedding of the same bounded owner transport; no host object crosses the ABI.

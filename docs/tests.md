@@ -121,3 +121,39 @@ diff-check прошли. Новый локальный release bundle прошё
 с отдельно собранным consumer: checksums, production exports, checked ABI/CLI
 preview parity и сохранение incident marker. В bundle включён HOST-TRUST.md.
 MSRV 1.88, native VM/crash и power loss в этом проходе не повторялись.
+
+
+## Уточнённые входы продукта: Rust, ABI, root CLI и backend4
+
+Проход после `c80e852` добавляет внешнюю host policy для Rust/Stabby и C JSON
+bridge, stdlib Python SDK, root exact-plan confirmation и Rust `dg-backend4`.
+Общая приёмка на Rust/Cargo 1.98.1: **468 passed, 19 ignored**, 0 failures;
+workspace/all-targets Clippy `-D warnings`, rustfmt и diff-check проходят.
+C header проверен `cc -std=c11 -Wall -Wextra -Werror -fsyntax-only`.
+
+Проверены реальные portable routes:
+
+- checked Stabby import нового policy export и отказ без native configuration;
+- C memory ownership/open/call/close и реальные function-pointer policy decisions;
+- отдельный Python-процесс загружает .so, сохраняет historical baseline, получает
+  preview, освобождает responses и сохраняет incident marker;
+- Python GC не освобождает живой native owner/callback до явного close;
+- actual backend4 subprocess: живая session, read/write framing, edit/undo/redo,
+  preview и freeze совпадают с прямым Rust пересчётом экспортированного draft;
+- root policy: exact challenge/digest/plan/run, EOF/cancel/oversized input,
+  отдельный destructive callback и новый challenge для следующего run.
+
+Release bundle `/tmp/pdisks-product-bundle-20261020` закреплён на source commit
+`019fc915dbef5152d065ecc72c357c02cdab441b`. `scripts/check-package.py` подтвердил
+checksums/file set, source archive, production Stabby/C exports, standalone
+checked Rust consumer/CLI preview parity и Python C client. Bundle включает оба
+исполняемых файла, .so, C header, Rust/Python SDK, документацию и exact committed
+Rust workspace source archive. Тестовому checkout не требуется системная установка.
+
+Новые native owned-host/root-application compositions ещё требуют одного
+конкретного guarded VM acceptance: положительное подтверждение и реальная
+четырёхшаговая запись; отказ после arm должен сохранить marker. Предыдущие C4/C6/C7
+native эксперименты не объявляются доказательством этой новой композиции.
+В этом проходе native VM/crash/power loss и MSRV 1.88 не повторялись. Дополнительная
+per-user ACL внутри root CLI и универсальный privileged service не являются
+незакрытыми требованиями уточнённого продукта. Disks preview остаётся отключён.

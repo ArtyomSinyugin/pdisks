@@ -1,4 +1,4 @@
-//! Owned native read configuration shared by CLI and long-lived application transports.
+//! Owned native host configuration shared by library embeddings, CLI and application transports.
 
 mod owned;
 pub use owned::{
