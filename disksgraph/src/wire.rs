@@ -108,6 +108,24 @@ pub enum Request {
 }
 
 impl Request {
+    /// Methods permitted inside Altera backend4's read authorization action.
+    /// New methods require write access unless deliberately classified here.
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Probe {}
+                | Self::SessionPreview { .. }
+                | Self::SessionExport { .. }
+                | Self::PlanExport { .. }
+                | Self::Capabilities { .. }
+                | Self::RunSnapshot { .. }
+                | Self::RunEvents { .. }
+                | Self::JobPoll { .. }
+                | Self::IncidentInspect {}
+                | Self::IncidentReview {}
+        )
+    }
+
     /// Saved-input contexts cannot accidentally publish an empty probe as native evidence.
     fn needs_live_host(&self) -> bool {
         matches!(

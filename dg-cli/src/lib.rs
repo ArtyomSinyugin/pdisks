@@ -2,6 +2,7 @@
 
 //! Foreground command adapter over the application facade; saved files grant no authorization.
 
+pub mod backend4;
 mod commands;
 pub mod files;
 pub mod incident;
