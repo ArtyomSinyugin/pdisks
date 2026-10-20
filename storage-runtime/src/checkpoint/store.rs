@@ -85,6 +85,7 @@ impl<'lock> CheckpointStore<'lock> {
             file.sync_all()?;
             #[cfg(test)]
             tests::boundary(tests::Boundary::Publish)?;
+            self.lock.validate()?;
             match renameat_with(
                 directory,
                 &temporary,
@@ -130,6 +131,7 @@ impl<'lock> CheckpointStore<'lock> {
         let result = (|| {
             #[cfg(test)]
             tests::boundary(tests::Boundary::Unlink)?;
+            self.lock.validate()?;
             unlinkat(directory, ACTIVE_FILE, AtFlags::empty()).map_err(io::Error::from)?;
             #[cfg(test)]
             tests::boundary(tests::Boundary::ClearSync)?;
@@ -144,6 +146,7 @@ impl<'lock> CheckpointStore<'lock> {
 
     /// Retains the opened file identity for the final no-follow check before removal.
     fn read_current(&self) -> Result<Option<(ActiveAttempt, Stat)>, CheckpointError> {
+        self.lock.validate()?;
         #[cfg(test)]
         tests::boundary(tests::Boundary::Read)?;
         let fd = match openat(

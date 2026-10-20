@@ -132,6 +132,12 @@ pub struct HostExecutionLock {
 }
 
 impl HostExecutionLock {
+    /// Rechecks retained root permissions and the named lock inode before checkpoint operations.
+    pub(crate) fn validate(&self) -> Result<(), LeaseError> {
+        validate_directory(&self.directory)?;
+        validate_lock(&self.directory, &self._lock)
+    }
+
     /// Borrows the retained root descriptor without exposing or cloning the lock itself.
     pub(crate) fn directory(&self) -> &OwnedFd {
         &self.directory

@@ -492,3 +492,44 @@ fn checkpoint_rejects_executable_and_special_modes() -> Result<(), Box<dyn Error
     assert_eq!(store.inspect()?, Some(attempt));
     Ok(())
 }
+
+/// A retained descriptor cannot certify a replaced lock or loosened execution-directory policy.
+#[test]
+fn checkpoint_operations_revalidate_the_held_lock_domain() -> Result<(), Box<dyn Error>> {
+    let _serial = serialize_process_tests();
+    for case in 0..4 {
+        let scratch = Scratch::new()?;
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let lock = root.try_lock_host()?;
+        let store = CheckpointStore::new(&lock);
+        let attempt = fixture();
+        store.arm(&attempt)?;
+        let active = scratch.0.join(ACTIVE_FILE);
+        let bytes = fs::read(&active)?;
+        let named_lock = scratch.0.join("execution.lock");
+        match case {
+            0 => fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o755))?,
+            1 => fs::set_permissions(&named_lock, fs::Permissions::from_mode(0o644))?,
+            2 => {
+                fs::rename(&named_lock, scratch.0.join("old.lock"))?;
+                drop(root.try_lock_host()?);
+            }
+            _ => fs::hard_link(&named_lock, scratch.0.join("alias.lock"))?,
+        }
+        assert!(
+            matches!(store.inspect(), Err(CheckpointError::Lease(_))),
+            "case {case}"
+        );
+        assert!(
+            matches!(store.clear(&attempt), Err(CheckpointError::Lease(_))),
+            "case {case}"
+        );
+        assert!(
+            matches!(store.arm(&attempt), Err(CheckpointError::Lease(_))),
+            "case {case}"
+        );
+        assert_eq!(fs::read(&active)?, bytes);
+        fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}

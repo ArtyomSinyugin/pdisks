@@ -30,6 +30,10 @@ const MAX_STRING_BYTES: usize = 1024;
 /// Failures leave the runtime without permission to invoke a storage backend.
 #[derive(Debug, Error)]
 pub enum CheckpointError {
+    /// The retained execution root or permanent lock no longer satisfies its safety contract.
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    Lease(#[from] crate::lease::LeaseError),
     /// A file could not be read, published, synchronized, or removed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
