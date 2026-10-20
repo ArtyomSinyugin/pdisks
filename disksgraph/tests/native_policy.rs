@@ -71,3 +71,32 @@ fn policy_requests_preserve_execution_context_and_confirmation_kind() -> Result<
     assert!(general["destructive_target"].is_null());
     Ok(())
 }
+
+/// Construction failures happen before consulting an embedding application's positive policy.
+#[test]
+fn native_write_constructor_requires_explicit_complete_configuration() -> Result<(), Box<dyn Error>>
+{
+    use std::{cell::Cell, fs, os::unix::fs::PermissionsExt, rc::Rc};
+    let scratch = support::Scratch::new()?;
+    let calls = Rc::new(Cell::new(0));
+    let captured = calls.clone();
+    let policy = disksgraph::native::HostPolicy::new(move |_: PolicyRequest<'_>| {
+        captured.set(captured.get() + 1);
+        LiveCheckStatus::Satisfied
+    });
+    let manifest = scratch.0.join("providers.json");
+    fs::write(&manifest, r#"{"manifest_version":1,"providers":[]}"#)?;
+    assert!(matches!(
+        disksgraph::native::open_with_policy(&scratch.0, &manifest, policy.clone()),
+        Err(disksgraph::native::OpenError::Configuration(_))
+    ));
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o755))?;
+    assert!(matches!(
+        disksgraph::native::open_with_policy(&scratch.0, &manifest, policy),
+        Err(disksgraph::native::OpenError::Application(_))
+    ));
+    assert_eq!(calls.get(), 0);
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}

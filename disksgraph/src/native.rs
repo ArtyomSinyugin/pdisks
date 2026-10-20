@@ -1,5 +1,9 @@
 //! Owned native read configuration shared by CLI and long-lived application transports.
 
+mod owned;
+pub use owned::{
+    HostPolicy, NativeCapabilities, NativeDispatcher, WritableApplication, open_with_policy,
+};
 mod policy;
 pub use policy::{NativeHostPolicy, PolicyContext, PolicyRequest, ScopeCheck};
 
@@ -75,7 +79,7 @@ impl BackendDispatcher for DisabledDispatcher {
 }
 
 /// Owns registrations while each probe temporarily borrows them; no leaks or self-references are needed.
-struct OwnedSystemProvider(Option<BackendRegistry>);
+struct OwnedSystemProvider(Option<std::rc::Rc<BackendRegistry>>);
 impl StateProvider for OwnedSystemProvider {
     /// Keeps the native stack's existing provider identity.
     fn id(&self) -> &str {
@@ -150,6 +154,21 @@ pub type Application =
 /// Real/effective UID and GID must match; this is not authorization or privilege separation.
 /// Credentials, loader environment and parent directories must remain under host control.
 pub fn open(root: &Path, manifest: Option<&Path>) -> Result<Application, OpenError> {
+    let (root, registry) = configuration(root, manifest)?;
+    let probe = LinuxProbe::from_providers(vec![Box::new(OwnedSystemProvider(registry))]);
+    let host = LinuxLiveHost::new(probe, ReadOnlyPolicy, ReadOnlyPolicy);
+    let dispatcher =
+        DisabledDispatcher(BackendId::new("cli-unconfigured").ok_or_else(|| {
+            OpenError::Configuration("invalid unavailable backend identity".into())
+        })?);
+    Ok(DisksGraph::with_root(root, host, dispatcher))
+}
+
+/// Validates process/root before loading shared registrations for either application constructor.
+fn configuration(
+    root: &Path,
+    manifest: Option<&Path>,
+) -> Result<(lease::ExecutionRoot, Option<std::rc::Rc<BackendRegistry>>), OpenError> {
     require_matching_credentials(
         (getuid().as_raw(), getgid().as_raw()),
         (geteuid().as_raw(), getegid().as_raw()),
@@ -161,16 +180,11 @@ pub fn open(root: &Path, manifest: Option<&Path>) -> Result<Application, OpenErr
                 .map_err(|error| OpenError::Configuration(error.to_string()))
         })
         .transpose()?;
+    let registry = registry.map(std::rc::Rc::new);
     if let Some(registry) = &registry {
         system(registry)?;
     }
-    let probe = LinuxProbe::from_providers(vec![Box::new(OwnedSystemProvider(registry))]);
-    let host = LinuxLiveHost::new(probe, ReadOnlyPolicy, ReadOnlyPolicy);
-    let dispatcher =
-        DisabledDispatcher(BackendId::new("cli-unconfigured").ok_or_else(|| {
-            OpenError::Configuration("invalid unavailable backend identity".into())
-        })?);
-    Ok(DisksGraph::with_root(root, host, dispatcher))
+    Ok((root, registry))
 }
 
 /// Native configuration is trusted code; a set-ID invocation cannot safely accept caller paths.
