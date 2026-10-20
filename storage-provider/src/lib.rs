@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
+    io::Read,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -65,6 +66,9 @@ pub const ACTION_SEMANTICS_VERSION: u32 = 11;
 
 /// Manifest JSON schema version supported by this release.
 pub const BACKEND_MANIFEST_VERSION: u16 = 1;
+
+/// Allocation bound for trusted backend configuration, checked before JSON parsing.
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
 /// Environment variable overriding the backend manifest file.
 ///
@@ -1377,7 +1381,20 @@ impl BackendRegistry {
 
 /// Reads and validates the versioned backend collection.
 fn read_manifests(path: &Path) -> Result<BackendManifests, BackendRegistryError> {
-    let bytes = fs::read(path).map_err(|source| BackendRegistryError::ReadManifest {
+    let bytes = (|| -> Result<Vec<u8>, std::io::Error> {
+        let file = fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_MANIFEST_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "backend manifest exceeds the size limit",
+            ));
+        }
+        Ok(bytes)
+    })()
+    .map_err(|source| BackendRegistryError::ReadManifest {
         path: path.to_path_buf(),
         source,
     })?;
@@ -1736,6 +1753,30 @@ mod tests {
             Err(BackendRegistryError::DuplicateBackend(_))
         ));
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
+    }
+
+    /// Large configuration is refused before JSON parsing or optional dependency discovery.
+    #[test]
+    fn registry_bounds_manifest_reads() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = fixture_dir();
+        let path = write_manifests(&directory, manifests(Vec::new()));
+        let original = fs::read(&path)?;
+        let mut exact = original.clone();
+        exact.resize(MAX_MANIFEST_BYTES, b' ');
+        fs::write(&path, &exact)?;
+        assert_eq!(BackendRegistry::load_from(&path)?.backends().len(), 0);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(MAX_MANIFEST_BYTES as u64 + 1)?;
+        assert!(matches!(
+            BackendRegistry::load_from(&path),
+            Err(BackendRegistryError::ReadManifest { source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert!(BackendRegistry::validate_dependencies(&path).is_err());
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     /// Verifies that JSON cannot bypass backend-ID constructor invariants.
