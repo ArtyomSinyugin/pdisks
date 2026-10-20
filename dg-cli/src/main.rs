@@ -14,10 +14,17 @@ use std::{
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && args[0] == "--help" {
-        println!(
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        let result = writeln!(
+            output,
             "dg-cli probe --manifest FILE --root PRIVATE_DIR\ndg-cli plan new --manifest FILE --root PRIVATE_DIR --output DRAFT\ndg-cli plan add --root PRIVATE_DIR --draft DRAFT --request REQUEST --output DRAFT\ndg-cli plan preview --root PRIVATE_DIR --draft DRAFT\ndg-cli plan freeze --root PRIVATE_DIR --draft DRAFT --output PLAN\ndg-cli plan edit --root PRIVATE_DIR --draft DRAFT [--manifest FILE]\ndg-cli plan apply --manifest FILE --root PRIVATE_DIR --file PLAN [--events jsonl]\ndg-cli incident show --manifest FILE --root PRIVATE_DIR\ndg-cli incident acknowledge --manifest FILE --root PRIVATE_DIR\nAll results are JSON. The execution root must already exist with mode 0700.\nSaved-draft commands do not probe or refresh the baseline.\nNative writes are unconfigured and fail closed. Events are flushed live during blocking execution."
         );
-        return ExitCode::SUCCESS;
+        return if result.and_then(|_| output.flush()).is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     }
     let result = Invocation::parse(args).and_then(|invocation| native::run(&invocation));
     let (value, exit) = match result {

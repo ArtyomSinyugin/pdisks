@@ -91,3 +91,23 @@ fn binary_returns_io_failure_when_stdout_is_closed() -> Result<(), Box<dyn Error
     assert_eq!(writes.get(), 0);
     Ok(())
 }
+
+/// Help output follows the same I/O exit contract and does not panic on a closed pipe.
+#[test]
+fn binary_help_reports_broken_stdout_without_panicking() -> Result<(), Box<dyn Error>> {
+    let (reader, writer) = rustix::pipe::pipe()?;
+    drop(reader);
+    let result = Command::new(env!("CARGO_BIN_EXE_dg-cli"))
+        .arg("--help")
+        .stdout(Stdio::from(writer))
+        .output()?;
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stderr.is_empty());
+    let success = Command::new(env!("CARGO_BIN_EXE_dg-cli"))
+        .arg("--help")
+        .output()?;
+    assert_eq!(success.status.code(), Some(0));
+    assert!(String::from_utf8(success.stdout)?.contains("Native writes are unconfigured"));
+    assert!(success.stderr.is_empty());
+    Ok(())
+}
