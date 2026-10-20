@@ -284,6 +284,19 @@ the declared library loads with every required symbol, or when the declared
 command exists. A missing optional package is therefore normal and does not
 prevent disksgraph from starting.
 
+The registry accepts only regular manifest files and bounds reads to 1 MiB before
+JSON parsing. It validates the entire collection before loading any library:
+version, declarations, absolute paths without NUL, symbols and unique IDs. Duplicate
+IDs are rejected even when one backend is unavailable. An invalid later declaration
+cannot execute an earlier library's constructors before failing validation.
+
+A valid manifest is executable configuration: native constructors can run during
+loading. The caller must trust the manifest, main/auxiliary libraries, executable
+fallbacks, transitive loader dependencies, environment and all parent directories.
+The registry does not authenticate packages or enforce path ownership. Absolute
+paths and a read-only storage policy do not sandbox native code. The facade's
+[native host contract](../docs/host-trust.md) describes its additional entry checks.
+
 The file is `/usr/share/disksgraph/providers.json` by default. Set
 `DISKSGRAPH_PROVIDER_MANIFEST` to replace it.
 

@@ -589,8 +589,10 @@ set frozen action и не зависит от transient NodeId, plan UUID или
 Проверка повторяется на сохранённом fd до и после захвата lock; удалённый каталог
 отклоняется. Directory/lock открываются без следования финальному symlink;
 родительские компоненты этим не проверяются. Lock должен быть regular, private
-и иметь ровно одну hard link; соответствие имени и inode проверяется до и после
-`flock`. [Эксплуатационный контракт каталога](packaging/README.md#execution-directory-and-process-contract)
+и иметь ровно одну hard link без executable/special permission bits; соответствие
+имени и inode проверяется до и после `flock`. Root/lock повторно проверяются при
+операциях checkpoint; изменённая область блокировки не позволяет arm/clear.
+Checkpoint также отклоняет executable/special bits, сохраняя исходный файл. [Эксплуатационный контракт каталога](packaging/README.md#execution-directory-and-process-contract)
 обязателен и для Rust, и для CLI/ABI.
 `execution.lock` не удаляется и не обнуляется. Каталог и lock нельзя заменять или
 удалять, пока hosts могут работать: новый inode создаст другую область блокировки.

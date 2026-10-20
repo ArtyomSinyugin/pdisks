@@ -74,3 +74,50 @@ sudo env DISKSGRAPH_PROVIDER_MANIFEST="$PWD/storage-probe/tests/providers.live.e
   cargo test -p storage-probe --test live_providers -- \
   --ignored --nocapture --test-threads=1 --show-output
 ```
+
+
+## C8: конфигурация host и границы привилегий
+
+Проверки не требуют root и не записывают на устройства:
+
+```sh
+cargo test -p storage-provider --lib registry_ --locked --offline
+cargo test -p disksgraph --lib native_configuration --locked --offline
+cargo test -p disksgraph --test wire native_configuration --locked --offline
+cargo test -p storage-runtime --lib checkpoint::store::tests --locked --offline
+cargo test -p storage-runtime --test execution_leases --test runtime --locked --offline
+cargo test -p dg-cli --lib --test exit_codes --locked --offline
+cargo test -p disksgraph-ffi --test checked_consumer --locked --offline
+```
+
+Частная Rust `.so` и `/proc/self/maps` проверяют отсутствие загрузки native-кода
+до полной проверки manifest и root. Это проверка фактического loader через Rust
+и Stabby checked import, без подмены production constructor. Матрица credentials
+проверяет отказ несовпадающих UID/GID на synthetic значениях; setuid/setgid install
+и production privilege separation не заявлены.
+
+Runtime проверяет полный principal request на каждом свежем admission, права
+root/lock/checkpoint и сохранение marker при подмене lock или изменении прав из
+callback перед arm/clear. CLI subprocess проверяет явную native-конфигурацию и
+выход 1 без panic при закрытом stdout `--help`. FIFO inputs отклоняются без writer.
+
+После SIGKILL/crash suites не запускайте ignored helpers отдельно: их вызывают
+обычные parent tests. Native writes, внешние writers, privileged configuration
+races и power loss эти synthetic проверки не моделируют. Полный контракт и
+незавершённые production gates: [trusted host](host-trust.md).
+
+При нехватке места сборку можно вынести в отдельный каталог без debug symbols:
+
+```sh
+CARGO_TARGET_DIR=/tmp/disksgraph-check CARGO_INCREMENTAL=0 \
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+cargo test --workspace --all-targets --locked --offline
+```
+
+
+Проход 20 октября 2026 проверен на Rust/Cargo 1.98.1: полный locked/offline
+workspace/all-targets — 452 passed, 19 ignored; Clippy с `-D warnings`, rustfmt и
+diff-check прошли. Новый локальный release bundle прошёл `scripts/check-package.py`
+с отдельно собранным consumer: checksums, production exports, checked ABI/CLI
+preview parity и сохранение incident marker. В bundle включён HOST-TRUST.md.
+MSRV 1.88, native VM/crash и power loss в этом проходе не повторялись.

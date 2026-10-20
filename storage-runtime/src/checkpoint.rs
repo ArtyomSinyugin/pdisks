@@ -58,7 +58,7 @@ pub enum CheckpointError {
     /// An unresolved attempt already occupies the only active checkpoint name.
     #[error("an active checkpoint already exists")]
     AlreadyActive,
-    /// Clear requires an existing checkpoint with the exact requested run/action identity.
+    /// Clear requires an existing checkpoint equal to the complete expected armed attempt.
     #[error("checkpoint does not belong to this run and action")]
     AttemptMismatch,
     /// Files must be private, non-executable, without special bits, owned and singly linked.

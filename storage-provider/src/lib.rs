@@ -1307,7 +1307,8 @@ pub struct BackendRegistry {
 }
 
 impl BackendRegistry {
-    /// Loads manifests from the environment override or the system file.
+    /// Loads trusted executable configuration from the environment override or the system file.
+    /// The caller must control the environment, selected files, loader dependencies and parent paths.
     pub fn load() -> Result<Self, BackendRegistryError> {
         let path = std::env::var_os(BACKEND_MANIFEST_ENV)
             .map_or_else(|| PathBuf::from(DEFAULT_BACKEND_MANIFEST), PathBuf::from);
@@ -1318,6 +1319,8 @@ impl BackendRegistry {
     ///
     /// A well-formed backend whose system dependency is unavailable on the
     /// host is skipped. Optional system packages therefore do not prevent startup.
+    /// The complete bounded regular-file manifest is structurally validated before any native load.
+    /// Library constructors can run here; paths and native dependencies must already be trusted.
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self, BackendRegistryError> {
         let path = path.as_ref();
         let manifests = read_manifests(path)?;
@@ -1332,6 +1335,7 @@ impl BackendRegistry {
     ///
     /// Unlike runtime discovery, this fails when any declared optional
     /// dependency is unavailable or lacks its required symbols.
+    /// This loads native code and has the same caller-owned trust boundary as `load_from`.
     pub fn validate_dependencies(path: impl AsRef<Path>) -> Result<(), BackendRegistryError> {
         let path = path.as_ref();
         for manifest in read_manifests(path)?.backends {
