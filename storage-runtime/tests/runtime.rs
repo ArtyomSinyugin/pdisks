@@ -399,6 +399,75 @@ mod admission {
         Ok(())
     }
 
+    /// Principal policy receives every exact request field again after each fresh admission probe.
+    #[test]
+    fn authorization_receives_complete_fresh_requests() -> Result<(), Box<dyn Error>> {
+        /// Captures trusted context without granting execution permission.
+        struct Capture(Rc<RefCell<Vec<ApprovalRequest>>>);
+        impl AuthorizationContext for Capture {
+            /// Retains a copy for independent assertions and leaves principal authority unknown.
+            fn check(&mut self, request: &ApprovalRequest) -> LiveCheckStatus {
+                self.0.borrow_mut().push(ApprovalRequest {
+                    run_id: request.run_id,
+                    plan_id: request.plan_id,
+                    action_id: request.action_id,
+                    plan_digest: request.plan_digest.clone(),
+                    backend: request.backend.clone(),
+                    targets: request.targets.clone(),
+                    observation: request.observation,
+                });
+                LiveCheckStatus::Unknown {
+                    required_evidence: "authenticated principal".into(),
+                }
+            }
+        }
+        let _process = isolate_processes();
+        let (state, frozen) = fixture()?;
+        let scratch = Scratch::new()?;
+        let root = ExecutionRoot::open(&scratch.0)?;
+        let mut run = ExecutionRun::new(frozen.document())?;
+        let action = ActionId::new(0);
+        run.begin_check(action)?;
+        let lease = ExecutionLease::try_acquire(&root, &run, action)?;
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        let mut host = LinuxLiveHost::new(
+            probe(Rc::new(RefCell::new(state))),
+            Capabilities {
+                availability: OperationAvailability::Available(backend()),
+                scope: LiveCheckStatus::Satisfied,
+            },
+            Capture(captured.clone()),
+        );
+        for pass in 0..2 {
+            let observed = host.probe()?;
+            let expected = resolve_action(&run, action, observed.observation(), backend())?;
+            let decision = host.check_admission(
+                &run,
+                action,
+                &observed,
+                &storage_runtime::bindings::OutputBindings::new(&run),
+                &lease,
+            )?;
+            assert!(decision.resolved.is_none());
+            assert!(!run.record_admission(decision.report)?);
+            let requests = captured.borrow();
+            assert_eq!(requests.len(), pass + 1);
+            let request = &requests[pass];
+            assert_eq!(request.run_id, run.run_id());
+            assert_eq!(request.plan_id, run.context().plan_id);
+            assert_eq!(request.action_id, action);
+            assert_eq!(request.plan_digest, plan_digest(run.document())?);
+            assert_eq!(request.backend, backend());
+            assert_eq!(request.targets, expected.fingerprints());
+            assert_eq!(request.observation, observed.observation().reference);
+        }
+        let requests = captured.borrow();
+        assert!(requests[1].observation.epoch > requests[0].observation.epoch);
+        assert_eq!(run.state(action)?, ActionRunState::Checking);
+        assert!(!scratch.0.join("active-attempt.json").exists());
+        Ok(())
+    }
+
     /// A report cannot reuse another host's publication, an old generation, or another run's guard.
     #[test]
     fn admission_rejects_foreign_lease_and_stale_publications() -> Result<(), Box<dyn Error>> {
