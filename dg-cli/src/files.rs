@@ -13,7 +13,10 @@ pub const MAX_INPUT_BYTES: usize = disksgraph::MAX_PLAN_JSON_BYTES;
 
 /// Reads a regular file with a hard allocation bound, including files that grow after metadata.
 pub fn read_document(path: &Path) -> Result<String, Error> {
-    let file = File::open(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(Error::Document("input must be a regular file".into()));
     }
@@ -67,6 +70,23 @@ pub fn save_document(path: &Path, document: &str) -> Result<(), Error> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, symlink};
+
+    /// A user-selected FIFO must not stall before the regular-file check.
+    #[test]
+    fn rejects_fifo_documents_without_waiting_for_a_writer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("dg-cli-fifo-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root)?;
+        let path = root.join("input");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )?;
+        assert!(matches!(read_document(&path), Err(Error::Document(_))));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     /// Replacement is private and does not follow an existing destination symlink.
     #[test]
