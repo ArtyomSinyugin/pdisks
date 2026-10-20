@@ -8,6 +8,8 @@ import json
 import pathlib
 import sys
 import tempfile
+import gc
+import weakref
 sys.dont_write_bytecode = True
 from disksgraph import Library
 
@@ -39,6 +41,15 @@ def main():
         finally:
             library.close(context)
         assert marker.read_bytes() == b"retained incident evidence"
+        owner = Library(pathlib.Path(sys.argv[1]).resolve(strict=True))
+        retained_context = owner.open(root)
+        retained_owner = weakref.ref(owner)
+        del owner
+        gc.collect()
+        assert retained_owner() is not None, "live native owner was garbage collected"
+        retained_owner().close(retained_context)
+        gc.collect()
+        assert retained_owner() is None, "closed native owner was retained"
     print("PYTHON_ABI_VERIFIED: actual library, owned buffers, draft preview, retained marker")
 
 

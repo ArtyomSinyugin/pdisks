@@ -35,7 +35,16 @@ not part of these entry-point requirements. Host exclusion assumptions must be
 explicit and cannot be silently represented as observed facts. Checkpoints after
 unknown native outcomes remain blocking until separately reviewed.
 
-C8 is not complete merely because its tests pass: the shipped read-only ABI lacks
-external host policy configuration, and ordinary CLI apply currently lacks a
-positive confirmation route. These are concrete remaining functionality, together
-with backend4 integration, rather than reasons to keep expanding synthetic gates.
+Implemented entry points now include native `open_with_policy` for Rust and
+Stabby, the same host callback via a C JSON memory bridge, a stdlib Python SDK,
+exact-plan root CLI confirmation, and a persistent Rust backend4 executable.
+The bundle contains both applications, the .so, headers, SDKs and exact committed
+Rust workspace source. Portable acceptance covers actual Stabby/Python loading,
+backend4 subprocess editing/freeze parity, callback contracts and root confirmation.
+
+Final native acceptance of the new owned native constructors/root application
+policy remains a specific outstanding task in the guarded disposable VM. Existing
+native recipe acceptance does not automatically prove the new constructor/transport
+composition. System RPM installation and hardware power-loss qualification are
+separate deployment work; adding a new per-user authorization framework or full
+observation anonymization is not a prerequisite for the clarified product.
