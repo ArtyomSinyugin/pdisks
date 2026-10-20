@@ -666,3 +666,26 @@ fn checked_policy_open_requires_a_native_manifest() -> Result<(), Error> {
     assert!(!scratch.0.join("execution.lock").exists());
     Ok(())
 }
+
+/// A non-Rust process uses the packaged C memory contract with no Rust-side loader or wrapper.
+#[test]
+fn python_client_loads_the_same_dynamic_library() -> Result<(), Error> {
+    let scratch = Scratch::new()?;
+    let draft_path = scratch.0.join("draft.json");
+    fs::write(&draft_path, draft()?.to_string())?;
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../packaging/consumer/python/check.py");
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg(library()?)
+        .arg(&draft_path)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8(output.stdout)?.contains("PYTHON_ABI_VERIFIED"));
+    Ok(())
+}
