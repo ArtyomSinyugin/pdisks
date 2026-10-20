@@ -10,7 +10,7 @@ use std::{
     ffi::OsString,
     fs,
     io::Read,
-    os::unix::fs::PermissionsExt,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -1433,13 +1433,14 @@ fn validate_manifest(path: &Path, manifest: &BackendManifest) -> Result<(), Back
             validate_library_fields(path, &auxiliary.path, &auxiliary.required_symbols)?;
         }
     }
-    if let Some(executable) = &manifest.executable
-        && !executable.is_absolute()
-    {
-        return Err(BackendRegistryError::RelativeExecutable {
-            path: path.to_path_buf(),
-            executable: executable.clone(),
-        });
+    if let Some(executable) = &manifest.executable {
+        if !executable.is_absolute() {
+            return Err(BackendRegistryError::RelativeExecutable {
+                path: path.to_path_buf(),
+                executable: executable.clone(),
+            });
+        }
+        validate_path_bytes(path, executable)?;
     }
     Ok(())
 }
@@ -1456,10 +1457,25 @@ fn validate_library_fields(
             library: library_path.to_path_buf(),
         });
     }
+    validate_path_bytes(manifest_path, library_path)?;
     if let Some(symbol) = symbols.iter().find(|symbol| symbol.as_bytes().contains(&0)) {
         return Err(BackendRegistryError::InvalidLibrarySymbol {
             path: manifest_path.to_path_buf(),
             symbol: symbol.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Rejects paths that cannot cross a filesystem or C-loader boundary without truncation.
+fn validate_path_bytes(
+    manifest_path: &Path,
+    backend_path: &Path,
+) -> Result<(), BackendRegistryError> {
+    if backend_path.as_os_str().as_bytes().contains(&0) {
+        return Err(BackendRegistryError::InvalidBackendPath {
+            path: manifest_path.to_path_buf(),
+            backend_path: backend_path.to_path_buf(),
         });
     }
     Ok(())
@@ -1526,6 +1542,14 @@ pub enum BackendRegistryError {
     /// Relative library paths would make privileged loading process-dependent.
     #[error("backend manifest {path:?} has relative library {library:?}")]
     RelativeLibrary { path: PathBuf, library: PathBuf },
+    /// Backend paths containing NUL must not be treated as optional missing dependencies.
+    #[error("backend manifest {path:?} has invalid path {backend_path:?}")]
+    InvalidBackendPath {
+        /// Configuration file containing the invalid path.
+        path: PathBuf,
+        /// Path rejected before any native library is loaded.
+        backend_path: PathBuf,
+    },
     /// A symbol name cannot be passed to the native loader.
     #[error("backend manifest {path:?} has invalid library symbol {symbol:?}")]
     InvalidLibrarySymbol { path: PathBuf, symbol: String },
@@ -1775,6 +1799,47 @@ mod tests {
                 if source.kind() == std::io::ErrorKind::InvalidData
         ));
         assert!(BackendRegistry::validate_dependencies(&path).is_err());
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    /// Main, auxiliary and executable paths share the same no-NUL trust boundary.
+    #[test]
+    fn registry_rejects_nul_paths() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = fixture_dir();
+        for target in 0..3 {
+            let mut backend = manifest("invalid-path", "/bin/true");
+            if target == 0 {
+                backend.executable = Some("/bin/true\0suffix".into());
+            } else {
+                backend.library = Some(BackendLibrary {
+                    path: if target == 1 {
+                        "/lib/backend.so\0suffix"
+                    } else {
+                        "/lib/backend.so"
+                    }
+                    .into(),
+                    required_symbols: BTreeSet::new(),
+                    auxiliary: if target == 2 {
+                        vec![AuxiliaryLibrary {
+                            path: "/lib/helper.so\0suffix".into(),
+                            required_symbols: BTreeSet::new(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+            let path = write_manifests(&directory, manifests(vec![backend]));
+            assert!(matches!(
+                BackendRegistry::load_from(&path),
+                Err(BackendRegistryError::InvalidBackendPath { .. })
+            ));
+            assert!(matches!(
+                BackendRegistry::validate_dependencies(&path),
+                Err(BackendRegistryError::InvalidBackendPath { .. })
+            ));
+        }
         fs::remove_dir_all(directory)?;
         Ok(())
     }
