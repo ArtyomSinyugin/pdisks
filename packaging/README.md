@@ -70,14 +70,30 @@ fallback. A container or another UID selecting a different root does not share
 this exclusion. External disk tools do not participate in it.
 
 Do not delete or recreate `execution.lock` to resolve contention. Its name and
-inode are checked before and after flock acquisition, but this is not protection
-against a privileged writer replacing them later. A completed run leaves only
+inode are checked before and after flock acquisition and again during checkpoint
+operations. Lock/checkpoint files reject executable and special permission bits.
+These checks cannot exclude a privileged writer replacing them later. A completed run leaves only
 that lock in an initially empty root. An active, malformed or unreadable
 `active-attempt.json` blocks new execution. Process death before publication can
 leave an inert `.active-attempt-*.tmp`; it grants no permission to dispatch.
 There is no automatic checkpoint retry, replay or deletion during close. Use
 incident review; acknowledgment still requires an independently configured
 trusted principal/scope/quiescence policy and fails closed by default.
+
+The native constructor checks matching real/effective UID and GID before root
+or manifest access. Mismatched credentials fail even in saved-only mode; ordinary
+root execution supplies no authorization. Do not install with setuid/setgid bits
+or file capabilities. The embedding process owns its credentials, environment and
+all configuration paths; this API is not a privileged service boundary.
+
+Backend manifests can load native code during open. They, their backend paths,
+loader dependencies and parent directories must be trusted. Structural manifest
+validation is complete before the first load, with a 1 MiB input bound and regular
+file requirement. The native constructor retains the root descriptor validated
+before loading. The full [host trust contract](share/doc/disksgraph/HOST-TRUST.md)
+is shipped with this bundle. Rust consumers matching error enums exhaustively must
+handle the new `BackendRegistryError::InvalidBackendPath` and
+`CheckpointError::Lease` variants; JSON/ABI versions and signatures are unchanged.
 
 The executable never elevates privileges. Effective UID, directory ownership,
 a provider manifest and a saved plan are not execution authorization. Production
