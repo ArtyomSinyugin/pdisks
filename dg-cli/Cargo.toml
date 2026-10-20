@@ -1,5 +1,6 @@
 [package]
 name = "dg-cli"
+default-run = "dg-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
