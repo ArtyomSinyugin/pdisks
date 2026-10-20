@@ -4,6 +4,7 @@
 
 pub mod backend4;
 mod commands;
+pub mod confirmation;
 pub mod files;
 pub mod incident;
 pub mod repl;
