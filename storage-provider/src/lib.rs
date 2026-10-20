@@ -1844,6 +1844,53 @@ mod tests {
         Ok(())
     }
 
+    /// A malformed collection must not map an otherwise loadable library into this process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_rejects_collections_before_dlopen() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = fixture_dir();
+        let source = directory.join("fixture.rs");
+        let library = directory.join("fixture.so");
+        fs::write(
+            &source,
+            "/// Native loading sentinel.\npub fn sentinel() {}\n",
+        )?;
+        let output =
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .args(["--crate-type=cdylib", "--crate-name=registry_sentinel"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&library)
+                .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut native = manifest("sentinel", "/bin/true");
+        native.library = Some(BackendLibrary {
+            path: library.clone(),
+            required_symbols: BTreeSet::new(),
+            auxiliary: Vec::new(),
+        });
+        for invalid in [manifest("bad", "relative"), manifest("sentinel", "/absent")] {
+            let path = write_manifests(&directory, manifests(vec![native.clone(), invalid]));
+            assert!(BackendRegistry::load_from(&path).is_err());
+            assert!(BackendRegistry::validate_dependencies(&path).is_err());
+            assert!(
+                !fs::read_to_string("/proc/self/maps")?
+                    .contains(library.to_string_lossy().as_ref())
+            );
+        }
+        let path = write_manifests(&directory, manifests(vec![native]));
+        assert_eq!(BackendRegistry::load_from(&path)?.backends().len(), 1);
+        assert!(
+            fs::read_to_string("/proc/self/maps")?.contains(library.to_string_lossy().as_ref())
+        );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
     /// Verifies that JSON cannot bypass backend-ID constructor invariants.
     #[test]
     fn backend_id_rejects_invalid_json() {
