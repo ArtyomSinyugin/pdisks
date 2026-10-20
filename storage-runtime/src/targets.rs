@@ -54,7 +54,7 @@ pub enum TargetError {
 }
 
 /// A stable VG UUID and its currently observed native name, never an identity inferred from a path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ResolvedTarget {
     /// Node identity retained in the reviewed plan.
     pub planned_id: NodeId,
@@ -67,7 +67,7 @@ pub struct ResolvedTarget {
 }
 
 /// UUID-qualified LV endpoint from a verified output and this exact provider publication.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ResolvedLvTarget {
     /// Output node reserved by the frozen plan.
     pub planned_id: NodeId,
@@ -84,7 +84,7 @@ pub struct ResolvedLvTarget {
 }
 
 /// Ext4 identity correlated from this run's verified output in the exact admission publication.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct ResolvedFilesystemTarget {
     /// Planned output retained by the immutable plan.
     pub planned_id: NodeId,
@@ -96,7 +96,7 @@ pub struct ResolvedFilesystemTarget {
 
 /// An operation bound to one run, action, probe publication, and concrete backend.
 /// Fields are private so consumers cannot replace the operation after admission.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct ResolvedAction {
     /// Attempt whose admission is being checked.
     run_id: Uuid,

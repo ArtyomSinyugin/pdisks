@@ -1,5 +1,8 @@
 //! Owned native read configuration shared by CLI and long-lived application transports.
 
+mod policy;
+pub use policy::{NativeHostPolicy, PolicyContext, PolicyRequest, ScopeCheck};
+
 use crate::{DisksGraph, DisksGraphError, LiveCheckStatus, LiveObservation, host::*};
 use authorization::{ApprovalRequest, AuthorizationContext};
 use capability::{BackendCapabilityCheck, OperationAvailability};

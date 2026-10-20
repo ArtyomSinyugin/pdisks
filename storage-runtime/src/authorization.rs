@@ -6,7 +6,7 @@ use storage_provider::BackendId;
 use uuid::Uuid;
 
 /// Exact request submitted to a host-owned approval policy after fresh target resolution.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct ApprovalRequest {
     /// Attempt for which the host is requesting permission.
     pub run_id: Uuid,
