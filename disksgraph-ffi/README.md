@@ -1,4 +1,4 @@
-# Stabby API с ограниченными apply jobs (C7)
+# Stabby API, native host policy и C JSON bridge
 
 `cargo build -p disksgraph-ffi --offline` собирает `target/debug/libdisksgraph_ffi.so`.
 `scripts/stage-package.sh /path/to/new-bundle` укладывает release ABI как
@@ -8,8 +8,11 @@ Cargo-имя сохраняется, чтобы не конфликтовать 
 production deployment и write/safety policies относятся к C8.
 Все методы делегируются `disksgraph`; runtime остаётся единственным владельцем
 execution/admission/checkpoint. Конфигурация native reads общая с `dg-cli`.
-Native writes в этом конструкторе отключены: capability/authorization возвращают
-Unknown, dispatcher не выполняет mutations.
+В обычном `disksgraph_open` native writes отключены: capability/authorization возвращают
+Unknown, dispatcher не выполняет mutations. Явный `disksgraph_open_with_policy`
+подключает внешний host callback. Для клиентов не на Rust есть C JSON bridge и
+Python SDK; [контракт embedding](../docs/embedding.md) описывает signatures,
+policy schema, ownership и ограничения.
 
 Экспорты используют Stabby **72.1.16**, закреплённый в workspace. Consumer обязан
 получать функции через `StabbyLibrary::get_stabbied`, который проверяет signature

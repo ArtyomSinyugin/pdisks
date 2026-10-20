@@ -34,7 +34,7 @@ def verify(bundle):
         raise ValueError("bundle file set differs from SHA256SUMS")
     symbols = run("nm", "-D", "--defined-only", str(bundle / "lib/libdisksgraph.so"))
     names = {line.split()[-1] for line in symbols.splitlines() if line.split()}
-    for name in ["api_version", "open", "call", "close"]:
+    for name in ["api_version", "open", "open_with_policy", "call", "close", "json_api_version", "json_open", "json_open_with_policy", "json_call", "json_close", "json_free"]:
         if "disksgraph_" + name not in names:
             raise ValueError(f"missing export: {name}")
     if any(name.startswith("disksgraph_vm_") for name in names):
@@ -65,9 +65,13 @@ def main():
         cli = json.loads(run(str(bundle / "bin/dg-cli"), "plan", "preview", "--root", str(root), "--draft", str(source)))
         if abi != cli:
             raise ValueError("ABI/CLI preview differs")
+        python_check = run(sys.executable, str(bundle / "consumer/python/check.py"),
+                           str(bundle / "lib/libdisksgraph.so"), str(source))
+        if "PYTHON_ABI_VERIFIED" not in python_check:
+            raise ValueError("non-Rust Python consumer did not complete")
         if marker.read_bytes() != b"retained synthetic incident":
             raise ValueError("preview/close changed the incident")
-    print("PACKAGE_VERIFIED: checksums, production exports, checked ABI/CLI preview, retained marker")
+    print("PACKAGE_VERIFIED: checksums, production exports, checked ABI/CLI preview, Python C client, retained marker")
 
 
 if __name__ == "__main__":

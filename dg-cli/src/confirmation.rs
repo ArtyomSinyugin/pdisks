@@ -180,6 +180,18 @@ fn refused() -> LiveCheckStatus {
     }
 }
 
+/// Reads one bounded confirmation record; EOF or malformed data can never imply consent.
+pub fn read_reply(input: &mut impl std::io::BufRead) -> Result<Value, crate::Error> {
+    let mut line = Vec::new();
+    let count = std::io::Read::take(input, 64 * 1024 + 1).read_until(b'\n', &mut line)?;
+    if count == 0 || line.len() > 64 * 1024 {
+        return Err(crate::Error::Usage(
+            "one bounded explicit confirmation is required".into(),
+        ));
+    }
+    Ok(serde_json::from_slice(&line)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,16 +306,4 @@ mod tests {
         ));
         assert_eq!(calls.get(), 1);
     }
-}
-
-/// Reads one bounded confirmation record; EOF or malformed data can never imply consent.
-pub fn read_reply(input: &mut impl std::io::BufRead) -> Result<Value, crate::Error> {
-    let mut line = Vec::new();
-    let count = std::io::Read::take(input, 64 * 1024 + 1).read_until(b'\n', &mut line)?;
-    if count == 0 || line.len() > 64 * 1024 {
-        return Err(crate::Error::Usage(
-            "one bounded explicit confirmation is required".into(),
-        ));
-    }
-    Ok(serde_json::from_slice(&line)?)
 }

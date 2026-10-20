@@ -100,6 +100,17 @@ pub fn read_frame(input: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
+/// Reads consent from a separately Altera-authorized write frame, never a read wrapper or raw flag.
+pub fn read_confirmation(input: &mut impl BufRead) -> Result<Value, crate::Error> {
+    let envelope: Envelope = serde_json::from_value(crate::confirmation::read_reply(input)?)?;
+    match envelope.action {
+        Action::Write(payload) => Ok(payload),
+        _ => Err(crate::Error::Usage(
+            "confirmation requires backend4 write action".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,16 +184,5 @@ mod tests {
         let reply: Value = serde_json::from_slice(&output)?;
         assert_eq!(reply["error"]["code"], "resource_limit");
         Ok(())
-    }
-}
-
-/// Reads consent from a separately Altera-authorized write frame, never a read wrapper or raw flag.
-pub fn read_confirmation(input: &mut impl BufRead) -> Result<Value, crate::Error> {
-    let envelope: Envelope = serde_json::from_value(crate::confirmation::read_reply(input)?)?;
-    match envelope.action {
-        Action::Write(payload) => Ok(payload),
-        _ => Err(crate::Error::Usage(
-            "confirmation requires backend4 write action".into(),
-        )),
     }
 }

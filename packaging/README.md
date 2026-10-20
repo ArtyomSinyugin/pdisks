@@ -5,7 +5,7 @@ The destination must not exist. The command builds the locked release CLI and AB
 offline, without installing files or selecting native write policies. A failed
 command may leave a partial directory; only a successful exit identifies a bundle.
 
-The bundle contains `bin/dg-cli`, `bin/dg-backend4`, `lib/libdisksgraph.so`, protocol documentation,
+The bundle contains `bin/dg-cli`, `bin/dg-backend4`, C header, Python SDK, `lib/libdisksgraph.so`, protocol documentation,
 GPL license, dependency lockfile, compiler/build information, a standalone checked
 consumer SDK under `consumer/`, and SHA-256 checksums.
 Verify it after moving with `cd /path/to/bundle && sha256sum -c SHA256SUMS`.
@@ -16,8 +16,9 @@ installation and framing are described in `share/doc/disksgraph/BACKEND4.md`.
 
 This is a native host build, not a cross-platform distribution or system package.
 It uses host loader/runtime libraries; the native provider libraries and their
-trusted manifest are configured separately. There is no permissive write or
-incident acknowledgment policy in the default CLI/ABI constructor. Existing
+trusted manifest are configured separately. The ordinary ABI open remains read-only; explicit host policy open and the root
+CLI/backend4 application use the shared native host. Incident acknowledgment still
+requires independent quiescence evidence. Existing
 private execution directories must be provided explicitly; this bundle creates
 no global execution root, service, history or configuration under `/etc`.
 

@@ -76,6 +76,7 @@ impl Api {
 
     /// Supplies policy through a checked function pointer, never through ordinary request JSON.
     /// The callback and its cookie remain valid until this context is closed and joined.
+    #[allow(dead_code)] // Optional SDK entry point; saved-preview and VM examples use ordinary open.
     pub fn open_with_policy(
         &self,
         config: &Value,
