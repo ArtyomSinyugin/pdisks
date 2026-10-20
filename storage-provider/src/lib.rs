@@ -10,7 +10,10 @@ use std::{
     ffi::OsString,
     fs,
     io::Read,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -1382,7 +1385,16 @@ impl BackendRegistry {
 /// Reads and validates the versioned backend collection.
 fn read_manifests(path: &Path) -> Result<BackendManifests, BackendRegistryError> {
     let bytes = (|| -> Result<Vec<u8>, std::io::Error> {
-        let file = fs::File::open(path)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "backend manifest must be a regular file",
+            ));
+        }
         let mut bytes = Vec::new();
         file.take(MAX_MANIFEST_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
@@ -1887,6 +1899,26 @@ mod tests {
         assert!(
             fs::read_to_string("/proc/self/maps")?.contains(library.to_string_lossy().as_ref())
         );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    /// A FIFO with no writer must be refused without waiting for filesystem data.
+    #[test]
+    fn registry_rejects_nonregular_manifest_inputs() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = fixture_dir();
+        let fifo = directory.join("manifest.fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )?;
+        for path in [&fifo, &directory] {
+            assert!(matches!(BackendRegistry::load_from(path),
+                Err(BackendRegistryError::ReadManifest { source, .. })
+                    if source.kind() == std::io::ErrorKind::InvalidInput));
+            assert!(BackendRegistry::validate_dependencies(path).is_err());
+        }
         fs::remove_dir_all(directory)?;
         Ok(())
     }

@@ -444,6 +444,7 @@ name = "storage-provider"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "rustix",
  "serde",
  "serde_json",
  "storage-core",
