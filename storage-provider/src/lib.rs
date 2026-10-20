@@ -1328,7 +1328,6 @@ impl BackendRegistry {
     pub fn validate_dependencies(path: impl AsRef<Path>) -> Result<(), BackendRegistryError> {
         let path = path.as_ref();
         for manifest in read_manifests(path)?.backends {
-            validate_manifest(path, &manifest)?;
             if let Some(library) = &manifest.library
                 && dylib::LoadedLibrary::load(library).is_none()
             {
@@ -1365,8 +1364,6 @@ impl BackendRegistry {
         path: &Path,
         manifest: BackendManifest,
     ) -> Result<(), BackendRegistryError> {
-        validate_manifest(path, &manifest)?;
-
         let Some(access) = available_backend_access(&manifest) else {
             return Ok(());
         };
@@ -1402,6 +1399,10 @@ fn read_manifests(path: &Path) -> Result<BackendManifests, BackendRegistryError>
             path: path.to_path_buf(),
             version: manifests.manifest_version,
         });
+    }
+    // Validate the whole document before any dlopen can execute native constructors.
+    for manifest in &manifests.backends {
+        validate_manifest(path, manifest)?;
     }
     Ok(manifests)
 }
@@ -1697,6 +1698,24 @@ mod tests {
         assert!(matches!(
             BackendRegistry::load_from(path),
             Err(BackendRegistryError::RelativeLibrary { .. })
+        ));
+        fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
+    }
+
+    /// Invalid later declarations must fail before checking any optional dependency.
+    #[test]
+    fn registry_validates_all_declarations_before_dependency_checks() {
+        let directory = fixture_dir();
+        let path = write_manifests(
+            &directory,
+            manifests(vec![
+                manifest("missing", "/definitely/missing/backend"),
+                manifest("invalid", "relative/backend"),
+            ]),
+        );
+        assert!(matches!(
+            BackendRegistry::validate_dependencies(&path),
+            Err(BackendRegistryError::RelativeExecutable { .. })
         ));
         fs::remove_dir_all(directory).unwrap_or_else(|error| panic!("remove fixture: {error}"));
     }
