@@ -223,6 +223,9 @@ libraries, panic hooks и собственные логи embedding host эти�
 Полная политика экспорта чувствительных observations и production privilege/
 principal/quiescence остаются отдельными незавершёнными задачами C8.
 
+Rust-программа [`dg-backend4`](docs/backend4.md) предоставляет тот же application API
+через stdin/stdout протокол backend4 Altera.
+
 ## CLI C6 — сохранённые черновики и foreground apply
 
 `cargo build -p dg-cli --offline` собирает `target/debug/dg-cli`. Исполняемый файл

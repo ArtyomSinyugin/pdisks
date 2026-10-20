@@ -5,13 +5,14 @@ The destination must not exist. The command builds the locked release CLI and AB
 offline, without installing files or selecting native write policies. A failed
 command may leave a partial directory; only a successful exit identifies a bundle.
 
-The bundle contains `bin/dg-cli`, `lib/libdisksgraph.so`, protocol documentation,
+The bundle contains `bin/dg-cli`, `bin/dg-backend4`, `lib/libdisksgraph.so`, protocol documentation,
 GPL license, dependency lockfile, compiler/build information, a standalone checked
 consumer SDK under `consumer/`, and SHA-256 checksums.
 Verify it after moving with `cd /path/to/bundle && sha256sum -c SHA256SUMS`.
 Cargo's build artifact remains `libdisksgraph_ffi.so` to keep its Rust crate distinct
 from the facade crate `disksgraph`; the staged ABI filename is `libdisksgraph.so`.
-VM examples and their write-capable fixture library are never staged.
+VM examples and their write-capable fixture library are never staged. Backend4
+installation and framing are described in `share/doc/disksgraph/BACKEND4.md`.
 
 This is a native host build, not a cross-platform distribution or system package.
 It uses host loader/runtime libraries; the native provider libraries and their
