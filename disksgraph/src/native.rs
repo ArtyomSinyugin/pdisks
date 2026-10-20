@@ -5,6 +5,7 @@ use authorization::{ApprovalRequest, AuthorizationContext};
 use capability::{BackendCapabilityCheck, OperationAvailability};
 use dispatcher::{BackendDispatcher, DispatchError, ExecutionReceipt};
 use host::LinuxLiveHost;
+use rustix::process::{getegid, geteuid, getgid, getuid};
 use std::path::Path;
 use targets::ResolvedAction;
 
@@ -143,6 +144,10 @@ pub type Application =
 /// Opens an existing private root with optional native reads and deliberately disabled writes.
 /// Without a manifest, transports must restrict calls to saved inputs; direct probing reports missing data.
 pub fn open(root: &Path, manifest: Option<&Path>) -> Result<Application, OpenError> {
+    require_matching_credentials(
+        (getuid().as_raw(), getgid().as_raw()),
+        (geteuid().as_raw(), getegid().as_raw()),
+    )?;
     let root = lease::ExecutionRoot::open(root).map_err(DisksGraphError::from)?;
     let registry = manifest
         .map(|path| {
@@ -160,4 +165,36 @@ pub fn open(root: &Path, manifest: Option<&Path>) -> Result<Application, OpenErr
             OpenError::Configuration("invalid unavailable backend identity".into())
         })?);
     Ok(DisksGraph::with_root(root, host, dispatcher))
+}
+
+/// Native configuration is trusted code; a set-ID invocation cannot safely accept caller paths.
+fn require_matching_credentials(real: (u32, u32), effective: (u32, u32)) -> Result<(), OpenError> {
+    if real != effective {
+        return Err(OpenError::Configuration(
+            "native applications require matching real and effective user/group IDs".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Root is not approval, and set-user-ID/set-group-ID execution is rejected independently.
+    #[test]
+    fn native_configuration_rejects_mixed_credentials() {
+        assert!(require_matching_credentials((1000, 1000), (1000, 1000)).is_ok());
+        assert!(require_matching_credentials((0, 0), (0, 0)).is_ok());
+        for (real, effective) in [
+            ((1000, 1000), (0, 1000)),
+            ((1000, 1000), (1000, 0)),
+            ((0, 0), (1000, 0)),
+        ] {
+            assert!(matches!(
+                require_matching_credentials(real, effective),
+                Err(OpenError::Configuration(_))
+            ));
+        }
+    }
 }
