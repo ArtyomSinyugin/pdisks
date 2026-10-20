@@ -111,3 +111,46 @@ fn binary_help_reports_broken_stdout_without_panicking() -> Result<(), Box<dyn E
     assert!(success.stderr.is_empty());
     Ok(())
 }
+
+/// Saved preview ignores native selection, and live reads never fall back to an environment manifest.
+#[test]
+fn binary_keeps_native_configuration_explicit() -> Result<(), Box<dyn Error>> {
+    let (scratch, mut app, _, writes) = support::application()?;
+    let draft = scratch.0.join("draft.json");
+    dg_cli::execute(
+        &mut app,
+        &dg_cli::Command::New {
+            output: draft.clone(),
+        },
+        &mut Vec::new(),
+    )?;
+    let ignored = scratch.0.join("unused-manifest.json");
+    fs::write(&ignored, b"invalid native configuration")?;
+    let preview = Command::new(env!("CARGO_BIN_EXE_dg-cli"))
+        .args(["plan", "preview", "--root"])
+        .arg(&scratch.0)
+        .arg("--draft")
+        .arg(&draft)
+        .arg("--manifest")
+        .arg(&ignored)
+        .env("DISKSGRAPH_PROVIDER_MANIFEST", &ignored)
+        .output()?;
+    assert_eq!(preview.status.code(), Some(0));
+    let _: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+    assert!(preview.stderr.is_empty());
+    let probe = Command::new(env!("CARGO_BIN_EXE_dg-cli"))
+        .args(["probe", "--root"])
+        .arg(&scratch.0)
+        .env("DISKSGRAPH_PROVIDER_MANIFEST", &ignored)
+        .output()?;
+    assert_eq!(probe.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&probe.stdout)?["error"]["kind"],
+        "usage"
+    );
+    assert!(probe.stderr.is_empty());
+    assert_eq!(writes.get(), 0);
+    assert!(!scratch.0.join("execution.lock").exists());
+    assert!(!scratch.0.join("active-attempt.json").exists());
+    Ok(())
+}
