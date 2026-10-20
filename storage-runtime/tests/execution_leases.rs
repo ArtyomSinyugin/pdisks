@@ -379,3 +379,29 @@ fn root_requires_exact_0700_and_rechecks_retained_descriptors() -> Result<(), Bo
     assert_eq!(fs::read_dir(&scratch.0)?.count(), 0);
     Ok(())
 }
+
+/// Executable and special permission bits do not belong on a private permanent lock.
+#[test]
+fn lock_rejects_executable_and_special_modes_without_repairing_them() -> Result<(), Box<dyn Error>>
+{
+    let _process = PROCESS_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let scratch = Scratch::new()?;
+    let root = ExecutionRoot::open(&scratch.0)?;
+    drop(root.try_lock_host()?);
+    let path = scratch.0.join("execution.lock");
+    fs::write(&path, b"retain lock bytes")?;
+    for mode in [0o700, 0o1600, 0o2600, 0o4600] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+        assert!(
+            matches!(root.try_lock_host(), Err(LeaseError::InvalidLockFile)),
+            "mode {mode:o}"
+        );
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o7777, mode);
+        assert_eq!(fs::read(&path)?, b"retain lock bytes");
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    drop(root.try_lock_host()?);
+    Ok(())
+}

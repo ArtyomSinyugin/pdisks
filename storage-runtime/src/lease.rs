@@ -26,7 +26,7 @@ pub enum LeaseError {
     /// Only a linked mode-0700 directory owned by the effective user is supported.
     #[error("lease directory must have mode 0700 and be owned by the effective user")]
     InsecureDirectory,
-    /// Existing lock files must be regular, private, singly linked, and owned by this user.
+    /// Lock files must be private, non-executable, without special bits, singly linked and owned.
     #[error("invalid execution lock file")]
     InvalidLockFile,
     /// Another cooperating host holds the global lease; acquisition never waits.
@@ -111,7 +111,7 @@ fn validate_lock(directory: &OwnedFd, lock: &OwnedFd) -> Result<(), LeaseError> 
     let named = statat(directory, LOCK_FILE, AtFlags::SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
     if FileType::from_raw_mode(info.st_mode) != FileType::RegularFile
         || info.st_uid != geteuid().as_raw()
-        || info.st_mode & 0o077 != 0
+        || info.st_mode & 0o7177 != 0
         || info.st_nlink != 1
         || info.st_dev != named.st_dev
         || info.st_ino != named.st_ino
