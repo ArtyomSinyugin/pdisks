@@ -155,6 +155,56 @@ mod tests {
         unsafe { disksgraph_json_free(pointer) };
         Ok(serde_json::from_slice(&bytes)?)
     }
+    /// Parses only the borrowed callback input and returns the requested fixed test decision code.
+    unsafe extern "C" fn decide(cookie: u64, pointer: *const u8, length: usize) -> i32 {
+        // SAFETY: CPolicy supplies a readable slice retained until this callback returns.
+        let bytes = unsafe { slice::from_raw_parts(pointer, length) };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return -1;
+        };
+        if value["policy_version"] != 1
+            || value["request"]["check"] != "authorize"
+            || value["request"]["request"]["plan_digest"] != "a".repeat(64)
+        {
+            return -1;
+        }
+        cookie as i32
+    }
+    /// Real callback function pointers receive versioned exact requests and cannot invent decision codes.
+    #[test]
+    fn c_policy_callbacks_preserve_cookie_context_and_three_valued_status(
+    ) -> Result<(), Box<dyn StdError>> {
+        let request = disksgraph::host::authorization::ApprovalRequest {
+            run_id: uuid::Uuid::now_v7(),
+            plan_id: uuid::Uuid::now_v7(),
+            action_id: disksgraph::ActionId::new(0),
+            plan_digest: "a".repeat(64),
+            backend: disksgraph::host::BackendId::new("callback-fixture").ok_or("backend")?,
+            targets: Vec::new(),
+            observation: disksgraph::ObservationReference {
+                probe_instance: uuid::Uuid::now_v7(),
+                epoch: disksgraph::model::ProbeEpoch::new(1),
+            },
+        };
+        for code in [0, 1, 2] {
+            let mut policy = CPolicy {
+                callback: decide,
+                cookie: code,
+            };
+            let status = policy.check(PolicyRequest::Authorize {
+                request: &request,
+                destructive_target: None,
+            });
+            assert_eq!(status == LiveCheckStatus::Satisfied, code == 1);
+            assert_eq!(
+                matches!(status, LiveCheckStatus::Violated { .. }),
+                code == 0
+            );
+            assert_eq!(matches!(status, LiveCheckStatus::Unknown { .. }), code == 2);
+        }
+        Ok(())
+    }
+
     /// Real C signatures share the registry lifecycle, bounded input and diagnostic contracts.
     #[test]
     fn c_json_exports_own_buffers_and_close_the_same_worker() -> Result<(), Box<dyn StdError>> {
